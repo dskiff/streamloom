@@ -9,8 +9,8 @@ permissions:
   packages: write
 
 jobs:
-  streamloom:
-    name: streamloom
+  latest:
+    name: latest
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -22,6 +22,6 @@ jobs:
 
       - uses: ko-build/setup-ko@d006021bd0c28d1ce33a07e7943d48b079944c8d # v0.9.0
 
-      - run: ko build --tags=latest --push --ldflags="-X main.Version=${{ env.VERSION }}"
+      - run: ko build --tags=latest
         env:
           VERSION: ${{ github.ref_name }}
