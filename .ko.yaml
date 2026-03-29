@@ -1,0 +1,6 @@
+defaultFlags:
+- --verbose
+defaultLdflags:
+- -X main.Version={{.Env.VERSION}}
+defaultPlatforms:
+- linux/amd64

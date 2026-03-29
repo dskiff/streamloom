@@ -1,0 +1,36 @@
+name: ci
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [synchronize, opened, reopened]
+
+jobs:
+  streamloom:
+    name: streamloom
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - run: go fmt ./...
+
+      - run: go vet ./...
+
+      - run: go fix ./...
+
+      - name: Ensure no changes after formatting and fixing
+        run: |
+          if [[ -n $(git status --porcelain) ]]; then
+            echo "There are uncommitted changes after formatting/fixing. Please commit them before pushing.";
+            git --no-pager diff;
+            exit 1;
+          fi
+
+      - run: go build -ldflags "-X main.Version=test" -v .
+
+      - run: go test -v ./...
