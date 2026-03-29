@@ -16,6 +16,7 @@ import (
 	"github.com/dskiff/streamloom/pkg/config"
 	"github.com/dskiff/streamloom/pkg/routes"
 	"github.com/dskiff/streamloom/pkg/stream"
+	"github.com/dskiff/streamloom/pkg/watcher"
 	"github.com/joho/godotenv"
 )
 
@@ -78,7 +79,22 @@ func main() {
 		logger.Info("stream token configured", "streamID", id)
 	}
 
-	store := stream.NewStore(clock.Real{})
+	clk := clock.Real{}
+	store := stream.NewStore(clk)
+	tracker := watcher.NewTracker(clk)
+
+	go func() {
+		ticker := time.NewTicker(watcher.CleanupInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				tracker.Cleanup()
+			}
+		}
+	}()
 
 	serverWg := sync.WaitGroup{}
 
@@ -98,11 +114,11 @@ func main() {
 	}
 
 	streamAddr := fmt.Sprintf("%s:%d", addr, env.STREAM_PORT)
-	streamRouter := routes.Stream(logger, env, store, requestLogger)
+	streamRouter := routes.Stream(logger, env, store, requestLogger, tracker)
 	runServerThread(ctx, &serverWg, streamAddr, streamRouter)
 
 	apiAddr := fmt.Sprintf("%s:%d", addr, env.API_PORT)
-	apiRouter := routes.API(logger, env, store, requestLogger)
+	apiRouter := routes.API(logger, env, store, requestLogger, tracker)
 	runServerThread(ctx, &serverWg, apiAddr, apiRouter)
 
 	<-ctx.Done()

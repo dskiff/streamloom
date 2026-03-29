@@ -19,7 +19,7 @@ import (
 
 func TestGetSegment_Success(t *testing.T) {
 	clk := clock.NewMock(time.UnixMilli(1000))
-	router, store := testStreamRouter(t, clk)
+	router, store, _ := testStreamRouter(t, clk)
 	initStream(t, store, "1")
 
 	s := store.Get("1")
@@ -40,7 +40,7 @@ func TestGetSegment_Success(t *testing.T) {
 }
 
 func TestGetSegment_UnconfiguredStream_Returns503(t *testing.T) {
-	router, _ := testStreamRouter(t, clock.Real{})
+	router, _, _ := testStreamRouter(t, clock.Real{})
 
 	// Unconfigured streams with valid IDs return 503 (same as configured-but-
 	// uninitialized) to prevent stream ID enumeration.
@@ -53,7 +53,7 @@ func TestGetSegment_UnconfiguredStream_Returns503(t *testing.T) {
 }
 
 func TestGetSegment_ConfiguredButUninitialized_Returns503(t *testing.T) {
-	router, _ := testStreamRouter(t, clock.Real{})
+	router, _, _ := testStreamRouter(t, clock.Real{})
 
 	// Stream 1 is configured (has a token) but not initialized.
 	req := httptest.NewRequest(http.MethodGet, "/stream/1/segment_0.m4s", nil)
@@ -66,7 +66,7 @@ func TestGetSegment_ConfiguredButUninitialized_Returns503(t *testing.T) {
 
 func TestGetSegment_SegmentNotFound(t *testing.T) {
 	clk := clock.NewMock(time.UnixMilli(1000))
-	router, store := testStreamRouter(t, clk)
+	router, store, _ := testStreamRouter(t, clk)
 	initStream(t, store, "1")
 
 	req := httptest.NewRequest(http.MethodGet, "/stream/1/segment_99.m4s", nil)
@@ -78,7 +78,7 @@ func TestGetSegment_SegmentNotFound(t *testing.T) {
 }
 
 func TestGetSegment_InvalidSegmentID(t *testing.T) {
-	router, store := testStreamRouter(t, clock.Real{})
+	router, store, _ := testStreamRouter(t, clock.Real{})
 	initStream(t, store, "1")
 
 	req := httptest.NewRequest(http.MethodGet, "/stream/1/segment_abc.m4s", nil)
@@ -89,7 +89,7 @@ func TestGetSegment_InvalidSegmentID(t *testing.T) {
 }
 
 func TestGetSegment_OverflowSegmentID(t *testing.T) {
-	router, store := testStreamRouter(t, clock.Real{})
+	router, store, _ := testStreamRouter(t, clock.Real{})
 	initStream(t, store, "1")
 
 	req := httptest.NewRequest(http.MethodGet, "/stream/1/segment_99999999999.m4s", nil)
@@ -103,7 +103,7 @@ func TestGetSegment_OverflowSegmentID(t *testing.T) {
 
 func TestGetInitMP4_Success(t *testing.T) {
 	clk := clock.NewMock(time.UnixMilli(1000))
-	router, store := testStreamRouter(t, clk)
+	router, store, _ := testStreamRouter(t, clk)
 	initStream(t, store, "1")
 
 	s := store.Get("1")
@@ -122,7 +122,7 @@ func TestGetInitMP4_Success(t *testing.T) {
 }
 
 func TestGetInitMP4_UnconfiguredStream_Returns503(t *testing.T) {
-	router, _ := testStreamRouter(t, clock.Real{})
+	router, _, _ := testStreamRouter(t, clock.Real{})
 
 	// Unconfigured streams with valid IDs return 503 to prevent enumeration.
 	req := httptest.NewRequest(http.MethodGet, "/stream/999/init-123.mp4", nil)
@@ -134,7 +134,7 @@ func TestGetInitMP4_UnconfiguredStream_Returns503(t *testing.T) {
 }
 
 func TestGetInitMP4_ConfiguredButUninitialized_Returns503(t *testing.T) {
-	router, _ := testStreamRouter(t, clock.Real{})
+	router, _, _ := testStreamRouter(t, clock.Real{})
 
 	// Stream 1 is configured but not initialized.
 	req := httptest.NewRequest(http.MethodGet, "/stream/1/init-123.mp4", nil)
@@ -147,7 +147,7 @@ func TestGetInitMP4_ConfiguredButUninitialized_Returns503(t *testing.T) {
 
 func TestGetInitMP4_StaleInitID(t *testing.T) {
 	clk := clock.NewMock(time.UnixMilli(1000))
-	router, store := testStreamRouter(t, clk)
+	router, store, _ := testStreamRouter(t, clk)
 	initStream(t, store, "1")
 
 	// Request with a mismatched initID should return 404.
@@ -159,7 +159,7 @@ func TestGetInitMP4_StaleInitID(t *testing.T) {
 }
 
 func TestGetInitMP4_InvalidInitID(t *testing.T) {
-	router, store := testStreamRouter(t, clock.Real{})
+	router, store, _ := testStreamRouter(t, clock.Real{})
 	initStream(t, store, "1")
 
 	req := httptest.NewRequest(http.MethodGet, "/stream/1/init-abc.mp4", nil)
@@ -172,7 +172,7 @@ func TestGetInitMP4_InvalidInitID(t *testing.T) {
 // --- GET /stream/{streamID}/media.m3u8 tests ---
 
 func TestMediaPlaylist_UnconfiguredStream_Returns503(t *testing.T) {
-	router, _ := testStreamRouter(t, clock.Real{})
+	router, _, _ := testStreamRouter(t, clock.Real{})
 
 	// Unconfigured streams with valid IDs return 503 to prevent enumeration.
 	req := httptest.NewRequest(http.MethodGet, "/stream/999/media.m3u8", nil)
@@ -184,7 +184,7 @@ func TestMediaPlaylist_UnconfiguredStream_Returns503(t *testing.T) {
 }
 
 func TestMediaPlaylist_ConfiguredButUninitialized_Returns503(t *testing.T) {
-	router, _ := testStreamRouter(t, clock.Real{})
+	router, _, _ := testStreamRouter(t, clock.Real{})
 
 	// Stream 1 is configured but not initialized.
 	req := httptest.NewRequest(http.MethodGet, "/stream/1/media.m3u8", nil)
@@ -198,7 +198,7 @@ func TestMediaPlaylist_ConfiguredButUninitialized_Returns503(t *testing.T) {
 func TestMediaPlaylist_WithSegments(t *testing.T) {
 	// Start at time 0 so segment commits are accepted (timestamps are in the future).
 	clk := clock.NewMock(time.UnixMilli(0))
-	router, store := testStreamRouter(t, clk)
+	router, store, _ := testStreamRouter(t, clk)
 	initStream(t, store, "1")
 
 	s := store.Get("1")
@@ -241,7 +241,7 @@ func TestMediaPlaylist_WithSegments(t *testing.T) {
 func TestMediaPlaylist_WallClockFiltering(t *testing.T) {
 	// Start at time 0 so all segment commits are accepted.
 	clk := clock.NewMock(time.UnixMilli(0))
-	router, store := testStreamRouter(t, clk)
+	router, store, _ := testStreamRouter(t, clk)
 	initStream(t, store, "1")
 
 	s := store.Get("1")
@@ -278,7 +278,7 @@ func TestMediaPlaylist_WallClockFiltering(t *testing.T) {
 
 func TestMediaPlaylist_Returns503WhenStreamDeletedWhileWaiting(t *testing.T) {
 	clk := clock.NewMock(time.UnixMilli(0))
-	router, store := testStreamRouter(t, clk)
+	router, store, _ := testStreamRouter(t, clk)
 	initStream(t, store, "1")
 
 	s := store.Get("1")
@@ -308,7 +308,7 @@ func TestMediaPlaylist_Returns503WhenPlaylistBecomesEmpty(t *testing.T) {
 	// valid) but the cached playlist has since become "". This can happen
 	// when the mock clock moves backward so all segments become future.
 	clk := clock.NewMock(time.UnixMilli(0))
-	router, store := testStreamRouter(t, clk)
+	router, store, _ := testStreamRouter(t, clk)
 	initStream(t, store, "1")
 
 	s := store.Get("1")
@@ -346,7 +346,7 @@ func TestMediaPlaylist_Returns503WhenPlaylistBecomesEmpty(t *testing.T) {
 // --- GET /stream/{streamID}/stream.m3u8 tests ---
 
 func TestStreamM3U8_UnconfiguredStream_Returns503(t *testing.T) {
-	router, _ := testStreamRouter(t, clock.Real{})
+	router, _, _ := testStreamRouter(t, clock.Real{})
 
 	// Unconfigured streams with valid IDs return 503 to prevent enumeration.
 	req := httptest.NewRequest(http.MethodGet, "/stream/999/stream.m3u8", nil)
@@ -358,7 +358,7 @@ func TestStreamM3U8_UnconfiguredStream_Returns503(t *testing.T) {
 }
 
 func TestStreamM3U8_ConfiguredButUninitialized_Returns503(t *testing.T) {
-	router, _ := testStreamRouter(t, clock.Real{})
+	router, _, _ := testStreamRouter(t, clock.Real{})
 
 	// Stream 1 is configured but not initialized.
 	req := httptest.NewRequest(http.MethodGet, "/stream/1/stream.m3u8", nil)
@@ -373,7 +373,7 @@ func TestStreamM3U8_ConfiguredButUninitialized_Returns503(t *testing.T) {
 
 func TestNosniffHeader(t *testing.T) {
 	clk := clock.NewMock(time.UnixMilli(1000))
-	router, store := testStreamRouter(t, clk)
+	router, store, _ := testStreamRouter(t, clk)
 	initStream(t, store, "1")
 
 	s := store.Get("1")
@@ -411,7 +411,7 @@ func TestNosniffHeader(t *testing.T) {
 // --- Health check tests ---
 
 func TestStreamServer_Healthz(t *testing.T) {
-	router, _ := testStreamRouter(t, clock.Real{})
+	router, _, _ := testStreamRouter(t, clock.Real{})
 
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	rec := httptest.NewRecorder()
@@ -424,7 +424,7 @@ func TestStreamServer_Healthz(t *testing.T) {
 
 func TestMediaPlaylist_Returns503OnContextCancellation(t *testing.T) {
 	clk := clock.NewMock(time.UnixMilli(0))
-	router, store := testStreamRouter(t, clk)
+	router, store, _ := testStreamRouter(t, clk)
 	initStream(t, store, "1")
 
 	// Do not commit any segments so the handler blocks on HasPlaylist.
@@ -450,7 +450,7 @@ func TestMediaPlaylist_Returns503OnContextCancellation(t *testing.T) {
 // --- Routing tests ---
 
 func TestPublicRoute_InvalidStreamID(t *testing.T) {
-	router, _ := testStreamRouter(t, clock.Real{})
+	router, _, _ := testStreamRouter(t, clock.Real{})
 
 	// Stream ID with non-alphanumeric characters should return 404 Not Found.
 	req := httptest.NewRequest(http.MethodGet, "/stream/a.b/media.m3u8", nil)

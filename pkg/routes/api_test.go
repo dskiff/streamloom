@@ -12,6 +12,7 @@ import (
 	"github.com/dskiff/streamloom/pkg/clock"
 	"github.com/dskiff/streamloom/pkg/config"
 	"github.com/dskiff/streamloom/pkg/stream"
+	"github.com/dskiff/streamloom/pkg/watcher"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -19,7 +20,7 @@ import (
 // --- Auth middleware tests ---
 
 func TestAuth_MissingToken(t *testing.T) {
-	router, _, _ := testAPIRouterWithToken(t, clock.Real{})
+	router, _, _, _ := testAPIRouterWithToken(t, clock.Real{})
 
 	hdrs := initHeaders()
 	rec := postInit(router, "1", "", hdrs, []byte("init-data"))
@@ -27,7 +28,7 @@ func TestAuth_MissingToken(t *testing.T) {
 }
 
 func TestAuth_InvalidToken(t *testing.T) {
-	router, _, _ := testAPIRouterWithToken(t, clock.Real{})
+	router, _, _, _ := testAPIRouterWithToken(t, clock.Real{})
 
 	hdrs := initHeaders()
 	rec := postInit(router, "1", "wrong-token", hdrs, []byte("init-data"))
@@ -35,7 +36,7 @@ func TestAuth_InvalidToken(t *testing.T) {
 }
 
 func TestAuth_UnconfiguredStream(t *testing.T) {
-	router, _, _ := testAPIRouterWithToken(t, clock.Real{})
+	router, _, _, _ := testAPIRouterWithToken(t, clock.Real{})
 
 	hdrs := initHeaders()
 	// Stream 999 has no configured token.
@@ -44,7 +45,7 @@ func TestAuth_UnconfiguredStream(t *testing.T) {
 }
 
 func TestAuth_InvalidStreamID(t *testing.T) {
-	router, _, _ := testAPIRouterWithToken(t, clock.Real{})
+	router, _, _, _ := testAPIRouterWithToken(t, clock.Real{})
 
 	hdrs := initHeaders()
 	rec := postInit(router, "a.b", "test-token", hdrs, []byte("init-data"))
@@ -52,7 +53,7 @@ func TestAuth_InvalidStreamID(t *testing.T) {
 }
 
 func TestAuth_ValidToken(t *testing.T) {
-	router, store, _ := testAPIRouterWithToken(t, clock.Real{})
+	router, store, _, _ := testAPIRouterWithToken(t, clock.Real{})
 
 	hdrs := initHeaders()
 	rec := postInit(router, "1", "test-token", hdrs, []byte("init-data"))
@@ -63,7 +64,7 @@ func TestAuth_ValidToken(t *testing.T) {
 // --- POST /api/v1/stream/{streamID}/init tests ---
 
 func TestPostInit_Success(t *testing.T) {
-	router, store, _ := testAPIRouterWithToken(t, clock.Real{})
+	router, store, _, _ := testAPIRouterWithToken(t, clock.Real{})
 
 	hdrs := initHeaders()
 	rec := postInit(router, "1", "test-token", hdrs, []byte("init-data"))
@@ -83,7 +84,7 @@ func TestPostInit_Success(t *testing.T) {
 }
 
 func TestPostInit_MissingBandwidth(t *testing.T) {
-	router, _, _ := testAPIRouterWithToken(t, clock.Real{})
+	router, _, _, _ := testAPIRouterWithToken(t, clock.Real{})
 
 	hdrs := initHeaders()
 	delete(hdrs, "X-SL-BANDWIDTH")
@@ -92,7 +93,7 @@ func TestPostInit_MissingBandwidth(t *testing.T) {
 }
 
 func TestPostInit_InvalidBandwidth(t *testing.T) {
-	router, _, _ := testAPIRouterWithToken(t, clock.Real{})
+	router, _, _, _ := testAPIRouterWithToken(t, clock.Real{})
 
 	hdrs := initHeaders()
 	hdrs["X-SL-BANDWIDTH"] = "-1"
@@ -101,7 +102,7 @@ func TestPostInit_InvalidBandwidth(t *testing.T) {
 }
 
 func TestPostInit_MissingCodecs(t *testing.T) {
-	router, _, _ := testAPIRouterWithToken(t, clock.Real{})
+	router, _, _, _ := testAPIRouterWithToken(t, clock.Real{})
 
 	hdrs := initHeaders()
 	hdrs["X-SL-CODECS"] = ""
@@ -110,7 +111,7 @@ func TestPostInit_MissingCodecs(t *testing.T) {
 }
 
 func TestPostInit_MissingResolution(t *testing.T) {
-	router, _, _ := testAPIRouterWithToken(t, clock.Real{})
+	router, _, _, _ := testAPIRouterWithToken(t, clock.Real{})
 
 	hdrs := initHeaders()
 	delete(hdrs, "X-SL-RESOLUTION")
@@ -119,7 +120,7 @@ func TestPostInit_MissingResolution(t *testing.T) {
 }
 
 func TestPostInit_InvalidResolution(t *testing.T) {
-	router, _, _ := testAPIRouterWithToken(t, clock.Real{})
+	router, _, _, _ := testAPIRouterWithToken(t, clock.Real{})
 
 	hdrs := initHeaders()
 	hdrs["X-SL-RESOLUTION"] = "notvalid"
@@ -128,7 +129,7 @@ func TestPostInit_InvalidResolution(t *testing.T) {
 }
 
 func TestPostInit_OversizedResolution(t *testing.T) {
-	router, _, _ := testAPIRouterWithToken(t, clock.Real{})
+	router, _, _, _ := testAPIRouterWithToken(t, clock.Real{})
 
 	hdrs := initHeaders()
 	hdrs["X-SL-RESOLUTION"] = "99999x99999"
@@ -137,7 +138,7 @@ func TestPostInit_OversizedResolution(t *testing.T) {
 }
 
 func TestPostInit_MissingFramerate(t *testing.T) {
-	router, _, _ := testAPIRouterWithToken(t, clock.Real{})
+	router, _, _, _ := testAPIRouterWithToken(t, clock.Real{})
 
 	hdrs := initHeaders()
 	delete(hdrs, "X-SL-FRAMERATE")
@@ -146,7 +147,7 @@ func TestPostInit_MissingFramerate(t *testing.T) {
 }
 
 func TestPostInit_InvalidFramerate(t *testing.T) {
-	router, _, _ := testAPIRouterWithToken(t, clock.Real{})
+	router, _, _, _ := testAPIRouterWithToken(t, clock.Real{})
 
 	for _, val := range []string{"0", "-1", "NaN", "Inf"} {
 		hdrs := initHeaders()
@@ -157,7 +158,7 @@ func TestPostInit_InvalidFramerate(t *testing.T) {
 }
 
 func TestPostInit_MissingTargetDuration(t *testing.T) {
-	router, _, _ := testAPIRouterWithToken(t, clock.Real{})
+	router, _, _, _ := testAPIRouterWithToken(t, clock.Real{})
 
 	hdrs := initHeaders()
 	delete(hdrs, "X-SL-TARGET-DURATION")
@@ -166,7 +167,7 @@ func TestPostInit_MissingTargetDuration(t *testing.T) {
 }
 
 func TestPostInit_EmptyBody(t *testing.T) {
-	router, _, _ := testAPIRouterWithToken(t, clock.Real{})
+	router, _, _, _ := testAPIRouterWithToken(t, clock.Real{})
 
 	hdrs := initHeaders()
 	rec := postInit(router, "1", "test-token", hdrs, []byte{})
@@ -174,7 +175,7 @@ func TestPostInit_EmptyBody(t *testing.T) {
 }
 
 func TestPostInit_OversizedBody(t *testing.T) {
-	router, _, _ := testAPIRouterWithToken(t, clock.Real{})
+	router, _, _, _ := testAPIRouterWithToken(t, clock.Real{})
 
 	hdrs := initHeaders()
 	body := make([]byte, stream.MaxInitBytes+1)
@@ -183,7 +184,7 @@ func TestPostInit_OversizedBody(t *testing.T) {
 }
 
 func TestPostInit_MissingSegmentCap(t *testing.T) {
-	router, _, _ := testAPIRouterWithToken(t, clock.Real{})
+	router, _, _, _ := testAPIRouterWithToken(t, clock.Real{})
 
 	hdrs := initHeaders()
 	delete(hdrs, "X-SL-SEGMENT-CAP")
@@ -192,7 +193,7 @@ func TestPostInit_MissingSegmentCap(t *testing.T) {
 }
 
 func TestPostInit_MissingSegmentBytes(t *testing.T) {
-	router, _, _ := testAPIRouterWithToken(t, clock.Real{})
+	router, _, _, _ := testAPIRouterWithToken(t, clock.Real{})
 
 	hdrs := initHeaders()
 	delete(hdrs, "X-SL-SEGMENT-BYTES")
@@ -201,7 +202,7 @@ func TestPostInit_MissingSegmentBytes(t *testing.T) {
 }
 
 func TestPostInit_MissingBackwardBufferSize(t *testing.T) {
-	router, _, _ := testAPIRouterWithToken(t, clock.Real{})
+	router, _, _, _ := testAPIRouterWithToken(t, clock.Real{})
 
 	hdrs := initHeaders()
 	delete(hdrs, "X-SL-BACKWARD-BUFFER-SIZE")
@@ -221,7 +222,8 @@ func TestPostInit_ExceedsMaxBufferBytes(t *testing.T) {
 			"1": sha256.Sum256([]byte("Bearer test-token")),
 		},
 	}
-	router := API(l, env, store, nil)
+	tracker := watcher.NewTracker(clock.Real{})
+	router := API(l, env, store, nil, tracker)
 
 	hdrs := initHeaders()
 	hdrs["X-SL-SEGMENT-CAP"] = "100"
@@ -237,7 +239,7 @@ func TestPostInit_BufferSizeOverflowsInt64(t *testing.T) {
 		t.Skip("overflow guard targets 64-bit; Atoi range prevents this on 32-bit")
 	}
 
-	router, _, _ := testAPIRouterWithToken(t, clock.Real{})
+	router, _, _, _ := testAPIRouterWithToken(t, clock.Real{})
 	hdrs := initHeaders()
 	// These values are individually valid ints on 64-bit, but their product
 	// overflows int64: (4611686018427387903 + 20) * 3 > math.MaxInt64.
@@ -249,7 +251,7 @@ func TestPostInit_BufferSizeOverflowsInt64(t *testing.T) {
 
 func TestPostInit_ReInitClearsSegments(t *testing.T) {
 	clk := clock.NewMock(time.UnixMilli(0))
-	router, store, _ := testAPIRouterWithToken(t, clk)
+	router, store, _, _ := testAPIRouterWithToken(t, clk)
 
 	hdrs := initHeaders()
 	rec := postInit(router, "1", "test-token", hdrs, []byte("init-data-v1"))
@@ -273,7 +275,7 @@ func TestPostInit_ReInitClearsSegments(t *testing.T) {
 
 func TestPostSegment_Success(t *testing.T) {
 	clk := clock.NewMock(time.UnixMilli(0))
-	router, store, _ := testAPIRouterWithToken(t, clk)
+	router, store, _, _ := testAPIRouterWithToken(t, clk)
 
 	hdrs := initHeaders()
 	rec := postInit(router, "1", "test-token", hdrs, []byte("init-data"))
@@ -289,7 +291,7 @@ func TestPostSegment_Success(t *testing.T) {
 }
 
 func TestPostSegment_StreamNotFound(t *testing.T) {
-	router, _, _ := testAPIRouterWithToken(t, clock.Real{})
+	router, _, _, _ := testAPIRouterWithToken(t, clock.Real{})
 
 	rec := postSegment(router, "1", "test-token", "0", "5000", "2000", []byte("segment-data"))
 	assert.Equal(t, http.StatusNotFound, rec.Code)
@@ -297,7 +299,7 @@ func TestPostSegment_StreamNotFound(t *testing.T) {
 
 func TestPostSegment_MissingIndex(t *testing.T) {
 	clk := clock.NewMock(time.UnixMilli(0))
-	router, store, _ := testAPIRouterWithToken(t, clk)
+	router, store, _, _ := testAPIRouterWithToken(t, clk)
 	hdrs := initHeaders()
 	postInit(router, "1", "test-token", hdrs, []byte("init-data"))
 	t.Cleanup(func() { store.Delete("1") })
@@ -308,7 +310,7 @@ func TestPostSegment_MissingIndex(t *testing.T) {
 
 func TestPostSegment_MissingTimestamp(t *testing.T) {
 	clk := clock.NewMock(time.UnixMilli(0))
-	router, store, _ := testAPIRouterWithToken(t, clk)
+	router, store, _, _ := testAPIRouterWithToken(t, clk)
 	hdrs := initHeaders()
 	postInit(router, "1", "test-token", hdrs, []byte("init-data"))
 	t.Cleanup(func() { store.Delete("1") })
@@ -319,7 +321,7 @@ func TestPostSegment_MissingTimestamp(t *testing.T) {
 
 func TestPostSegment_MissingDuration(t *testing.T) {
 	clk := clock.NewMock(time.UnixMilli(0))
-	router, store, _ := testAPIRouterWithToken(t, clk)
+	router, store, _, _ := testAPIRouterWithToken(t, clk)
 	hdrs := initHeaders()
 	postInit(router, "1", "test-token", hdrs, []byte("init-data"))
 	t.Cleanup(func() { store.Delete("1") })
@@ -330,7 +332,7 @@ func TestPostSegment_MissingDuration(t *testing.T) {
 
 func TestPostSegment_ZeroDuration(t *testing.T) {
 	clk := clock.NewMock(time.UnixMilli(0))
-	router, store, _ := testAPIRouterWithToken(t, clk)
+	router, store, _, _ := testAPIRouterWithToken(t, clk)
 	hdrs := initHeaders()
 	postInit(router, "1", "test-token", hdrs, []byte("init-data"))
 	t.Cleanup(func() { store.Delete("1") })
@@ -341,7 +343,7 @@ func TestPostSegment_ZeroDuration(t *testing.T) {
 
 func TestPostSegment_EmptyBody(t *testing.T) {
 	clk := clock.NewMock(time.UnixMilli(0))
-	router, store, _ := testAPIRouterWithToken(t, clk)
+	router, store, _, _ := testAPIRouterWithToken(t, clk)
 	hdrs := initHeaders()
 	postInit(router, "1", "test-token", hdrs, []byte("init-data"))
 	t.Cleanup(func() { store.Delete("1") })
@@ -352,7 +354,7 @@ func TestPostSegment_EmptyBody(t *testing.T) {
 
 func TestPostSegment_DuplicateIndex(t *testing.T) {
 	clk := clock.NewMock(time.UnixMilli(0))
-	router, store, _ := testAPIRouterWithToken(t, clk)
+	router, store, _, _ := testAPIRouterWithToken(t, clk)
 	hdrs := initHeaders()
 	postInit(router, "1", "test-token", hdrs, []byte("init-data"))
 	t.Cleanup(func() { store.Delete("1") })
@@ -366,7 +368,7 @@ func TestPostSegment_DuplicateIndex(t *testing.T) {
 
 func TestPostSegment_TimestampInPast(t *testing.T) {
 	clk := clock.NewMock(time.UnixMilli(0))
-	router, store, _ := testAPIRouterWithToken(t, clk)
+	router, store, _, _ := testAPIRouterWithToken(t, clk)
 
 	hdrs := initHeaders()
 	postInit(router, "1", "test-token", hdrs, []byte("init-data"))
@@ -385,7 +387,7 @@ func TestPostSegment_TimestampInPast(t *testing.T) {
 
 func TestPostSegment_OversizedBody(t *testing.T) {
 	clk := clock.NewMock(time.UnixMilli(0))
-	router, store, _ := testAPIRouterWithToken(t, clk)
+	router, store, _, _ := testAPIRouterWithToken(t, clk)
 	hdrs := initHeaders()
 	// Segment bytes is 1024, so a body larger than that should be rejected.
 	postInit(router, "1", "test-token", hdrs, []byte("init-data"))
@@ -399,7 +401,7 @@ func TestPostSegment_OversizedBody(t *testing.T) {
 // --- DELETE /api/v1/stream/{streamID} tests ---
 
 func TestDelete_Success(t *testing.T) {
-	router, store, _ := testAPIRouterWithToken(t, clock.Real{})
+	router, store, _, _ := testAPIRouterWithToken(t, clock.Real{})
 
 	hdrs := initHeaders()
 	rec := postInit(router, "1", "test-token", hdrs, []byte("init-data"))
@@ -415,7 +417,7 @@ func TestDelete_Success(t *testing.T) {
 }
 
 func TestDelete_NotFound(t *testing.T) {
-	router, _, _ := testAPIRouterWithToken(t, clock.Real{})
+	router, _, _, _ := testAPIRouterWithToken(t, clock.Real{})
 
 	req := httptest.NewRequest(http.MethodDelete, "/api/v1/stream/1/", nil)
 	req.Header.Set("Authorization", "Bearer test-token")
@@ -426,7 +428,7 @@ func TestDelete_NotFound(t *testing.T) {
 }
 
 func TestDelete_Unauthorized(t *testing.T) {
-	router, _, _ := testAPIRouterWithToken(t, clock.Real{})
+	router, _, _, _ := testAPIRouterWithToken(t, clock.Real{})
 
 	req := httptest.NewRequest(http.MethodDelete, "/api/v1/stream/1/", nil)
 	req.Header.Set("Authorization", "Bearer wrong-token")
