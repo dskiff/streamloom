@@ -11,14 +11,16 @@ import (
 	"github.com/dskiff/streamloom/pkg/clock"
 	"github.com/dskiff/streamloom/pkg/config"
 	"github.com/dskiff/streamloom/pkg/stream"
+	"github.com/dskiff/streamloom/pkg/watcher"
 	"github.com/stretchr/testify/require"
 )
 
 // testStreamRouter creates a stream router with a pre-populated store.
 // The returned store can be used to initialize streams before making requests.
-func testStreamRouter(t *testing.T, clk clock.Clock) (http.Handler, *stream.Store) {
+func testStreamRouter(t *testing.T, clk clock.Clock) (http.Handler, *stream.Store, *watcher.Tracker) {
 	t.Helper()
 	store := stream.NewStore(clk)
+	tracker := watcher.NewTracker(clk)
 	l := slog.Default()
 	env := config.Env{
 		STREAM_MAX_BUFFER_BYTES: config.DefaultStreamMaxBufferBytes,
@@ -27,14 +29,15 @@ func testStreamRouter(t *testing.T, clk clock.Clock) (http.Handler, *stream.Stor
 			"1": sha256.Sum256([]byte("Bearer test-token")),
 		},
 	}
-	router := Stream(l, env, store, nil)
-	return router, store
+	router := Stream(l, env, store, nil, tracker)
+	return router, store, tracker
 }
 
 // testAPIRouterWithToken creates an API router with a configured token for stream 1.
-func testAPIRouterWithToken(t *testing.T, clk clock.Clock) (http.Handler, *stream.Store, config.Env) {
+func testAPIRouterWithToken(t *testing.T, clk clock.Clock) (http.Handler, *stream.Store, config.Env, *watcher.Tracker) {
 	t.Helper()
 	store := stream.NewStore(clk)
+	tracker := watcher.NewTracker(clk)
 	l := slog.Default()
 	env := config.Env{
 		STREAM_MAX_BUFFER_BYTES: config.DefaultStreamMaxBufferBytes,
@@ -43,15 +46,16 @@ func testAPIRouterWithToken(t *testing.T, clk clock.Clock) (http.Handler, *strea
 			"1": sha256.Sum256([]byte("Bearer test-token")),
 		},
 	}
-	router := API(l, env, store, nil)
-	return router, store, env
+	router := API(l, env, store, nil, tracker)
+	return router, store, env, tracker
 }
 
 // testBothRoutersWithToken creates both stream and API routers sharing a store.
 // Used for E2E tests that push via API and read via stream server.
-func testBothRoutersWithToken(t *testing.T, clk clock.Clock) (streamRouter http.Handler, apiRouter http.Handler, store *stream.Store) {
+func testBothRoutersWithToken(t *testing.T, clk clock.Clock) (streamRouter http.Handler, apiRouter http.Handler, store *stream.Store, tracker *watcher.Tracker) {
 	t.Helper()
 	store = stream.NewStore(clk)
+	tracker = watcher.NewTracker(clk)
 	l := slog.Default()
 	env := config.Env{
 		STREAM_MAX_BUFFER_BYTES: config.DefaultStreamMaxBufferBytes,
@@ -60,9 +64,9 @@ func testBothRoutersWithToken(t *testing.T, clk clock.Clock) (streamRouter http.
 			"1": sha256.Sum256([]byte("Bearer test-token")),
 		},
 	}
-	streamRouter = Stream(l, env, store, nil)
-	apiRouter = API(l, env, store, nil)
-	return streamRouter, apiRouter, store
+	streamRouter = Stream(l, env, store, nil, tracker)
+	apiRouter = API(l, env, store, nil, tracker)
+	return streamRouter, apiRouter, store, tracker
 }
 
 // initStream initializes a test stream in the store with a known init segment.

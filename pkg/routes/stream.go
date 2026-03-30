@@ -13,6 +13,7 @@ import (
 	mw "github.com/dskiff/streamloom/pkg/middleware"
 	"github.com/dskiff/streamloom/pkg/pool"
 	"github.com/dskiff/streamloom/pkg/stream"
+	"github.com/dskiff/streamloom/pkg/watcher"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 )
@@ -40,7 +41,7 @@ func getStream(store *stream.Store, streamID string) (*stream.Stream, int) {
 }
 
 // Stream constructs the chi router for the public HLS stream server.
-func Stream(logger *slog.Logger, env config.Env, store *stream.Store, requestLogger *slog.Logger) chi.Router {
+func Stream(logger *slog.Logger, env config.Env, store *stream.Store, requestLogger *slog.Logger, tracker *watcher.Tracker) chi.Router {
 	router := chi.NewRouter()
 	router.Use(middleware.RequestID)
 	router.Use(mw.TrustedRealIP(env.TRUSTED_PROXIES))
@@ -57,6 +58,8 @@ func Stream(logger *slog.Logger, env config.Env, store *stream.Store, requestLog
 	})
 
 	router.Route("/stream/{streamID}", func(r chi.Router) {
+		r.Use(mw.RecordWatcher(tracker))
+
 		r.Get("/media.m3u8", func(w http.ResponseWriter, r *http.Request) {
 			streamID := chi.URLParam(r, "streamID")
 			logger.Debug("handling media request", "streamID", streamID)

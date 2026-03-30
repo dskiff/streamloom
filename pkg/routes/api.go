@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"math"
@@ -17,6 +18,7 @@ import (
 	mw "github.com/dskiff/streamloom/pkg/middleware"
 	"github.com/dskiff/streamloom/pkg/pool"
 	"github.com/dskiff/streamloom/pkg/stream"
+	"github.com/dskiff/streamloom/pkg/watcher"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 )
@@ -48,7 +50,7 @@ func parseResolution(s string) (width, height int, ok bool) {
 }
 
 // API constructs the chi router for the authenticated push API server.
-func API(logger *slog.Logger, env config.Env, store *stream.Store, requestLogger *slog.Logger) chi.Router {
+func API(logger *slog.Logger, env config.Env, store *stream.Store, requestLogger *slog.Logger, tracker *watcher.Tracker) chi.Router {
 	router := chi.NewRouter()
 	router.Use(middleware.RequestID)
 	router.Use(mw.TrustedRealIP(env.TRUSTED_PROXIES))
@@ -114,6 +116,7 @@ func API(logger *slog.Logger, env config.Env, store *stream.Store, requestLogger
 				return
 			}
 
+			tracker.DeleteStream(streamID)
 			logger.Info("stream deleted", "streamID", streamID)
 			w.WriteHeader(http.StatusNoContent)
 		})
@@ -287,6 +290,30 @@ func API(logger *slog.Logger, env config.Env, store *stream.Store, requestLogger
 			)
 
 			w.WriteHeader(http.StatusCreated)
+		})
+
+		r.Get("/active_watchers", func(w http.ResponseWriter, r *http.Request) {
+			streamID := r.Context().Value(streamIDKey).(string)
+			logger.Debug("handling active watchers request", "streamID", streamID)
+
+			windowMs := watcher.DefaultWindowMs
+			if raw := r.URL.Query().Get("window_ms"); raw != "" {
+				parsed, err := strconv.ParseInt(raw, 10, 64)
+				if err != nil || parsed <= 0 {
+					logger.Warn("invalid window_ms parameter", "value", raw)
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				windowMs = parsed
+			}
+
+			count := tracker.ActiveCount(streamID, windowMs)
+
+			w.Header().Set("Content-Type", "text/plain")
+			w.Header().Set("Cache-Control", "no-store")
+			if _, err := fmt.Fprintf(w, "%d", count); err != nil {
+				logger.Error("failed to write response", "error", err)
+			}
 		})
 
 		r.Post("/segment", func(w http.ResponseWriter, r *http.Request) {

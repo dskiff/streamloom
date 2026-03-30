@@ -13,6 +13,7 @@ import (
 	"github.com/dskiff/streamloom/pkg/clock"
 	"github.com/dskiff/streamloom/pkg/config"
 	"github.com/dskiff/streamloom/pkg/stream"
+	"github.com/dskiff/streamloom/pkg/watcher"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -20,7 +21,7 @@ import (
 // --- GET /stream/{streamID}/stream.m3u8 (master playlist) tests ---
 
 func TestMasterPlaylist_Success(t *testing.T) {
-	streamRouter, apiRouter, store := testBothRoutersWithToken(t, clock.Real{})
+	streamRouter, apiRouter, store, _ := testBothRoutersWithToken(t, clock.Real{})
 
 	hdrs := initHeaders()
 	rec := postInit(apiRouter, "1", "test-token", hdrs, []byte("init-data"))
@@ -47,7 +48,7 @@ func TestMasterPlaylist_Success(t *testing.T) {
 }
 
 func TestMasterPlaylist_StreamNotFound(t *testing.T) {
-	streamRouter, _, _ := testBothRoutersWithToken(t, clock.Real{})
+	streamRouter, _, _, _ := testBothRoutersWithToken(t, clock.Real{})
 
 	// Valid-format but unknown stream ID returns 503 (not 404) to prevent
 	// stream ID enumeration via response-code differentiation.
@@ -63,7 +64,7 @@ func TestMasterPlaylist_StreamNotFound(t *testing.T) {
 
 func TestE2E_InitPushRetrieve(t *testing.T) {
 	clk := clock.NewMock(time.UnixMilli(0))
-	streamRouter, apiRouter, store := testBothRoutersWithToken(t, clk)
+	streamRouter, apiRouter, store, _ := testBothRoutersWithToken(t, clk)
 
 	// 1. Init the stream via the HTTP API.
 	hdrs := initHeaders()
@@ -124,8 +125,9 @@ func TestE2E_StringStreamID(t *testing.T) {
 			"myStream": sha256.Sum256([]byte("Bearer my-token")),
 		},
 	}
-	streamRouter := Stream(l, env, store, nil)
-	apiRouter := API(l, env, store, nil)
+	tracker := watcher.NewTracker(clk)
+	streamRouter := Stream(l, env, store, nil, tracker)
+	apiRouter := API(l, env, store, nil, tracker)
 
 	// 1. Init the stream with a non-numeric string ID.
 	hdrs := initHeaders()
