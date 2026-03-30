@@ -58,16 +58,7 @@ func Stream(logger *slog.Logger, env config.Env, store *stream.Store, requestLog
 	})
 
 	router.Route("/stream/{streamID}", func(r chi.Router) {
-		r.Use(func(next http.Handler) http.Handler {
-			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				streamID := chi.URLParam(r, "streamID")
-				if streamID != "" {
-					ip := watcher.ExtractIP(r.RemoteAddr)
-					tracker.Record(streamID, ip)
-				}
-				next.ServeHTTP(w, r)
-			})
-		})
+		r.Use(mw.RecordWatcher(tracker))
 
 		r.Get("/media.m3u8", func(w http.ResponseWriter, r *http.Request) {
 			streamID := chi.URLParam(r, "streamID")

@@ -2,7 +2,6 @@
 package watcher
 
 import (
-	"net"
 	"sync"
 	"time"
 
@@ -104,16 +103,4 @@ func (t *Tracker) DeleteStream(streamID string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	delete(t.streams, streamID)
-}
-
-// ExtractIP parses the host portion from an address that may be "IP",
-// "IP:port", or "[IPv6]:port". After chi's RealIP middleware, RemoteAddr
-// may be a bare IP (from X-Forwarded-For) or IP:port (direct connection).
-func ExtractIP(addr string) string {
-	host, _, err := net.SplitHostPort(addr)
-	if err != nil {
-		// addr is likely a bare IP without port
-		return addr
-	}
-	return host
 }
