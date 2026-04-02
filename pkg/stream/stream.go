@@ -37,6 +37,10 @@ var ErrTimestampInPast = errors.New("segment timestamp is in the past")
 // sorted by timestamp (index_1 > index_2 iff timestamp_1 > timestamp_2).
 var ErrTimestampOrderViolation = errors.New("segment timestamp order violation")
 
+// ErrStaleGeneration is returned when a segment's generation is older
+// than the stream's current generation. The caller should drop the segment.
+var ErrStaleGeneration = errors.New("stale generation")
+
 // MaxCodecsLength is the maximum allowed length for a codecs string.
 // Real HLS codec strings are typically under 50 bytes (e.g. "avc1.640029,mp4a.40.2").
 const MaxCodecsLength = 256
@@ -76,6 +80,7 @@ type Slot struct {
 	Timestamp  int64            // Unix ms
 	DurationMs uint32           // milliseconds
 	Data       *pool.BufferSlot // buffer from pool; nil when slot is unoccupied
+	Generation int64            // encoding generation; segments from older generations are dropped on advance
 }
 
 // Metadata holds HLS manifest metadata received during stream initialization.
@@ -97,9 +102,10 @@ type Stream struct {
 	initData        []byte
 	initTimestampMs int64 // Unix ms when Init was called; used for cache-busting init URL
 
-	segments   []Slot // sorted by Index
-	segmentCap int    // maximum number of segments
-	bufPool    *pool.BufferPool
+	segments          []Slot // sorted by Index
+	segmentCap        int    // maximum number of segments
+	currentGeneration int64  // latest generation seen; segments from older generations are dropped
+	bufPool           *pool.BufferPool
 
 	// backwardBufferSize is the maximum number of past (played) segments to
 	// retain. On each CommitSlot call, segments older than "now" are counted
@@ -209,6 +215,46 @@ func (s *Stream) WriteInitDataTo(w io.Writer) (int, error) {
 	return w.Write(s.initData)
 }
 
+// CurrentGeneration returns the stream's current generation value.
+func (s *Stream) CurrentGeneration() int64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.currentGeneration
+}
+
+// dropStaleGenerationLocked removes segments at or after position fromPos
+// whose generation is older than the stream's current generation. Freed
+// buffers are returned to the pool. The segment slice is compacted in-place.
+//
+// Segments at/after the insertion point are in the future and must not have
+// active readers; a non-zero reader count triggers a panic.
+//
+// Must be called with s.mu held.
+func (s *Stream) dropStaleGenerationLocked(fromPos int) {
+	w := fromPos // write cursor
+	for r := fromPos; r < len(s.segments); r++ {
+		if s.segments[r].Generation < s.currentGeneration {
+			if s.segments[r].Data.Readers() > 0 {
+				panic(fmt.Sprintf("streamloom: stale segment index=%d has %d active readers",
+					s.segments[r].Index, s.segments[r].Data.Readers()))
+			}
+			s.bufPool.AssertCheckedOut(s.segments[r].Data)
+			s.bufPool.Put(s.segments[r].Data)
+			s.segments[r].Data = nil
+			continue
+		}
+		if w != r {
+			s.segments[w] = s.segments[r]
+		}
+		w++
+	}
+	// Clear trailing slots to avoid retaining stale pointers.
+	for i := w; i < len(s.segments); i++ {
+		s.segments[i] = Slot{}
+	}
+	s.segments = s.segments[:w]
+}
+
 // evictOldLocked removes backward (past) segments that exceed backwardBufferSize.
 // Segments are sorted by index, and the invariant index_1 > index_2 iff
 // timestamp_1 > timestamp_2 means they are also sorted by timestamp.
@@ -275,14 +321,29 @@ func (s *Stream) ReleaseSlot(buf *pool.BufferSlot) {
 // to the stream. On error, the caller retains ownership and must call
 // ReleaseSlot.
 //
-// Returns ErrDuplicateIndex if a segment with the same index already exists,
+// generation identifies the encoding session. When a newer generation is seen,
+// segments from older generations at or after the insertion point are dropped.
+// A generation of 0 is the default and disables generation tracking.
+//
+// Returns ErrStaleGeneration if generation is older than the stream's current,
+// ErrDuplicateIndex if a segment with the same index already exists,
 // ErrBufferFull if the segment list is at capacity, ErrTimestampInPast if
 // the timestamp is before the current time and the stream is non-empty, or
 // ErrTimestampOrderViolation if the timestamp would break the index/timestamp
 // ordering invariant.
-func (s *Stream) CommitSlot(index uint32, buf *pool.BufferSlot, timestamp int64, durationMs uint32) error {
+func (s *Stream) CommitSlot(index uint32, buf *pool.BufferSlot, timestamp int64, durationMs uint32, generation int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// Reject segments from older generations.
+	if s.currentGeneration > generation {
+		return ErrStaleGeneration
+	}
+
+	advancingGeneration := s.currentGeneration < generation
+	if advancingGeneration {
+		s.currentGeneration = generation
+	}
 
 	// Reject past timestamps unless the stream is empty (first segment exception).
 	if timestamp < s.clock.Now().UnixMilli() && len(s.segments) > 0 {
@@ -293,14 +354,19 @@ func (s *Stream) CommitSlot(index uint32, buf *pool.BufferSlot, timestamp int64,
 
 	s.evictOldLocked()
 
-	if len(s.segments) >= s.segmentCap {
-		return ErrBufferFull
-	}
-
 	// Binary search for insertion point.
 	idx := sort.Search(len(s.segments), func(i int) bool {
 		return s.segments[i].Index >= index
 	})
+
+	// Drop stale-generation segments at/after the insertion point.
+	if advancingGeneration {
+		s.dropStaleGenerationLocked(idx)
+	}
+
+	if len(s.segments) >= s.segmentCap {
+		return ErrBufferFull
+	}
 
 	// Check for duplicate.
 	if idx < len(s.segments) && s.segments[idx].Index == index {
@@ -322,6 +388,7 @@ func (s *Stream) CommitSlot(index uint32, buf *pool.BufferSlot, timestamp int64,
 		Timestamp:  timestamp,
 		DurationMs: durationMs,
 		Data:       buf,
+		Generation: generation,
 	})
 
 	s.totalSegmentCount++

@@ -94,7 +94,7 @@ func commitSegment(t *testing.T, s *stream.Stream, index uint32, data []byte, ts
 	require.True(t, ok, "AcquireSlot should succeed")
 	_, err := buf.ReadFrom(bytes.NewReader(data))
 	require.NoError(t, err)
-	err = s.CommitSlot(index, buf, tsMs, 2000)
+	err = s.CommitSlot(index, buf, tsMs, 2000, 0)
 	if err != nil {
 		s.ReleaseSlot(buf)
 	}
@@ -129,6 +129,10 @@ func postInit(router http.Handler, streamID string, token string, headers map[st
 }
 
 func postSegment(router http.Handler, streamID string, token string, index, timestamp, durationMs string, body []byte) *httptest.ResponseRecorder {
+	return postSegmentWithGen(router, streamID, token, index, timestamp, durationMs, "", body)
+}
+
+func postSegmentWithGen(router http.Handler, streamID string, token string, index, timestamp, durationMs, generation string, body []byte) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/stream/"+streamID+"/segment", bytes.NewReader(body))
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
@@ -141,6 +145,9 @@ func postSegment(router http.Handler, streamID string, token string, index, time
 	}
 	if durationMs != "" {
 		req.Header.Set("X-SL-DURATION", durationMs)
+	}
+	if generation != "" {
+		req.Header.Set("X-SL-GENERATION", generation)
 	}
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)

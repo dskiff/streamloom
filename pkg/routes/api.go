@@ -374,6 +374,17 @@ func API(logger *slog.Logger, env config.Env, store *stream.Store, requestLogger
 				return
 			}
 
+			// Parse optional generation header (default 0).
+			var generation int64
+			if genStr := r.Header.Get("X-SL-GENERATION"); genStr != "" {
+				generation, err = strconv.ParseInt(genStr, 10, 64)
+				if err != nil || generation < 0 {
+					logger.Warn("invalid generation header", "value", genStr, "error", err)
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+			}
+
 			// Acquire a buffer slot from the pool.
 			buf, ok := s.AcquireSlot()
 			if !ok {
@@ -410,8 +421,13 @@ func API(logger *slog.Logger, env config.Env, store *stream.Store, requestLogger
 				return
 			}
 
-			if err := s.CommitSlot(uint32(index), buf, timestampNum, uint32(durationMs)); err != nil {
+			if err := s.CommitSlot(uint32(index), buf, timestampNum, uint32(durationMs), generation); err != nil {
 				s.ReleaseSlot(buf)
+				if errors.Is(err, stream.ErrStaleGeneration) {
+					logger.Warn("stale generation", "streamID", streamID, "index", index, "generation", generation)
+					w.WriteHeader(http.StatusConflict)
+					return
+				}
 				if errors.Is(err, stream.ErrTimestampInPast) {
 					logger.Warn("segment timestamp is in the past", "streamID", streamID, "index", index, "timestamp", timestampNum)
 					w.WriteHeader(http.StatusUnprocessableEntity)
