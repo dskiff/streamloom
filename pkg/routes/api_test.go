@@ -437,3 +437,94 @@ func TestDelete_Unauthorized(t *testing.T) {
 
 	assert.Equal(t, http.StatusUnauthorized, rec.Code)
 }
+
+// --- POST /api/v1/stream/{streamID}/segment generation tests ---
+
+func TestPostSegment_GenerationAccepted(t *testing.T) {
+	clk := clock.NewMock(time.UnixMilli(0))
+	router, store, _, _ := testAPIRouterWithToken(t, clk)
+
+	hdrs := initHeaders()
+	rec := postInit(router, "1", "test-token", hdrs, []byte("init-data"))
+	require.Equal(t, http.StatusCreated, rec.Code)
+	t.Cleanup(func() { store.Delete("1") })
+
+	rec = postSegmentWithGen(router, "1", "test-token", "0", "5000", "2000", "1", []byte("data"))
+	assert.Equal(t, http.StatusCreated, rec.Code)
+}
+
+func TestPostSegment_StaleGeneration(t *testing.T) {
+	clk := clock.NewMock(time.UnixMilli(0))
+	router, store, _, _ := testAPIRouterWithToken(t, clk)
+
+	hdrs := initHeaders()
+	rec := postInit(router, "1", "test-token", hdrs, []byte("init-data"))
+	require.Equal(t, http.StatusCreated, rec.Code)
+	t.Cleanup(func() { store.Delete("1") })
+
+	// Push gen=5.
+	rec = postSegmentWithGen(router, "1", "test-token", "0", "5000", "2000", "5", []byte("data"))
+	require.Equal(t, http.StatusCreated, rec.Code)
+
+	// Push gen=2 → stale → 409.
+	rec = postSegmentWithGen(router, "1", "test-token", "1", "7000", "2000", "2", []byte("data"))
+	assert.Equal(t, http.StatusConflict, rec.Code)
+}
+
+func TestPostSegment_InvalidGeneration(t *testing.T) {
+	clk := clock.NewMock(time.UnixMilli(0))
+	router, store, _, _ := testAPIRouterWithToken(t, clk)
+
+	hdrs := initHeaders()
+	rec := postInit(router, "1", "test-token", hdrs, []byte("init-data"))
+	require.Equal(t, http.StatusCreated, rec.Code)
+	t.Cleanup(func() { store.Delete("1") })
+
+	rec = postSegmentWithGen(router, "1", "test-token", "0", "5000", "2000", "abc", []byte("data"))
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+func TestPostSegment_NegativeGeneration(t *testing.T) {
+	clk := clock.NewMock(time.UnixMilli(0))
+	router, store, _, _ := testAPIRouterWithToken(t, clk)
+
+	hdrs := initHeaders()
+	rec := postInit(router, "1", "test-token", hdrs, []byte("init-data"))
+	require.Equal(t, http.StatusCreated, rec.Code)
+	t.Cleanup(func() { store.Delete("1") })
+
+	rec = postSegmentWithGen(router, "1", "test-token", "0", "5000", "2000", "-1", []byte("data"))
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+func TestPostSegment_MissingGenerationDefaultsZero(t *testing.T) {
+	clk := clock.NewMock(time.UnixMilli(0))
+	router, store, _, _ := testAPIRouterWithToken(t, clk)
+
+	hdrs := initHeaders()
+	rec := postInit(router, "1", "test-token", hdrs, []byte("init-data"))
+	require.Equal(t, http.StatusCreated, rec.Code)
+	t.Cleanup(func() { store.Delete("1") })
+
+	// No X-SL-GENERATION header → defaults to 0 → 201.
+	rec = postSegment(router, "1", "test-token", "0", "5000", "2000", []byte("data"))
+	assert.Equal(t, http.StatusCreated, rec.Code)
+}
+
+func TestPostSegment_MissingGenerationStaleAfterAdvance(t *testing.T) {
+	clk := clock.NewMock(time.UnixMilli(0))
+	router, store, _, _ := testAPIRouterWithToken(t, clk)
+
+	hdrs := initHeaders()
+	rec := postInit(router, "1", "test-token", hdrs, []byte("init-data"))
+	require.Equal(t, http.StatusCreated, rec.Code)
+	t.Cleanup(func() { store.Delete("1") })
+
+	// Advance stream to generation 2.
+	rec = postSegmentWithGen(router, "1", "test-token", "0", "5000", "2000", "2", []byte("data"))
+	require.Equal(t, http.StatusCreated, rec.Code)
+
+	// Omitting X-SL-GENERATION defaults to 0, which is now stale → 409.
+	rec = postSegment(router, "1", "test-token", "1", "7000", "2000", []byte("data"))
+	assert.Equal(t, http.StatusConflict, rec.Code)
+}

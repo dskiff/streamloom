@@ -38,7 +38,7 @@ func mustCommitSlot(t *testing.T, s *Stream, index uint32, data []byte, ts int64
 	require.True(t, ok, "AcquireSlot should succeed")
 	_, err := buf.ReadFrom(bytes.NewReader(data))
 	require.NoError(t, err, "ReadFrom should succeed")
-	err = s.CommitSlot(index, buf, ts, dur)
+	err = s.CommitSlot(index, buf, ts, dur, 0)
 	if err != nil {
 		s.ReleaseSlot(buf)
 	}
@@ -65,7 +65,22 @@ func commitSlot(t *testing.T, s *Stream, index uint32, data []byte, ts int64, du
 	require.True(t, ok, "AcquireSlot should succeed")
 	_, err := buf.ReadFrom(bytes.NewReader(data))
 	require.NoError(t, err, "ReadFrom should succeed")
-	err = s.CommitSlot(index, buf, ts, dur)
+	err = s.CommitSlot(index, buf, ts, dur, 0)
+	if err != nil {
+		s.ReleaseSlot(buf)
+	}
+	return err
+}
+
+// commitSlotGen acquires a slot, fills it with data, and attempts to commit
+// it with the given generation. Returns the error from CommitSlot.
+func commitSlotGen(t *testing.T, s *Stream, index uint32, data []byte, ts int64, dur uint32, gen int64) error {
+	t.Helper()
+	buf, ok := s.AcquireSlot()
+	require.True(t, ok, "AcquireSlot should succeed")
+	_, err := buf.ReadFrom(bytes.NewReader(data))
+	require.NoError(t, err, "ReadFrom should succeed")
+	err = s.CommitSlot(index, buf, ts, dur, gen)
 	if err != nil {
 		s.ReleaseSlot(buf)
 	}
@@ -1130,7 +1145,7 @@ func TestConcurrentReadersAndEviction(t *testing.T) {
 				continue
 			}
 			ts := t0.Add(20*time.Second).UnixMilli() + int64(i)*1000
-			if err := s.CommitSlot(uint32(i), buf, ts, 1000); err != nil {
+			if err := s.CommitSlot(uint32(i), buf, ts, 1000, 0); err != nil {
 				s.ReleaseSlot(buf)
 				writerErrs <- fmt.Errorf("CommitSlot failed for segment %d: %w", i, err)
 			}
@@ -1368,4 +1383,216 @@ func TestHasPlaylist_NotClosedWhenNoSegmentsEligible(t *testing.T) {
 		t.Fatal("HasPlaylist should not be closed when no segments are eligible")
 	default:
 	}
+}
+
+// --- Generation tests ---
+
+func TestCommitSlot_StaleGeneration(t *testing.T) {
+	clk := clock.NewMock(time.UnixMilli(0))
+	store := NewStore(clk)
+	meta := Metadata{Bandwidth: 1, Codecs: "avc1.64001f", Width: 1, Height: 1, FrameRate: 30, TargetDurationSecs: 2}
+	mustInit(t, store, "g", meta, []byte("init"), 10, testSegmentBytes, 5)
+	s := store.Get("g")
+
+	// Push gen=5.
+	err := commitSlotGen(t, s, 0, []byte("data"), 5000, 2000, 5)
+	require.NoError(t, err)
+	assert.Equal(t, int64(5), s.CurrentGeneration())
+
+	// Push gen=3 → stale.
+	err = commitSlotGen(t, s, 1, []byte("data"), 7000, 2000, 3)
+	assert.ErrorIs(t, err, ErrStaleGeneration)
+}
+
+func TestCommitSlot_GenerationAdvance_DropsStaleSegments(t *testing.T) {
+	clk := clock.NewMock(time.UnixMilli(0))
+	store := NewStore(clk)
+	meta := Metadata{Bandwidth: 1, Codecs: "avc1.64001f", Width: 1, Height: 1, FrameRate: 30, TargetDurationSecs: 2}
+	mustInit(t, store, "g", meta, []byte("init"), 10, testSegmentBytes, 5)
+	s := store.Get("g")
+
+	// Push 5 segments at gen=0.
+	for i := uint32(0); i < 5; i++ {
+		err := commitSlotGen(t, s, i, []byte("data"), int64(5000+i*2000), 2000, 0)
+		require.NoError(t, err)
+	}
+	segCount, _ := s.SegmentLoad()
+	assert.Equal(t, 5, segCount)
+
+	// Push gen=1 at index=2 → segments 2,3,4 (gen=0) should be dropped.
+	err := commitSlotGen(t, s, 2, []byte("new"), 9000, 2000, 1)
+	require.NoError(t, err)
+
+	segCount, _ = s.SegmentLoad()
+	assert.Equal(t, 3, segCount) // indices 0,1 (gen=0 before insertion point) + index 2 (gen=1)
+
+	// Old indices 3,4 should be gone.
+	_, err = readSegment(s, 3)
+	assert.ErrorIs(t, err, ErrSegmentNotFound)
+	_, err = readSegment(s, 4)
+	assert.ErrorIs(t, err, ErrSegmentNotFound)
+
+	// Indices 0,1 should still be readable.
+	_, err = readSegment(s, 0)
+	assert.NoError(t, err)
+	_, err = readSegment(s, 1)
+	assert.NoError(t, err)
+}
+
+func TestCommitSlot_SameGeneration_NoDrop(t *testing.T) {
+	clk := clock.NewMock(time.UnixMilli(0))
+	store := NewStore(clk)
+	meta := Metadata{Bandwidth: 1, Codecs: "avc1.64001f", Width: 1, Height: 1, FrameRate: 30, TargetDurationSecs: 2}
+	mustInit(t, store, "g", meta, []byte("init"), 10, testSegmentBytes, 5)
+	s := store.Get("g")
+
+	for i := uint32(0); i < 5; i++ {
+		err := commitSlotGen(t, s, i, []byte("data"), int64(5000+i*2000), 2000, 0)
+		require.NoError(t, err)
+	}
+	segCount, _ := s.SegmentLoad()
+	assert.Equal(t, 5, segCount)
+}
+
+func TestCommitSlot_GenerationDropFreesCapacity(t *testing.T) {
+	clk := clock.NewMock(time.UnixMilli(0))
+	store := NewStore(clk)
+	meta := Metadata{Bandwidth: 1, Codecs: "avc1.64001f", Width: 1, Height: 1, FrameRate: 30, TargetDurationSecs: 2}
+	// Capacity of 5, backward buffer 4, workingSpace 1 so AcquireSlot can
+	// succeed even when the segment list is full (the extra pool slot is
+	// needed to hold the new buffer before CommitSlot drops stale segments).
+	err := store.Init("g", meta, []byte("init"), 5, testSegmentBytes, 4, 1, testPlaylistWindowSize)
+	require.NoError(t, err)
+	t.Cleanup(func() { store.Delete("g") })
+	s := store.Get("g")
+
+	// Fill to capacity with gen=0.
+	for i := uint32(0); i < 5; i++ {
+		err := commitSlotGen(t, s, i, []byte("data"), int64(5000+i*2000), 2000, 0)
+		require.NoError(t, err)
+	}
+
+	// Buffer is full. A same-gen push would fail.
+	err = commitSlotGen(t, s, 5, []byte("data"), 15000, 2000, 0)
+	assert.ErrorIs(t, err, ErrBufferFull)
+
+	// But a gen advance at index 2 drops 2,3,4 → frees 3 slots.
+	err = commitSlotGen(t, s, 2, []byte("new"), 9000, 2000, 1)
+	require.NoError(t, err)
+
+	segCount, _ := s.SegmentLoad()
+	assert.Equal(t, 3, segCount) // 0,1 (gen=0) + 2 (gen=1)
+}
+
+func TestCommitSlot_GenerationAdvanceThenContinue(t *testing.T) {
+	clk := clock.NewMock(time.UnixMilli(0))
+	store := NewStore(clk)
+	meta := Metadata{Bandwidth: 1, Codecs: "avc1.64001f", Width: 1, Height: 1, FrameRate: 30, TargetDurationSecs: 2}
+	mustInit(t, store, "g", meta, []byte("init"), 10, testSegmentBytes, 5)
+	s := store.Get("g")
+
+	// Push gen=0 segments.
+	for i := uint32(0); i < 3; i++ {
+		err := commitSlotGen(t, s, i, []byte("data"), int64(5000+i*2000), 2000, 0)
+		require.NoError(t, err)
+	}
+
+	// Advance to gen=1 at index 2.
+	err := commitSlotGen(t, s, 2, []byte("new"), 9000, 2000, 1)
+	require.NoError(t, err)
+
+	// Continue pushing gen=1 segments.
+	err = commitSlotGen(t, s, 3, []byte("new2"), 11000, 2000, 1)
+	require.NoError(t, err)
+	err = commitSlotGen(t, s, 4, []byte("new3"), 13000, 2000, 1)
+	require.NoError(t, err)
+
+	segCount, _ := s.SegmentLoad()
+	assert.Equal(t, 5, segCount) // 0,1 (gen=0) + 2,3,4 (gen=1)
+}
+
+func TestCommitSlot_SameGenDropsStaleOnSubsequentInsert(t *testing.T) {
+	// Scenario: 10 gen=0 segments, then gen=1 at index 9 (drops only the old
+	// index 9), then gen=1 at index 5. The second insert must still drop the
+	// stale gen=0 segments at indices 5-8 even though the generation did not
+	// advance on this call.
+	clk := clock.NewMock(time.UnixMilli(0))
+	store := NewStore(clk)
+	meta := Metadata{Bandwidth: 1, Codecs: "avc1.64001f", Width: 1, Height: 1, FrameRate: 30, TargetDurationSecs: 2}
+	mustInit(t, store, "g", meta, []byte("init"), 20, testSegmentBytes, 15)
+	s := store.Get("g")
+
+	// Push 10 gen=0 segments (indices 0-9).
+	for i := uint32(0); i < 10; i++ {
+		err := commitSlotGen(t, s, i, []byte("data"), int64(5000+i*2000), 2000, 0)
+		require.NoError(t, err)
+	}
+	segCount, _ := s.SegmentLoad()
+	require.Equal(t, 10, segCount)
+
+	// Advance to gen=1 at index 9. Only old index 9 (gen=0) is at/after
+	// the insertion point, so it gets dropped and replaced.
+	err := commitSlotGen(t, s, 9, []byte("new9"), 23000, 2000, 1)
+	require.NoError(t, err)
+	segCount, _ = s.SegmentLoad()
+	assert.Equal(t, 10, segCount) // 0-8 (gen=0) + 9 (gen=1)
+
+	// Now push gen=1 at index 5. Generation is NOT advancing (already 1),
+	// but stale gen=0 segments at indices 5,6,7,8 must still be dropped.
+	err = commitSlotGen(t, s, 5, []byte("new5"), 15000, 2000, 1)
+	require.NoError(t, err)
+
+	segCount, _ = s.SegmentLoad()
+	assert.Equal(t, 7, segCount) // 0-4 (gen=0) + 5,9 (gen=1)
+
+	// Verify stale indices are gone.
+	for _, idx := range []uint32{6, 7, 8} {
+		_, err := readSegment(s, idx)
+		assert.ErrorIs(t, err, ErrSegmentNotFound, "index %d should be dropped", idx)
+	}
+
+	// Verify kept indices are readable.
+	for _, idx := range []uint32{0, 1, 2, 3, 4, 5, 9} {
+		_, err := readSegment(s, idx)
+		assert.NoError(t, err, "index %d should be readable", idx)
+	}
+}
+
+func TestCommitSlot_DefaultGenerationZero(t *testing.T) {
+	clk := clock.NewMock(time.UnixMilli(0))
+	store := NewStore(clk)
+	meta := Metadata{Bandwidth: 1, Codecs: "avc1.64001f", Width: 1, Height: 1, FrameRate: 30, TargetDurationSecs: 2}
+	mustInit(t, store, "g", meta, []byte("init"), 10, testSegmentBytes, 5)
+	s := store.Get("g")
+
+	// Passing generation 0 works like pre-feature behavior.
+	err := commitSlotGen(t, s, 0, []byte("data"), 5000, 2000, 0)
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), s.CurrentGeneration())
+
+	err = commitSlotGen(t, s, 1, []byte("data2"), 7000, 2000, 0)
+	require.NoError(t, err)
+
+	segCount, _ := s.SegmentLoad()
+	assert.Equal(t, 2, segCount)
+}
+
+func TestCommitSlot_ZeroGenerationStaleAfterAdvance(t *testing.T) {
+	// Once the stream has advanced past generation 0, a subsequent push
+	// with generation=0 (the default / missing-header case) must be
+	// rejected as stale — generation 0 is not special.
+	clk := clock.NewMock(time.UnixMilli(0))
+	store := NewStore(clk)
+	meta := Metadata{Bandwidth: 1, Codecs: "avc1.64001f", Width: 1, Height: 1, FrameRate: 30, TargetDurationSecs: 2}
+	mustInit(t, store, "g", meta, []byte("init"), 10, testSegmentBytes, 5)
+	s := store.Get("g")
+
+	// Advance to generation 3.
+	err := commitSlotGen(t, s, 0, []byte("data"), 5000, 2000, 3)
+	require.NoError(t, err)
+	assert.Equal(t, int64(3), s.CurrentGeneration())
+
+	// Push with generation 0 → stale.
+	err = commitSlotGen(t, s, 1, []byte("data2"), 7000, 2000, 0)
+	assert.ErrorIs(t, err, ErrStaleGeneration)
 }
