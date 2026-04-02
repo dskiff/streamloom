@@ -1511,6 +1511,53 @@ func TestCommitSlot_GenerationAdvanceThenContinue(t *testing.T) {
 	assert.Equal(t, 5, segCount) // 0,1 (gen=0) + 2,3,4 (gen=1)
 }
 
+func TestCommitSlot_SameGenDropsStaleOnSubsequentInsert(t *testing.T) {
+	// Scenario: 10 gen=0 segments, then gen=1 at index 9 (drops only the old
+	// index 9), then gen=1 at index 5. The second insert must still drop the
+	// stale gen=0 segments at indices 5-8 even though the generation did not
+	// advance on this call.
+	clk := clock.NewMock(time.UnixMilli(0))
+	store := NewStore(clk)
+	meta := Metadata{Bandwidth: 1, Codecs: "avc1.64001f", Width: 1, Height: 1, FrameRate: 30, TargetDurationSecs: 2}
+	mustInit(t, store, "g", meta, []byte("init"), 20, testSegmentBytes, 15)
+	s := store.Get("g")
+
+	// Push 10 gen=0 segments (indices 0-9).
+	for i := uint32(0); i < 10; i++ {
+		err := commitSlotGen(t, s, i, []byte("data"), int64(5000+i*2000), 2000, 0)
+		require.NoError(t, err)
+	}
+	segCount, _ := s.SegmentLoad()
+	require.Equal(t, 10, segCount)
+
+	// Advance to gen=1 at index 9. Only old index 9 (gen=0) is at/after
+	// the insertion point, so it gets dropped and replaced.
+	err := commitSlotGen(t, s, 9, []byte("new9"), 23000, 2000, 1)
+	require.NoError(t, err)
+	segCount, _ = s.SegmentLoad()
+	assert.Equal(t, 10, segCount) // 0-8 (gen=0) + 9 (gen=1)
+
+	// Now push gen=1 at index 5. Generation is NOT advancing (already 1),
+	// but stale gen=0 segments at indices 5,6,7,8 must still be dropped.
+	err = commitSlotGen(t, s, 5, []byte("new5"), 15000, 2000, 1)
+	require.NoError(t, err)
+
+	segCount, _ = s.SegmentLoad()
+	assert.Equal(t, 7, segCount) // 0-4 (gen=0) + 5,9 (gen=1)
+
+	// Verify stale indices are gone.
+	for _, idx := range []uint32{6, 7, 8} {
+		_, err := readSegment(s, idx)
+		assert.ErrorIs(t, err, ErrSegmentNotFound, "index %d should be dropped", idx)
+	}
+
+	// Verify kept indices are readable.
+	for _, idx := range []uint32{0, 1, 2, 3, 4, 5, 9} {
+		_, err := readSegment(s, idx)
+		assert.NoError(t, err, "index %d should be readable", idx)
+	}
+}
+
 func TestCommitSlot_DefaultGenerationZero(t *testing.T) {
 	clk := clock.NewMock(time.UnixMilli(0))
 	store := NewStore(clk)

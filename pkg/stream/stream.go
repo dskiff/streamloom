@@ -321,9 +321,11 @@ func (s *Stream) ReleaseSlot(buf *pool.BufferSlot) {
 // to the stream. On error, the caller retains ownership and must call
 // ReleaseSlot.
 //
-// generation identifies the encoding session. When a newer generation is seen,
-// segments from older generations at or after the insertion point are dropped.
-// A generation of 0 is the default and disables generation tracking.
+// generation identifies the encoding session. Segments from older generations
+// at or after the insertion point are dropped. A generation of 0 is the
+// default; it participates in generation comparisons the same as any other
+// value (e.g. a generation-1 segment will cause generation-0 segments to be
+// dropped).
 //
 // Returns ErrStaleGeneration if generation is older than the stream's current,
 // ErrDuplicateIndex if a segment with the same index already exists,
@@ -340,8 +342,7 @@ func (s *Stream) CommitSlot(index uint32, buf *pool.BufferSlot, timestamp int64,
 		return ErrStaleGeneration
 	}
 
-	advancingGeneration := s.currentGeneration < generation
-	if advancingGeneration {
+	if s.currentGeneration < generation {
 		s.currentGeneration = generation
 	}
 
@@ -359,10 +360,12 @@ func (s *Stream) CommitSlot(index uint32, buf *pool.BufferSlot, timestamp int64,
 		return s.segments[i].Index >= index
 	})
 
-	// Drop stale-generation segments at/after the insertion point.
-	if advancingGeneration {
-		s.dropStaleGenerationLocked(idx)
-	}
+	// Drop segments at/after the insertion point whose generation is older
+	// than the stream's current generation. This must run on every commit,
+	// not just when the generation advances: a second segment of the same
+	// (newer) generation inserted earlier in the list must still clean up
+	// stale segments between it and the first new-generation segment.
+	s.dropStaleGenerationLocked(idx)
 
 	if len(s.segments) >= s.segmentCap {
 		return ErrBufferFull
