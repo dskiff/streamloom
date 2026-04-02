@@ -510,3 +510,21 @@ func TestPostSegment_MissingGenerationDefaultsZero(t *testing.T) {
 	rec = postSegment(router, "1", "test-token", "0", "5000", "2000", []byte("data"))
 	assert.Equal(t, http.StatusCreated, rec.Code)
 }
+
+func TestPostSegment_MissingGenerationStaleAfterAdvance(t *testing.T) {
+	clk := clock.NewMock(time.UnixMilli(0))
+	router, store, _, _ := testAPIRouterWithToken(t, clk)
+
+	hdrs := initHeaders()
+	rec := postInit(router, "1", "test-token", hdrs, []byte("init-data"))
+	require.Equal(t, http.StatusCreated, rec.Code)
+	t.Cleanup(func() { store.Delete("1") })
+
+	// Advance stream to generation 2.
+	rec = postSegmentWithGen(router, "1", "test-token", "0", "5000", "2000", "2", []byte("data"))
+	require.Equal(t, http.StatusCreated, rec.Code)
+
+	// Omitting X-SL-GENERATION defaults to 0, which is now stale → 409.
+	rec = postSegment(router, "1", "test-token", "1", "7000", "2000", []byte("data"))
+	assert.Equal(t, http.StatusConflict, rec.Code)
+}

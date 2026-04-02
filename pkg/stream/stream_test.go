@@ -1576,3 +1576,23 @@ func TestCommitSlot_DefaultGenerationZero(t *testing.T) {
 	segCount, _ := s.SegmentLoad()
 	assert.Equal(t, 2, segCount)
 }
+
+func TestCommitSlot_ZeroGenerationStaleAfterAdvance(t *testing.T) {
+	// Once the stream has advanced past generation 0, a subsequent push
+	// with generation=0 (the default / missing-header case) must be
+	// rejected as stale — generation 0 is not special.
+	clk := clock.NewMock(time.UnixMilli(0))
+	store := NewStore(clk)
+	meta := Metadata{Bandwidth: 1, Codecs: "avc1.64001f", Width: 1, Height: 1, FrameRate: 30, TargetDurationSecs: 2}
+	mustInit(t, store, "g", meta, []byte("init"), 10, testSegmentBytes, 5)
+	s := store.Get("g")
+
+	// Advance to generation 3.
+	err := commitSlotGen(t, s, 0, []byte("data"), 5000, 2000, 3)
+	require.NoError(t, err)
+	assert.Equal(t, int64(3), s.CurrentGeneration())
+
+	// Push with generation 0 → stale.
+	err = commitSlotGen(t, s, 1, []byte("data2"), 7000, 2000, 0)
+	assert.ErrorIs(t, err, ErrStaleGeneration)
+}
