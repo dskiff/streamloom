@@ -49,6 +49,45 @@ func parseResolution(s string) (width, height int, ok bool) {
 	return w, h, true
 }
 
+// checkMetadataConflict inspects the HTTP request for metadata headers and
+// returns a non-empty description of the first conflict found against the
+// existing stream metadata. Returns "" if no metadata headers are present
+// or all present headers match the existing values.
+func checkMetadataConflict(r *http.Request, existing stream.Metadata) string {
+	if v := r.Header.Get("X-SL-BANDWIDTH"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n != existing.Bandwidth {
+			return fmt.Sprintf("bandwidth: header=%d existing=%d", n, existing.Bandwidth)
+		}
+	}
+	if v := r.Header.Get("X-SL-CODECS"); v != "" {
+		if v != existing.Codecs {
+			return fmt.Sprintf("codecs: header=%q existing=%q", v, existing.Codecs)
+		}
+	}
+	if v := r.Header.Get("X-SL-RESOLUTION"); v != "" {
+		w, h, ok := parseResolution(v)
+		if ok && (w != existing.Width || h != existing.Height) {
+			return fmt.Sprintf("resolution: header=%dx%d existing=%dx%d", w, h, existing.Width, existing.Height)
+		}
+	}
+	if v := r.Header.Get("X-SL-FRAMERATE"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f != existing.FrameRate {
+			return fmt.Sprintf("framerate: header=%g existing=%g", f, existing.FrameRate)
+		}
+	}
+	if v := r.Header.Get("X-SL-TARGET-DURATION"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n != existing.TargetDurationSecs {
+			return fmt.Sprintf("target-duration: header=%d existing=%d", n, existing.TargetDurationSecs)
+		}
+	}
+	if v := r.Header.Get("X-SL-SEGMENT-BYTES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n != existing.SegmentByteCount {
+			return fmt.Sprintf("segment-bytes: header=%d existing=%d", n, existing.SegmentByteCount)
+		}
+	}
+	return ""
+}
+
 // API constructs the chi router for the authenticated push API server.
 func API(logger *slog.Logger, env config.Env, store *stream.Store, requestLogger *slog.Logger, tracker *watcher.Tracker) chi.Router {
 	router := chi.NewRouter()
@@ -160,10 +199,28 @@ func API(logger *slog.Logger, env config.Env, store *stream.Store, requestLogger
 			// Check if the stream already exists: subsequent inits only need
 			// generation + body to add a new init entry.
 			if s := store.Get(streamID); s != nil {
+				// Reject if any metadata headers are present and conflict
+				// with the existing stream-level metadata.
+				if conflict := checkMetadataConflict(r, s.Metadata()); conflict != "" {
+					logger.Warn("metadata conflict on subsequent init",
+						"streamID", streamID, "conflict", conflict)
+					w.WriteHeader(http.StatusConflict)
+					return
+				}
+
 				if err := s.AddInitEntry(generation, initData); err != nil {
-					if errors.Is(err, stream.ErrDuplicateGeneration) {
-						logger.Warn("duplicate generation", "streamID", streamID, "generation", generation)
+					if errors.Is(err, stream.ErrDuplicateGeneration) ||
+						errors.Is(err, stream.ErrGenerationNotMonotonic) {
+						logger.Warn("rejected init generation",
+							"streamID", streamID, "generation", generation, "error", err)
 						w.WriteHeader(http.StatusConflict)
+						return
+					}
+					if errors.Is(err, stream.ErrNegativeGeneration) ||
+						errors.Is(err, stream.ErrEmptyInitData) {
+						logger.Warn("invalid init entry",
+							"streamID", streamID, "generation", generation, "error", err)
+						w.WriteHeader(http.StatusBadRequest)
 						return
 					}
 					logger.Error("failed to add init entry", "error", err)

@@ -383,24 +383,40 @@ func TestCommitSlot_MissingInitForGeneration(t *testing.T) {
 	assert.ErrorIs(t, err, ErrMissingInitForGeneration)
 }
 
-func TestAddInitEntry_DuplicateGeneration(t *testing.T) {
+func TestAddInitEntry_Validation(t *testing.T) {
 	clk := clock.NewMock(time.UnixMilli(0))
 	store := NewStore(clk)
 	meta := Metadata{Bandwidth: 1, Codecs: "avc1.64001f", Width: 1, Height: 1, FrameRate: 30, TargetDurationSecs: 2}
 	mustInit(t, store, "g", meta, []byte("init"), 10, testSegmentBytes, 5)
 	s := store.Get("g")
 
-	// Adding generation 0 again should fail (already created by Init).
-	err := s.AddInitEntry(0, []byte("init-dup"))
+	// Negative generation should fail.
+	err := s.AddInitEntry(-1, []byte("init"))
+	assert.ErrorIs(t, err, ErrNegativeGeneration)
+
+	// Empty init data should fail.
+	err = s.AddInitEntry(1, []byte{})
+	assert.ErrorIs(t, err, ErrEmptyInitData)
+
+	// Generation 0 already has an init entry (created by Init) → duplicate.
+	err = s.AddInitEntry(0, []byte("init-dup"))
 	assert.ErrorIs(t, err, ErrDuplicateGeneration)
 
-	// Adding a new generation should succeed.
+	// Adding generation 1 (> max existing gen 0) should succeed.
 	err = s.AddInitEntry(1, []byte("init1"))
 	assert.NoError(t, err)
 
-	// Adding generation 1 again should fail.
+	// Adding generation 1 again → duplicate.
 	err = s.AddInitEntry(1, []byte("init1-dup"))
 	assert.ErrorIs(t, err, ErrDuplicateGeneration)
+
+	// Adding generation 3 (skipping 2) should succeed.
+	err = s.AddInitEntry(3, []byte("init3"))
+	assert.NoError(t, err)
+
+	// Adding generation 2 (less than max existing 3) → not monotonic.
+	err = s.AddInitEntry(2, []byte("init2"))
+	assert.ErrorIs(t, err, ErrGenerationNotMonotonic)
 }
 
 func TestAddInitEntry_ClonesData(t *testing.T) {

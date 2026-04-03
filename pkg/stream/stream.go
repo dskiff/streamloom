@@ -50,6 +50,19 @@ var ErrDuplicateGeneration = errors.New("duplicate generation for init")
 // a generation before pushing segments at that generation.
 var ErrMissingInitForGeneration = errors.New("no init entry for segment generation")
 
+// ErrNegativeGeneration is returned when a generation value is negative.
+// Generations must be non-negative integers; -1 is reserved as an
+// internal sentinel.
+var ErrNegativeGeneration = errors.New("generation must be non-negative")
+
+// ErrEmptyInitData is returned when init data is empty.
+var ErrEmptyInitData = errors.New("init data must not be empty")
+
+// ErrGenerationNotMonotonic is returned when a new init generation is not
+// strictly greater than the stream's current generation. Init entries must
+// advance forward; re-pushing previous or current generations is rejected.
+var ErrGenerationNotMonotonic = errors.New("init generation must be greater than current generation")
+
 // MaxCodecsLength is the maximum allowed length for a codecs string.
 // Real HLS codec strings are typically under 50 bytes (e.g. "avc1.640029,mp4a.40.2").
 const MaxCodecsLength = 256
@@ -577,13 +590,31 @@ func (s *Store) Init(id string, meta Metadata, initData []byte, generation int64
 // stream. The initData slice is cloned. This does NOT modify segments, the
 // buffer pool, the renderer, or currentGeneration.
 //
-// Returns ErrDuplicateGeneration if an init entry for this generation already exists.
+// Returns ErrNegativeGeneration if generation < 0, ErrEmptyInitData if
+// initData is empty, ErrGenerationNotMonotonic if generation is not strictly
+// greater than the stream's current generation, or ErrDuplicateGeneration if
+// an init entry for this generation already exists.
 func (s *Stream) AddInitEntry(generation int64, initData []byte) error {
+	if generation < 0 {
+		return ErrNegativeGeneration
+	}
+	if len(initData) == 0 {
+		return ErrEmptyInitData
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if _, ok := s.initEntries[generation]; ok {
 		return ErrDuplicateGeneration
+	}
+
+	// The new generation must be strictly greater than all existing init
+	// generations to maintain forward-only ordering.
+	for existingGen := range s.initEntries {
+		if generation < existingGen {
+			return ErrGenerationNotMonotonic
+		}
 	}
 
 	cloned := make([]byte, len(initData))

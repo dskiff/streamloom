@@ -140,7 +140,7 @@ func Stream(logger *slog.Logger, env config.Env, store *stream.Store, requestLog
 			streamID := chi.URLParam(r, "streamID")
 			initIDStr := chi.URLParam(r, "initID")
 			generation, err := strconv.ParseInt(initIDStr, 10, 64)
-			if err != nil {
+			if err != nil || generation < 0 {
 				logger.Warn("invalid init ID", "value", initIDStr, "error", err)
 				w.WriteHeader(http.StatusBadRequest)
 				return
