@@ -27,8 +27,11 @@ func (s *Stream) discontinuitySequence(start int) int {
 		discSeq++
 	}
 
-	// Count transitions within buffered pre-window segments.
-	for i := 1; i < start; i++ {
+	// Count transitions among buffered pre-window segments and the boundary
+	// between the last pre-window segment and the first window segment.
+	// Using <= start (not < start) ensures the transition at segments[start-1]
+	// → segments[start] is counted when windowing pushes it out.
+	for i := 1; i <= start; i++ {
 		if s.segments[i].Generation != s.segments[i-1].Generation {
 			discSeq++
 		}

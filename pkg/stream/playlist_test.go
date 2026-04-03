@@ -476,6 +476,56 @@ func TestRenderMediaPlaylist_DiscontinuitySequence_EvictedBoundaryAtStartZero(t 
 		"no in-window discontinuity expected; got:\n%s", playlist)
 }
 
+func TestRenderMediaPlaylist_DiscontinuitySequence_WindowBoundary(t *testing.T) {
+	// Regression test: when windowing (not eviction) pushes a generation
+	// transition out of the playlist window, the transition at
+	// segments[start-1] → segments[start] must be counted.
+	_, s := setupStreamForPlaylist(t, 2)
+
+	require.NoError(t, s.AddInitEntry(1, []byte("init1")))
+
+	// Push 2 gen=0 segments, then 2 gen=1 segments.
+	mustCommitSlot(t, s, 0, []byte("d"), 0, 2000)
+	mustCommitSlot(t, s, 1, []byte("d"), 2000, 2000)
+	require.NoError(t, commitSlotGen(t, s, 2, []byte("d"), 4000, 2000, 1))
+	require.NoError(t, commitSlotGen(t, s, 3, []byte("d"), 6000, 2000, 1))
+
+	// Render with windowSize=2 so only segments 2,3 (gen=1) are in the window.
+	// The gen 0→1 transition at the window boundary must be counted.
+	s.mu.RLock()
+	playlist, _ := s.renderMediaPlaylist(20000, 2)
+	s.mu.RUnlock()
+
+	assert.Contains(t, playlist, "#EXT-X-DISCONTINUITY-SEQUENCE:1",
+		"window-boundary transition should be counted; got:\n%s", playlist)
+	assert.NotContains(t, playlist, "#EXT-X-DISCONTINUITY\n",
+		"no in-window discontinuity expected; got:\n%s", playlist)
+	assert.Contains(t, playlist, `#EXT-X-MAP:URI="init_1.mp4"`)
+	assert.NotContains(t, playlist, `#EXT-X-MAP:URI="init_0.mp4"`)
+}
+
+func TestRenderMediaPlaylist_DiscontinuitySequence_WindowBoundaryMultiple(t *testing.T) {
+	// Multiple transitions scroll out via windowing alone (no eviction).
+	_, s := setupStreamForPlaylist(t, 2)
+
+	require.NoError(t, s.AddInitEntry(1, []byte("init1")))
+	require.NoError(t, s.AddInitEntry(2, []byte("init2")))
+
+	// gen=0, gen=1, gen=2, gen=2 — window=2 shows only the last 2 (gen=2).
+	mustCommitSlot(t, s, 0, []byte("d"), 0, 2000)
+	require.NoError(t, commitSlotGen(t, s, 1, []byte("d"), 2000, 2000, 1))
+	require.NoError(t, commitSlotGen(t, s, 2, []byte("d"), 4000, 2000, 2))
+	require.NoError(t, commitSlotGen(t, s, 3, []byte("d"), 6000, 2000, 2))
+
+	s.mu.RLock()
+	playlist, _ := s.renderMediaPlaylist(20000, 2)
+	s.mu.RUnlock()
+
+	// Both 0→1 and 1→2 transitions scrolled out.
+	assert.Contains(t, playlist, "#EXT-X-DISCONTINUITY-SEQUENCE:2",
+		"both transitions should be counted; got:\n%s", playlist)
+}
+
 func TestRenderMediaPlaylist_DiscontinuityOrder(t *testing.T) {
 	// Verify the exact ordering: DISCONTINUITY comes before MAP for new generation.
 	_, s := setupStreamForPlaylist(t, 2)
