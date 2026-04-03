@@ -59,9 +59,10 @@ var ErrNegativeGeneration = errors.New("generation must be non-negative")
 var ErrEmptyInitData = errors.New("init data must not be empty")
 
 // ErrGenerationNotMonotonic is returned when a new init generation is not
-// strictly greater than the stream's current generation. Init entries must
-// advance forward; re-pushing previous or current generations is rejected.
-var ErrGenerationNotMonotonic = errors.New("init generation must be greater than current generation")
+// strictly greater than the highest existing init generation. Init entries
+// must advance forward; pushing a generation less than an already-registered
+// generation is rejected.
+var ErrGenerationNotMonotonic = errors.New("init generation must be greater than all existing init generations")
 
 // MaxCodecsLength is the maximum allowed length for a codecs string.
 // Real HLS codec strings are typically under 50 bytes (e.g. "avc1.640029,mp4a.40.2").
@@ -117,7 +118,9 @@ type Metadata struct {
 }
 
 // InitEntry holds the init segment data for a single encoding generation.
-// InitData is cloned on creation and immutable; safe to read concurrently.
+// InitData is cloned on creation and must not be modified by callers.
+// Treat it as read-only; mutating the slice will corrupt shared state and
+// race with concurrent readers.
 type InitEntry struct {
 	InitData []byte
 }
@@ -232,7 +235,8 @@ func (s *Stream) CachedPlaylist() string {
 }
 
 // GetInitEntry returns the init entry for the given generation, or nil and false
-// if no init has been pushed for that generation.
+// if no init has been pushed for that generation. The returned InitEntry is
+// shared state; callers must not modify its InitData slice.
 func (s *Stream) GetInitEntry(generation int64) (*InitEntry, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -592,8 +596,8 @@ func (s *Store) Init(id string, meta Metadata, initData []byte, generation int64
 //
 // Returns ErrNegativeGeneration if generation < 0, ErrEmptyInitData if
 // initData is empty, ErrGenerationNotMonotonic if generation is not strictly
-// greater than the stream's current generation, or ErrDuplicateGeneration if
-// an init entry for this generation already exists.
+// greater than the highest existing init generation, or ErrDuplicateGeneration
+// if an init entry for this generation already exists.
 func (s *Stream) AddInitEntry(generation int64, initData []byte) error {
 	if generation < 0 {
 		return ErrNegativeGeneration
