@@ -41,6 +41,15 @@ var ErrTimestampOrderViolation = errors.New("segment timestamp order violation")
 // than the stream's current generation. The caller should drop the segment.
 var ErrStaleGeneration = errors.New("stale generation")
 
+// ErrDuplicateGeneration is returned when an init entry for the given
+// generation already exists on the stream.
+var ErrDuplicateGeneration = errors.New("duplicate generation for init")
+
+// ErrMissingInitForGeneration is returned when a segment references a
+// generation that has no init entry. The streamer must push /init for
+// a generation before pushing segments at that generation.
+var ErrMissingInitForGeneration = errors.New("no init entry for segment generation")
+
 // MaxCodecsLength is the maximum allowed length for a codecs string.
 // Real HLS codec strings are typically under 50 bytes (e.g. "avc1.640029,mp4a.40.2").
 const MaxCodecsLength = 256
@@ -94,13 +103,22 @@ type Metadata struct {
 	TargetDurationSecs int     // EXT-X-TARGETDURATION value (seconds)
 }
 
+// InitEntry holds the init segment data for a single encoding generation.
+// InitData is cloned on creation and immutable; safe to read concurrently.
+type InitEntry struct {
+	InitData []byte
+}
+
 // Stream holds the complete in-memory state for a single HLS stream.
 type Stream struct {
-	mu              sync.RWMutex
-	clock           clock.Clock
-	metadata        Metadata
-	initData        []byte
-	initTimestampMs int64 // Unix ms when Init was called; used for cache-busting init URL
+	mu       sync.RWMutex
+	clock    clock.Clock
+	metadata Metadata
+
+	// initEntries holds per-generation init segment data, keyed by generation.
+	// Entries are added via Init (first generation) and AddInitEntry (subsequent).
+	// The map grows unbounded; reaping is deferred to a separate project.
+	initEntries map[int64]*InitEntry
 
 	segments          []Slot // sorted by Index
 	segmentCap        int    // maximum number of segments
@@ -115,6 +133,15 @@ type Stream struct {
 	// totalSegmentCount is the total number of segments ever added to this stream.
 	// Useful for deriving EXT-X-MEDIA-SEQUENCE in playlist generation.
 	totalSegmentCount int64
+
+	// evictedDiscontinuities counts generation transitions among segments that
+	// have been evicted from the buffer. Used to compute EXT-X-DISCONTINUITY-SEQUENCE.
+	evictedDiscontinuities int
+
+	// lastEvictedGeneration is the generation of the most recently evicted segment.
+	// Initialized to -1 (sentinel) meaning no segments have been evicted yet.
+	// Since generations are validated as non-negative, -1 is unambiguous.
+	lastEvictedGeneration int64
 
 	// notifyCh is signaled (non-blocking) on each successful CommitSlot to
 	// wake the playlist renderer goroutine.
@@ -191,28 +218,37 @@ func (s *Stream) CachedPlaylist() string {
 	return *p
 }
 
-// InitTimestampMs returns the Unix millisecond timestamp of when the stream
-// was last initialized. Used to construct cache-busting init segment URLs.
-func (s *Stream) InitTimestampMs() int64 {
+// GetInitEntry returns the init entry for the given generation, or nil and false
+// if no init has been pushed for that generation.
+func (s *Stream) GetInitEntry(generation int64) (*InitEntry, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.initTimestampMs
+	e, ok := s.initEntries[generation]
+	return e, ok
 }
 
-// InitDataLen returns the byte length of the stored init segment.
-func (s *Stream) InitDataLen() int {
+// InitDataLenForGeneration returns the byte length of the init segment for the
+// given generation, or 0 if the generation has no init entry.
+func (s *Stream) InitDataLenForGeneration(generation int64) int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return len(s.initData)
+	if e, ok := s.initEntries[generation]; ok {
+		return len(e.InitData)
+	}
+	return 0
 }
 
-// WriteInitData writes the init segment bytes to w under a read lock,
-// avoiding a per-request allocation. The stored slice is immutable (cloned
-// during Init), so it is safe to write directly.
-func (s *Stream) WriteInitDataTo(w io.Writer) (int, error) {
+// WriteInitDataForGenerationTo writes the init segment bytes for the given
+// generation to w under a read lock. Returns 0 and ErrSegmentNotFound if
+// the generation has no init entry.
+func (s *Stream) WriteInitDataForGenerationTo(w io.Writer, generation int64) (int, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return w.Write(s.initData)
+	e, ok := s.initEntries[generation]
+	if !ok {
+		return 0, ErrSegmentNotFound
+	}
+	return w.Write(e.InitData)
 }
 
 // CurrentGeneration returns the stream's current generation value.
@@ -285,6 +321,12 @@ func (s *Stream) evictOldLocked() {
 			break
 		}
 
+		// Track generation transitions for EXT-X-DISCONTINUITY-SEQUENCE.
+		if s.lastEvictedGeneration >= 0 && s.segments[i].Generation != s.lastEvictedGeneration {
+			s.evictedDiscontinuities++
+		}
+		s.lastEvictedGeneration = s.segments[i].Generation
+
 		s.bufPool.AssertCheckedOut(s.segments[i].Data)
 		s.bufPool.Put(s.segments[i].Data)
 		s.segments[i].Data = nil
@@ -340,6 +382,11 @@ func (s *Stream) CommitSlot(index uint32, buf *pool.BufferSlot, timestamp int64,
 	// Reject segments from older generations.
 	if s.currentGeneration > generation {
 		return ErrStaleGeneration
+	}
+
+	// Reject segments whose generation has no init entry.
+	if _, ok := s.initEntries[generation]; !ok {
+		return ErrMissingInitForGeneration
 	}
 
 	if s.currentGeneration < generation {
@@ -461,12 +508,13 @@ var ErrInvalidWorkingSpace = errors.New("workingSpace must be >= 0 and segmentCa
 
 // Init creates or replaces a stream's init state, clearing any existing segments.
 // The initData slice is cloned so that the caller cannot mutate the stored bytes.
+// generation identifies the encoding generation for this init entry.
 // workingSpace extra slots are added to the BufferPool beyond segmentCapacity to
 // allow concurrent handlers to hold buffers before committing.
 // backwardBufferSize controls how many past segments are retained during eviction;
 // it must be >= 1 and < segmentCapacity.
 // playlistWindowSize is the maximum number of segments in the media playlist.
-func (s *Store) Init(id string, meta Metadata, initData []byte, segmentCapacity, segmentBytes, backwardBufferSize, workingSpace, playlistWindowSize int) error {
+func (s *Store) Init(id string, meta Metadata, initData []byte, generation int64, segmentCapacity, segmentBytes, backwardBufferSize, workingSpace, playlistWindowSize int) error {
 	if meta.TargetDurationSecs <= 0 {
 		return ErrInvalidTargetDuration
 	}
@@ -495,19 +543,22 @@ func (s *Store) Init(id string, meta Metadata, initData []byte, segmentCapacity,
 	}
 
 	st := &Stream{
-		clock:              s.clock,
-		metadata:           meta,
-		initData:           cloned,
-		initTimestampMs:    s.clock.Now().UnixMilli(),
-		segments:           make([]Slot, 0, segmentCapacity),
-		segmentCap:         segmentCapacity,
-		bufPool:            pool.NewBufferPool(segmentCapacity+workingSpace, segmentBytes),
-		backwardBufferSize: backwardBufferSize,
-		notifyCh:           make(chan struct{}, 1),
-		done:               make(chan struct{}),
-		stopped:            make(chan struct{}),
-		hasSegments:        make(chan struct{}),
-		hasPlaylist:        make(chan struct{}),
+		clock:    s.clock,
+		metadata: meta,
+		initEntries: map[int64]*InitEntry{
+			generation: {InitData: cloned},
+		},
+		segments:              make([]Slot, 0, segmentCapacity),
+		segmentCap:            segmentCapacity,
+		currentGeneration:     generation,
+		bufPool:               pool.NewBufferPool(segmentCapacity+workingSpace, segmentBytes),
+		backwardBufferSize:    backwardBufferSize,
+		lastEvictedGeneration: -1, // sentinel: no evictions yet
+		notifyCh:              make(chan struct{}, 1),
+		done:                  make(chan struct{}),
+		stopped:               make(chan struct{}),
+		hasSegments:           make(chan struct{}),
+		hasPlaylist:           make(chan struct{}),
 	}
 	s.streams[id] = st
 	s.mu.Unlock()
@@ -519,6 +570,25 @@ func (s *Store) Init(id string, meta Metadata, initData []byte, segmentCapacity,
 
 	go st.runPlaylistRenderer(playlistWindowSize)
 
+	return nil
+}
+
+// AddInitEntry adds a new init segment for the given generation to an existing
+// stream. The initData slice is cloned. This does NOT modify segments, the
+// buffer pool, the renderer, or currentGeneration.
+//
+// Returns ErrDuplicateGeneration if an init entry for this generation already exists.
+func (s *Stream) AddInitEntry(generation int64, initData []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.initEntries[generation]; ok {
+		return ErrDuplicateGeneration
+	}
+
+	cloned := make([]byte, len(initData))
+	copy(cloned, initData)
+	s.initEntries[generation] = &InitEntry{InitData: cloned}
 	return nil
 }
 

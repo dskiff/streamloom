@@ -11,10 +11,38 @@ import (
 // Prevents busy-looping when many segments have past timestamps.
 const minRenderInterval = 50 * time.Millisecond
 
+// discontinuitySequence counts the number of generation transitions that have
+// scrolled out before the playlist window. This includes transitions among
+// evicted segments and transitions among buffered segments before the window.
+//
+// Must be called with s.mu.RLock held.
+func (s *Stream) discontinuitySequence(start int) int {
+	discSeq := s.evictedDiscontinuities
+
+	// Check boundary between last evicted segment and first buffered segment.
+	// lastEvictedGeneration == -1 means no segments have been evicted yet.
+	if start > 0 && s.lastEvictedGeneration >= 0 && s.segments[0].Generation != s.lastEvictedGeneration {
+		discSeq++
+	}
+
+	// Count transitions within buffered pre-window segments.
+	for i := 1; i < start; i++ {
+		if s.segments[i].Generation != s.segments[i-1].Generation {
+			discSeq++
+		}
+	}
+
+	return discSeq
+}
+
 // renderMediaPlaylist builds the HLS media playlist string from the current
 // in-memory segments. Only segments with Timestamp <= nowMs are eligible.
 // A sliding window of at most windowSize segments is applied to the tail of
 // the eligible set.
+//
+// Generation transitions within the window produce #EXT-X-DISCONTINUITY tags
+// and per-generation #EXT-X-MAP directives. The #EXT-X-DISCONTINUITY-SEQUENCE
+// header counts transitions that have scrolled out before the window.
 //
 // Returns (playlist, nextEligibleMs) where nextEligibleMs is the timestamp
 // of the first segment not yet eligible (0 if no such segment exists).
@@ -41,18 +69,29 @@ func (s *Stream) renderMediaPlaylist(nowMs int64, windowSize int) (string, int64
 	start := max(eligible-windowSize, 0)
 	window := s.segments[start:eligible]
 
+	discSeq := s.discontinuitySequence(start)
+
 	var b strings.Builder
 
-	// Estimate capacity: ~120 bytes per segment entry + ~150 bytes header.
-	b.Grow(150 + len(window)*120)
+	// Estimate capacity: ~150 bytes per segment entry + ~200 bytes header.
+	b.Grow(200 + len(window)*150)
 
 	b.WriteString("#EXTM3U\n")
 	b.WriteString("#EXT-X-VERSION:7\n")
 	fmt.Fprintf(&b, "#EXT-X-TARGETDURATION:%d\n", s.metadata.TargetDurationSecs)
 	fmt.Fprintf(&b, "#EXT-X-MEDIA-SEQUENCE:%d\n", window[0].Index)
-	fmt.Fprintf(&b, "#EXT-X-MAP:URI=\"init-%d.mp4\"\n", s.initTimestampMs)
+	fmt.Fprintf(&b, "#EXT-X-DISCONTINUITY-SEQUENCE:%d\n", discSeq)
 
-	for _, seg := range window {
+	var prevGeneration int64
+	for i, seg := range window {
+		if i == 0 || seg.Generation != prevGeneration {
+			if i > 0 {
+				b.WriteString("#EXT-X-DISCONTINUITY\n")
+			}
+			fmt.Fprintf(&b, "#EXT-X-MAP:URI=\"init_%d.mp4\"\n", seg.Generation)
+		}
+		prevGeneration = seg.Generation
+
 		ts := time.UnixMilli(seg.Timestamp).UTC().Format("2006-01-02T15:04:05.000Z")
 		dur := float64(seg.DurationMs) / 1000.0
 		fmt.Fprintf(&b, "#EXT-X-PROGRAM-DATE-TIME:%s\n", ts)

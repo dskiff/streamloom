@@ -2,7 +2,6 @@ package routes
 
 import (
 	"crypto/sha256"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -83,11 +82,10 @@ func TestE2E_InitPushRetrieve(t *testing.T) {
 	rec = postSegment(apiRouter, "1", "test-token", "0", "5000", "2000", segData)
 	require.Equal(t, http.StatusCreated, rec.Code)
 
-	// 4. Retrieve init.mp4 using the timestamped URL via stream server.
+	// 4. Retrieve init.mp4 by generation via stream server.
 	s := store.Get("1")
 	require.NotNil(t, s)
-	initURL := fmt.Sprintf("/stream/1/init-%d.mp4", s.InitTimestampMs())
-	req := httptest.NewRequest(http.MethodGet, initURL, nil)
+	req := httptest.NewRequest(http.MethodGet, "/stream/1/init_0.mp4", nil)
 	rec = httptest.NewRecorder()
 	streamRouter.ServeHTTP(rec, req)
 	assert.Equal(t, http.StatusOK, rec.Code)
@@ -111,6 +109,69 @@ func TestE2E_InitPushRetrieve(t *testing.T) {
 	streamRouter.ServeHTTP(rec, req)
 	assert.Equal(t, http.StatusOK, rec.Code)
 	assert.Contains(t, rec.Body.String(), "segment_0.m4s")
+}
+
+func TestE2E_DiscontinuityFlow(t *testing.T) {
+	clk := clock.NewMock(time.UnixMilli(0))
+	streamRouter, apiRouter, store, _ := testBothRoutersWithToken(t, clk)
+
+	// 1. Init stream at generation 0.
+	hdrs := initHeaders()
+	rec := postInit(apiRouter, "1", "test-token", hdrs, []byte("init-gen0"))
+	require.Equal(t, http.StatusCreated, rec.Code)
+	t.Cleanup(func() { store.Delete("1") })
+
+	// 2. Push gen=0 segments (timestamps in the future relative to clock=0).
+	rec = postSegment(apiRouter, "1", "test-token", "0", "5000", "2000", []byte("seg0"))
+	require.Equal(t, http.StatusCreated, rec.Code)
+	rec = postSegment(apiRouter, "1", "test-token", "1", "7000", "2000", []byte("seg1"))
+	require.Equal(t, http.StatusCreated, rec.Code)
+
+	// 3. Add init for generation 1 (subsequent init, only needs generation + body).
+	rec = postInitForGeneration(apiRouter, "1", "test-token", "1", []byte("init-gen1"))
+	require.Equal(t, http.StatusCreated, rec.Code)
+
+	// 4. Push gen=1 segment.
+	rec = postSegmentWithGen(apiRouter, "1", "test-token", "2", "9000", "2000", "1", []byte("seg2"))
+	require.Equal(t, http.StatusCreated, rec.Code)
+
+	// 5. Advance clock so all segments become eligible.
+	clk.Set(time.UnixMilli(20000))
+
+	// 6. Verify init segments are served by generation.
+	req := httptest.NewRequest(http.MethodGet, "/stream/1/init_0.mp4", nil)
+	rec = httptest.NewRecorder()
+	streamRouter.ServeHTTP(rec, req)
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, []byte("init-gen0"), rec.Body.Bytes())
+
+	req = httptest.NewRequest(http.MethodGet, "/stream/1/init_1.mp4", nil)
+	rec = httptest.NewRecorder()
+	streamRouter.ServeHTTP(rec, req)
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, []byte("init-gen1"), rec.Body.Bytes())
+
+	// 7. Verify media playlist contains discontinuity.
+	s := store.Get("1")
+	require.NotNil(t, s)
+	require.Eventually(t, func() bool {
+		p := s.CachedPlaylist()
+		return p != "" && strings.Contains(p, "segment_2.m4s")
+	}, 2*time.Second, 10*time.Millisecond)
+
+	req = httptest.NewRequest(http.MethodGet, "/stream/1/media.m3u8", nil)
+	rec = httptest.NewRecorder()
+	streamRouter.ServeHTTP(rec, req)
+	assert.Equal(t, http.StatusOK, rec.Code)
+
+	body := rec.Body.String()
+	assert.Contains(t, body, "#EXT-X-DISCONTINUITY\n")
+	assert.Contains(t, body, "#EXT-X-MAP:URI=\"init_0.mp4\"")
+	assert.Contains(t, body, "#EXT-X-MAP:URI=\"init_1.mp4\"")
+	assert.Contains(t, body, "#EXT-X-DISCONTINUITY-SEQUENCE:0")
+	assert.Contains(t, body, "segment_0.m4s")
+	assert.Contains(t, body, "segment_1.m4s")
+	assert.Contains(t, body, "segment_2.m4s")
 }
 
 func TestE2E_StringStreamID(t *testing.T) {
@@ -142,11 +203,10 @@ func TestE2E_StringStreamID(t *testing.T) {
 	rec = postSegment(apiRouter, "myStream", "my-token", "0", "5000", "2000", segData)
 	require.Equal(t, http.StatusCreated, rec.Code)
 
-	// 3. Retrieve init.mp4.
+	// 3. Retrieve init.mp4 by generation.
 	s := store.Get("myStream")
 	require.NotNil(t, s)
-	initURL := fmt.Sprintf("/stream/myStream/init-%d.mp4", s.InitTimestampMs())
-	req := httptest.NewRequest(http.MethodGet, initURL, nil)
+	req := httptest.NewRequest(http.MethodGet, "/stream/myStream/init_0.mp4", nil)
 	rec = httptest.NewRecorder()
 	streamRouter.ServeHTTP(rec, req)
 	assert.Equal(t, http.StatusOK, rec.Code)

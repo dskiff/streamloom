@@ -125,7 +125,57 @@ func API(logger *slog.Logger, env config.Env, store *stream.Store, requestLogger
 			streamID := r.Context().Value(streamIDKey).(string)
 			logger.Debug("handling stream init request", "streamID", streamID)
 
-			// Parse required metadata headers.
+			// Parse optional generation header (default 0).
+			var generation int64
+			var err error
+			if genStr := r.Header.Get("X-SL-GENERATION"); genStr != "" {
+				generation, err = strconv.ParseInt(genStr, 10, 64)
+				if err != nil || generation < 0 {
+					logger.Warn("invalid generation header", "value", genStr, "error", err)
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+			}
+
+			// Read init.mp4 body with size limit (always required).
+			r.Body = http.MaxBytesReader(w, r.Body, stream.MaxInitBytes)
+			initData, err := io.ReadAll(r.Body)
+			if err != nil {
+				var maxBytesErr *http.MaxBytesError
+				if errors.As(err, &maxBytesErr) {
+					logger.Warn("init body too large", "limit", stream.MaxInitBytes)
+					w.WriteHeader(http.StatusRequestEntityTooLarge)
+				} else {
+					logger.Warn("failed to read init body", "error", err)
+					w.WriteHeader(http.StatusBadRequest)
+				}
+				return
+			}
+			if len(initData) == 0 {
+				logger.Warn("empty init body")
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+
+			// Check if the stream already exists: subsequent inits only need
+			// generation + body to add a new init entry.
+			if s := store.Get(streamID); s != nil {
+				if err := s.AddInitEntry(generation, initData); err != nil {
+					if errors.Is(err, stream.ErrDuplicateGeneration) {
+						logger.Warn("duplicate generation", "streamID", streamID, "generation", generation)
+						w.WriteHeader(http.StatusConflict)
+						return
+					}
+					logger.Error("failed to add init entry", "error", err)
+					w.WriteHeader(http.StatusInternalServerError)
+					return
+				}
+				logger.Info("init entry added", "streamID", streamID, "generation", generation)
+				w.WriteHeader(http.StatusCreated)
+				return
+			}
+
+			// First init: parse required metadata and capacity headers.
 			bandwidthStr := r.Header.Get("X-SL-BANDWIDTH")
 			if bandwidthStr == "" {
 				logger.Warn("missing bandwidth header")
@@ -181,26 +231,6 @@ func API(logger *slog.Logger, env config.Env, store *stream.Store, requestLogger
 			targetDuration, err := strconv.Atoi(targetDurationStr)
 			if err != nil || targetDuration <= 0 {
 				logger.Warn("invalid target-duration header", "value", targetDurationStr, "error", err)
-				w.WriteHeader(http.StatusBadRequest)
-				return
-			}
-
-			// Read init.mp4 body with size limit.
-			r.Body = http.MaxBytesReader(w, r.Body, stream.MaxInitBytes)
-			initData, err := io.ReadAll(r.Body)
-			if err != nil {
-				var maxBytesErr *http.MaxBytesError
-				if errors.As(err, &maxBytesErr) {
-					logger.Warn("init body too large", "limit", stream.MaxInitBytes)
-					w.WriteHeader(http.StatusRequestEntityTooLarge)
-				} else {
-					logger.Warn("failed to read init body", "error", err)
-					w.WriteHeader(http.StatusBadRequest)
-				}
-				return
-			}
-			if len(initData) == 0 {
-				logger.Warn("empty init body")
 				w.WriteHeader(http.StatusBadRequest)
 				return
 			}
@@ -273,13 +303,14 @@ func API(logger *slog.Logger, env config.Env, store *stream.Store, requestLogger
 				FrameRate:          framerate,
 				TargetDurationSecs: targetDuration,
 			}
-			if err := store.Init(streamID, meta, initData, segmentCap, segmentBytes, backwardBufferSize, env.BUFFER_WORKING_SPACE, config.DefaultMediaWindowSize); err != nil {
+			if err := store.Init(streamID, meta, initData, generation, segmentCap, segmentBytes, backwardBufferSize, env.BUFFER_WORKING_SPACE, config.DefaultMediaWindowSize); err != nil {
 				logger.Warn("invalid stream configuration", "error", err)
 				w.WriteHeader(http.StatusBadRequest)
 				return
 			}
 			logger.Info("stream initialized",
 				"streamID", streamID,
+				"generation", generation,
 				"bandwidth", bandwidth,
 				"codecs", codecs,
 				"resolution", resolutionStr,
@@ -426,6 +457,11 @@ func API(logger *slog.Logger, env config.Env, store *stream.Store, requestLogger
 				if errors.Is(err, stream.ErrStaleGeneration) {
 					logger.Warn("stale generation", "streamID", streamID, "index", index, "generation", generation)
 					w.WriteHeader(http.StatusConflict)
+					return
+				}
+				if errors.Is(err, stream.ErrMissingInitForGeneration) {
+					logger.Warn("no init entry for segment generation", "streamID", streamID, "index", index, "generation", generation)
+					w.WriteHeader(http.StatusUnprocessableEntity)
 					return
 				}
 				if errors.Is(err, stream.ErrTimestampInPast) {
