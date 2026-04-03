@@ -20,8 +20,10 @@ func (s *Stream) discontinuitySequence(start int) int {
 	discSeq := s.evictedDiscontinuities
 
 	// Check boundary between last evicted segment and first buffered segment.
+	// This applies regardless of whether start is 0: if eviction removed all
+	// pre-window segments, the transition still scrolled out of the window.
 	// lastEvictedGeneration == -1 means no segments have been evicted yet.
-	if start > 0 && s.lastEvictedGeneration >= 0 && s.segments[0].Generation != s.lastEvictedGeneration {
+	if s.lastEvictedGeneration >= 0 && len(s.segments) > 0 && s.segments[0].Generation != s.lastEvictedGeneration {
 		discSeq++
 	}
 

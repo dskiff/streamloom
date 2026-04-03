@@ -346,6 +346,136 @@ func TestRenderMediaPlaylist_DiscontinuitySequence_AfterEviction(t *testing.T) {
 	assert.Contains(t, playlist, "#EXT-X-DISCONTINUITY-SEQUENCE:1")
 }
 
+func TestRenderMediaPlaylist_DiscontinuitySequence_AllPreWindowEvicted(t *testing.T) {
+	// Regression test: when eviction removes ALL pre-window segments, start == 0
+	// and the boundary discontinuity between the last evicted segment and
+	// segments[0] must still be counted in DISCONTINUITY-SEQUENCE.
+	clk := clock.NewMock(time.UnixMilli(0))
+	store := NewStore(clk)
+	meta := Metadata{
+		Bandwidth:          4000000,
+		Codecs:             "avc1.64001f",
+		Width:              1920,
+		Height:             1080,
+		FrameRate:          23.976,
+		TargetDurationSecs: 2,
+	}
+	// backwardBufferSize=1, windowSize=3
+	err := store.Init("1", meta, []byte("init0"), 0, 50, testSegmentBytes, 1, 5, 3)
+	require.NoError(t, err)
+	t.Cleanup(func() { store.Delete("1") })
+	s := store.Get("1")
+	require.NotNil(t, s)
+
+	require.NoError(t, s.AddInitEntry(1, []byte("init1")))
+
+	// Push 2 gen=0 segments.
+	mustCommitSlot(t, s, 0, []byte("d"), 1000, 2000)
+	mustCommitSlot(t, s, 1, []byte("d"), 3000, 2000)
+
+	// Push 3 gen=1 segments.
+	require.NoError(t, commitSlotGen(t, s, 2, []byte("d"), 5000, 2000, 1))
+	require.NoError(t, commitSlotGen(t, s, 3, []byte("d"), 7000, 2000, 1))
+	require.NoError(t, commitSlotGen(t, s, 4, []byte("d"), 9000, 2000, 1))
+
+	// Advance clock so all 5 segments are in the past, then push one more
+	// gen=1 segment to trigger eviction.
+	clk.Set(time.UnixMilli(10000))
+	require.NoError(t, commitSlotGen(t, s, 5, []byte("d"), 11000, 2000, 1))
+
+	// backwardBufferSize=1 means eviction keeps only 1 past segment.
+	// 5 segments are in the past (ts <= 10000), so 4 are evicted (indices 0-3).
+	// Remaining: index 4 (past, kept as backward buffer), index 5 (future).
+	// Window of 3 at nowMs=11000: eligible segments are those with ts <= 11000,
+	// which is all 2 remaining. start = max(2-3, 0) = 0.
+	//
+	// The gen 0→1 boundary was between evicted index 1 (gen 0) and evicted
+	// index 2 (gen 1). evictedDiscontinuities captured that. But the boundary
+	// between the last evicted segment (index 3, gen 1) and segments[0]
+	// (index 4, gen 1) has no transition, so no extra increment.
+	//
+	// To test the start==0 boundary case, we need the last evicted segment
+	// to differ from segments[0]. Let's set up that scenario directly.
+
+	s.mu.RLock()
+	playlist, _ := s.renderMediaPlaylist(11000, 3)
+	s.mu.RUnlock()
+
+	// The gen 0→1 transition was among the evicted segments.
+	assert.Contains(t, playlist, "#EXT-X-DISCONTINUITY-SEQUENCE:1",
+		"evicted gen 0→1 transition should be counted; got:\n%s", playlist)
+
+	// No discontinuity within the window (all remaining segments are gen 1).
+	assert.NotContains(t, playlist, "#EXT-X-DISCONTINUITY\n",
+		"no in-window discontinuity expected; got:\n%s", playlist)
+}
+
+func TestRenderMediaPlaylist_DiscontinuitySequence_EvictedBoundaryAtStartZero(t *testing.T) {
+	// Specific test for the boundary between lastEvictedGeneration and
+	// segments[0] when start == 0: all pre-window segments have been evicted,
+	// and the last evicted segment's generation differs from segments[0].
+	clk := clock.NewMock(time.UnixMilli(0))
+	store := NewStore(clk)
+	meta := Metadata{
+		Bandwidth:          4000000,
+		Codecs:             "avc1.64001f",
+		Width:              1920,
+		Height:             1080,
+		FrameRate:          23.976,
+		TargetDurationSecs: 2,
+	}
+	// backwardBufferSize=1, windowSize=2
+	err := store.Init("1", meta, []byte("init0"), 0, 50, testSegmentBytes, 1, 5, 2)
+	require.NoError(t, err)
+	t.Cleanup(func() { store.Delete("1") })
+	s := store.Get("1")
+	require.NotNil(t, s)
+
+	require.NoError(t, s.AddInitEntry(1, []byte("init1")))
+
+	// Push 1 gen=0 segment.
+	mustCommitSlot(t, s, 0, []byte("d"), 1000, 2000)
+
+	// Push 2 gen=1 segments.
+	require.NoError(t, commitSlotGen(t, s, 1, []byte("d"), 3000, 2000, 1))
+	require.NoError(t, commitSlotGen(t, s, 2, []byte("d"), 5000, 2000, 1))
+
+	// Advance clock so segments 0,1,2 are in the past.
+	clk.Set(time.UnixMilli(6000))
+	// Push gen=1 segment to trigger eviction.
+	require.NoError(t, commitSlotGen(t, s, 3, []byte("d"), 7000, 2000, 1))
+
+	// backwardBufferSize=1: 3 past segments (0,1,2), evict 2 → indices 0,1 evicted.
+	// Remaining: [2(gen1), 3(gen1)]. start=0 (window=2 fits all 2 eligible).
+	// lastEvictedGeneration = gen1 (index 1 was gen1).
+	// But evictedDiscontinuities should be 1 (index 0 was gen0, index 1 was gen1).
+	// Boundary: lastEvicted gen1 vs segments[0] gen1 → no extra increment.
+	// Total discSeq = 1. ✓
+
+	// Now advance further and push more to evict index 2 (gen1).
+	clk.Set(time.UnixMilli(8000))
+	require.NoError(t, commitSlotGen(t, s, 4, []byte("d"), 9000, 2000, 1))
+
+	require.NoError(t, s.AddInitEntry(2, []byte("init2")))
+	require.NoError(t, commitSlotGen(t, s, 5, []byte("d"), 11000, 2000, 2))
+
+	// Now advance and evict so the gen1→gen2 boundary is at start==0.
+	clk.Set(time.UnixMilli(12000))
+	require.NoError(t, commitSlotGen(t, s, 6, []byte("d"), 13000, 2000, 2))
+
+	// Render: window=2 at nowMs=13000.
+	s.mu.RLock()
+	playlist, _ := s.renderMediaPlaylist(13000, 2)
+	s.mu.RUnlock()
+
+	// The gen0→1 and gen1→2 transitions should both be in DISCONTINUITY-SEQUENCE.
+	// The window contains only gen=2 segments, so no in-window discontinuity.
+	assert.Contains(t, playlist, "#EXT-X-DISCONTINUITY-SEQUENCE:2",
+		"both scrolled-out transitions should be counted; got:\n%s", playlist)
+	assert.NotContains(t, playlist, "#EXT-X-DISCONTINUITY\n",
+		"no in-window discontinuity expected; got:\n%s", playlist)
+}
+
 func TestRenderMediaPlaylist_DiscontinuityOrder(t *testing.T) {
 	// Verify the exact ordering: DISCONTINUITY comes before MAP for new generation.
 	_, s := setupStreamForPlaylist(t, 2)
