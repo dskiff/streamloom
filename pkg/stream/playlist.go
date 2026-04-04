@@ -83,7 +83,7 @@ func (s *Stream) renderMediaPlaylist(nowMs int64, windowSize int) (string, int64
 
 	b.WriteString("#EXTM3U\n")
 	b.WriteString("#EXT-X-VERSION:7\n")
-	b.WriteString("#EXT-X-INDEPENDENT-SEGMENTS")
+	b.WriteString("#EXT-X-INDEPENDENT-SEGMENTS\n")
 	fmt.Fprintf(&b, "#EXT-X-TARGETDURATION:%d\n", s.metadata.TargetDurationSecs)
 	fmt.Fprintf(&b, "#EXT-X-MEDIA-SEQUENCE:%d\n", window[0].Index)
 	fmt.Fprintf(&b, "#EXT-X-DISCONTINUITY-SEQUENCE:%d\n", discSeq)
