@@ -284,6 +284,10 @@ func API(logger *slog.Logger, env config.Env, store *stream.Store, requestLogger
 						logger.Warn("metadata conflict on subsequent init",
 							"streamID", streamID, "conflict", err)
 						w.WriteHeader(http.StatusConflict)
+					default:
+						logger.Error("unexpected error from parseMetadataHeaders",
+							"streamID", streamID, "error", err)
+						w.WriteHeader(http.StatusInternalServerError)
 					}
 					return
 				}
