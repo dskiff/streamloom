@@ -49,7 +49,7 @@ func parseResolution(s string) (width, height int, ok bool) {
 	return w, h, true
 }
 
-// errMalformedHeader indicates a metadata header is present but unparseable.
+// errMalformedHeader indicates a metadata header is missing or unparseable.
 type errMalformedHeader struct{ detail string }
 
 func (e *errMalformedHeader) Error() string { return e.detail }
@@ -60,64 +60,105 @@ type errMetadataConflict struct{ detail string }
 
 func (e *errMetadataConflict) Error() string { return e.detail }
 
-// checkMetadataConflict inspects the HTTP request for metadata headers and
-// checks them against the existing stream metadata. Returns
-// *errMalformedHeader if a header is present but unparseable,
-// *errMetadataConflict if a header's value differs from the existing
-// metadata, or nil if no metadata headers are present or all present
-// headers match.
-func checkMetadataConflict(r *http.Request, existing stream.Metadata) error {
+// parseMetadataHeaders parses and validates stream metadata from request
+// headers. If existing is nil (first init), all metadata headers are required.
+// If existing is non-nil (subsequent init), headers are optional but any
+// present header must be valid and match the existing value.
+//
+// Returns *errMalformedHeader for missing or unparseable headers and
+// *errMetadataConflict for value mismatches against existing metadata.
+func parseMetadataHeaders(r *http.Request, existing *stream.Metadata) (stream.Metadata, error) {
+	required := existing == nil
+	var meta stream.Metadata
+	if existing != nil {
+		meta = *existing
+	}
+
+	// Bandwidth
 	if v := r.Header.Get("X-SL-BANDWIDTH"); v != "" {
 		n, err := strconv.Atoi(v)
-		if err != nil {
-			return &errMalformedHeader{fmt.Sprintf("bandwidth: invalid value %q", v)}
+		if err != nil || n <= 0 {
+			return meta, &errMalformedHeader{fmt.Sprintf("bandwidth: invalid value %q", v)}
 		}
-		if n != existing.Bandwidth {
-			return &errMetadataConflict{fmt.Sprintf("bandwidth: header=%d existing=%d", n, existing.Bandwidth)}
+		if existing != nil && n != existing.Bandwidth {
+			return meta, &errMetadataConflict{fmt.Sprintf("bandwidth: header=%d existing=%d", n, existing.Bandwidth)}
 		}
+		meta.Bandwidth = n
+	} else if required {
+		return meta, &errMalformedHeader{"missing X-SL-BANDWIDTH header"}
 	}
+
+	// Codecs
 	if v := r.Header.Get("X-SL-CODECS"); v != "" {
-		if v != existing.Codecs {
-			return &errMetadataConflict{fmt.Sprintf("codecs: header=%q existing=%q", v, existing.Codecs)}
+		if err := stream.ValidateCodecs(v); err != nil {
+			return meta, &errMalformedHeader{fmt.Sprintf("codecs: %s", err)}
 		}
+		if existing != nil && v != existing.Codecs {
+			return meta, &errMetadataConflict{fmt.Sprintf("codecs: header=%q existing=%q", v, existing.Codecs)}
+		}
+		meta.Codecs = v
+	} else if required {
+		return meta, &errMalformedHeader{"missing X-SL-CODECS header"}
 	}
+
+	// Resolution
 	if v := r.Header.Get("X-SL-RESOLUTION"); v != "" {
 		w, h, ok := parseResolution(v)
 		if !ok {
-			return &errMalformedHeader{fmt.Sprintf("resolution: invalid value %q", v)}
+			return meta, &errMalformedHeader{fmt.Sprintf("resolution: invalid value %q", v)}
 		}
-		if w != existing.Width || h != existing.Height {
-			return &errMetadataConflict{fmt.Sprintf("resolution: header=%dx%d existing=%dx%d", w, h, existing.Width, existing.Height)}
+		if existing != nil && (w != existing.Width || h != existing.Height) {
+			return meta, &errMetadataConflict{fmt.Sprintf("resolution: header=%dx%d existing=%dx%d", w, h, existing.Width, existing.Height)}
 		}
+		meta.Width = w
+		meta.Height = h
+	} else if required {
+		return meta, &errMalformedHeader{"missing X-SL-RESOLUTION header"}
 	}
+
+	// Frame rate
 	if v := r.Header.Get("X-SL-FRAMERATE"); v != "" {
 		f, err := strconv.ParseFloat(v, 64)
-		if err != nil {
-			return &errMalformedHeader{fmt.Sprintf("framerate: invalid value %q", v)}
+		if err != nil || math.IsNaN(f) || math.IsInf(f, 0) || f <= 0 {
+			return meta, &errMalformedHeader{fmt.Sprintf("framerate: invalid value %q", v)}
 		}
-		if f != existing.FrameRate {
-			return &errMetadataConflict{fmt.Sprintf("framerate: header=%g existing=%g", f, existing.FrameRate)}
+		if existing != nil && f != existing.FrameRate {
+			return meta, &errMetadataConflict{fmt.Sprintf("framerate: header=%g existing=%g", f, existing.FrameRate)}
 		}
+		meta.FrameRate = f
+	} else if required {
+		return meta, &errMalformedHeader{"missing X-SL-FRAMERATE header"}
 	}
+
+	// Target duration
 	if v := r.Header.Get("X-SL-TARGET-DURATION"); v != "" {
 		n, err := strconv.Atoi(v)
-		if err != nil {
-			return &errMalformedHeader{fmt.Sprintf("target-duration: invalid value %q", v)}
+		if err != nil || n <= 0 {
+			return meta, &errMalformedHeader{fmt.Sprintf("target-duration: invalid value %q", v)}
 		}
-		if n != existing.TargetDurationSecs {
-			return &errMetadataConflict{fmt.Sprintf("target-duration: header=%d existing=%d", n, existing.TargetDurationSecs)}
+		if existing != nil && n != existing.TargetDurationSecs {
+			return meta, &errMetadataConflict{fmt.Sprintf("target-duration: header=%d existing=%d", n, existing.TargetDurationSecs)}
 		}
+		meta.TargetDurationSecs = n
+	} else if required {
+		return meta, &errMalformedHeader{"missing X-SL-TARGET-DURATION header"}
 	}
+
+	// Segment bytes
 	if v := r.Header.Get("X-SL-SEGMENT-BYTES"); v != "" {
 		n, err := strconv.Atoi(v)
-		if err != nil {
-			return &errMalformedHeader{fmt.Sprintf("segment-bytes: invalid value %q", v)}
+		if err != nil || n <= 0 {
+			return meta, &errMalformedHeader{fmt.Sprintf("segment-bytes: invalid value %q", v)}
 		}
-		if n != existing.SegmentByteCount {
-			return &errMetadataConflict{fmt.Sprintf("segment-bytes: header=%d existing=%d", n, existing.SegmentByteCount)}
+		if existing != nil && n != existing.SegmentByteCount {
+			return meta, &errMetadataConflict{fmt.Sprintf("segment-bytes: header=%d existing=%d", n, existing.SegmentByteCount)}
 		}
+		meta.SegmentByteCount = n
+	} else if required {
+		return meta, &errMalformedHeader{"missing X-SL-SEGMENT-BYTES header"}
 	}
-	return nil
+
+	return meta, nil
 }
 
 // API constructs the chi router for the authenticated push API server.
@@ -231,9 +272,9 @@ func API(logger *slog.Logger, env config.Env, store *stream.Store, requestLogger
 			// Check if the stream already exists: subsequent inits only need
 			// generation + body to add a new init entry.
 			if s := store.Get(streamID); s != nil {
-				// Reject if any metadata headers are present and either
-				// malformed or conflicting with the existing metadata.
-				if err := checkMetadataConflict(r, s.Metadata()); err != nil {
+				// Validate any metadata headers present on the subsequent init.
+				existing := s.Metadata()
+				if _, err := parseMetadataHeaders(r, &existing); err != nil {
 					switch err.(type) {
 					case *errMalformedHeader:
 						logger.Warn("malformed metadata header on subsequent init",
@@ -272,66 +313,14 @@ func API(logger *slog.Logger, env config.Env, store *stream.Store, requestLogger
 			}
 
 			// First init: parse required metadata and capacity headers.
-			bandwidthStr := r.Header.Get("X-SL-BANDWIDTH")
-			if bandwidthStr == "" {
-				logger.Warn("missing bandwidth header")
-				w.WriteHeader(http.StatusBadRequest)
-				return
-			}
-			bandwidth, err := strconv.Atoi(bandwidthStr)
-			if err != nil || bandwidth <= 0 {
-				logger.Warn("invalid bandwidth header", "value", bandwidthStr, "error", err)
+			meta, err := parseMetadataHeaders(r, nil)
+			if err != nil {
+				logger.Warn("invalid metadata header", "error", err)
 				w.WriteHeader(http.StatusBadRequest)
 				return
 			}
 
-			codecs := r.Header.Get("X-SL-CODECS")
-			if err := stream.ValidateCodecs(codecs); err != nil {
-				logger.Warn("invalid codecs header", "value", codecs, "error", err)
-				w.WriteHeader(http.StatusBadRequest)
-				return
-			}
-
-			resolutionStr := r.Header.Get("X-SL-RESOLUTION")
-			if resolutionStr == "" {
-				logger.Warn("missing resolution header")
-				w.WriteHeader(http.StatusBadRequest)
-				return
-			}
-			width, height, ok := parseResolution(resolutionStr)
-			if !ok {
-				logger.Warn("invalid resolution header", "value", resolutionStr)
-				w.WriteHeader(http.StatusBadRequest)
-				return
-			}
-
-			framerateStr := r.Header.Get("X-SL-FRAMERATE")
-			if framerateStr == "" {
-				logger.Warn("missing framerate header")
-				w.WriteHeader(http.StatusBadRequest)
-				return
-			}
-			framerate, err := strconv.ParseFloat(framerateStr, 64)
-			if err != nil || math.IsNaN(framerate) || math.IsInf(framerate, 0) || framerate <= 0 {
-				logger.Warn("invalid framerate header", "value", framerateStr, "error", err)
-				w.WriteHeader(http.StatusBadRequest)
-				return
-			}
-
-			targetDurationStr := r.Header.Get("X-SL-TARGET-DURATION")
-			if targetDurationStr == "" {
-				logger.Warn("missing target-duration header")
-				w.WriteHeader(http.StatusBadRequest)
-				return
-			}
-			targetDuration, err := strconv.Atoi(targetDurationStr)
-			if err != nil || targetDuration <= 0 {
-				logger.Warn("invalid target-duration header", "value", targetDurationStr, "error", err)
-				w.WriteHeader(http.StatusBadRequest)
-				return
-			}
-
-			// Parse buffer capacity headers.
+			// Parse capacity-only headers (not part of Metadata).
 			segmentCapStr := r.Header.Get("X-SL-SEGMENT-CAP")
 			if segmentCapStr == "" {
 				logger.Warn("missing segment-cap header")
@@ -345,33 +334,20 @@ func API(logger *slog.Logger, env config.Env, store *stream.Store, requestLogger
 				return
 			}
 
-			segmentBytesStr := r.Header.Get("X-SL-SEGMENT-BYTES")
-			if segmentBytesStr == "" {
-				logger.Warn("missing segment-bytes header")
-				w.WriteHeader(http.StatusBadRequest)
-				return
-			}
-			segmentBytes, err := strconv.Atoi(segmentBytesStr)
-			if err != nil || segmentBytes <= 0 {
-				logger.Warn("invalid segment-bytes header", "value", segmentBytesStr, "error", err)
-				w.WriteHeader(http.StatusBadRequest)
-				return
-			}
-
 			totalSlots := int64(segmentCap) + int64(env.BUFFER_WORKING_SPACE)
-			if totalSlots > math.MaxInt64/int64(segmentBytes) {
+			if totalSlots > math.MaxInt64/int64(meta.SegmentByteCount) {
 				logger.Warn("requested buffer overflows int64",
 					"segmentCap", segmentCap,
-					"segmentBytes", segmentBytes,
+					"segmentBytes", meta.SegmentByteCount,
 				)
 				w.WriteHeader(http.StatusBadRequest)
 				return
 			}
-			totalBufferBytes := totalSlots * int64(segmentBytes)
+			totalBufferBytes := totalSlots * int64(meta.SegmentByteCount)
 			if totalBufferBytes > env.STREAM_MAX_BUFFER_BYTES {
 				logger.Warn("requested buffer exceeds maximum",
 					"segmentCap", segmentCap,
-					"segmentBytes", segmentBytes,
+					"segmentBytes", meta.SegmentByteCount,
 					"totalBufferBytes", totalBufferBytes,
 					"maxBufferBytes", env.STREAM_MAX_BUFFER_BYTES,
 				)
@@ -391,15 +367,8 @@ func API(logger *slog.Logger, env config.Env, store *stream.Store, requestLogger
 				w.WriteHeader(http.StatusBadRequest)
 				return
 			}
-			meta := stream.Metadata{
-				Bandwidth:          bandwidth,
-				Codecs:             codecs,
-				Width:              width,
-				Height:             height,
-				FrameRate:          framerate,
-				TargetDurationSecs: targetDuration,
-			}
-			if err := store.Init(streamID, meta, initData, generation, segmentCap, segmentBytes, backwardBufferSize, env.BUFFER_WORKING_SPACE, config.DefaultMediaWindowSize); err != nil {
+
+			if err := store.Init(streamID, meta, initData, generation, segmentCap, meta.SegmentByteCount, backwardBufferSize, env.BUFFER_WORKING_SPACE, config.DefaultMediaWindowSize); err != nil {
 				logger.Warn("invalid stream configuration", "error", err)
 				w.WriteHeader(http.StatusBadRequest)
 				return
@@ -407,12 +376,12 @@ func API(logger *slog.Logger, env config.Env, store *stream.Store, requestLogger
 			logger.Info("stream initialized",
 				"streamID", streamID,
 				"generation", generation,
-				"bandwidth", bandwidth,
-				"codecs", codecs,
-				"resolution", resolutionStr,
-				"framerate", framerate,
+				"bandwidth", meta.Bandwidth,
+				"codecs", meta.Codecs,
+				"resolution", fmt.Sprintf("%dx%d", meta.Width, meta.Height),
+				"framerate", meta.FrameRate,
 				"segmentCap", segmentCap,
-				"segmentBytes", segmentBytes,
+				"segmentBytes", meta.SegmentByteCount,
 				"backwardBufferSize", backwardBufferSize,
 			)
 
