@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // MaxStreamIDLength is the upper bound on stream ID length.
@@ -76,6 +77,10 @@ type Env struct {
 	// headers are never trusted (safe default).
 	TRUSTED_PROXIES []*net.IPNet
 
+	// STREAM_IDLE_TIMEOUT is the duration after which a stream with no new
+	// content is automatically deleted. Set to 0 to disable reaping.
+	STREAM_IDLE_TIMEOUT time.Duration
+
 	// STREAM_TOKENS maps stream IDs to SHA-256 digests of the expected
 	// "Bearer <token>" header value for constant-time comparison.
 	STREAM_TOKENS map[string]TokenDigest
@@ -91,6 +96,11 @@ func (e *Env) GetStreamToken(streamID string) (TokenDigest, bool) {
 // GetEnv reads configuration from environment variables.
 // Stream tokens (SL_STREAM_<id>_TOKEN) are unset from the environment after reading.
 func GetEnv() (Env, error) {
+	idleTimeout, err := parseStreamIdleTimeout()
+	if err != nil {
+		return Env{}, err
+	}
+
 	streamTokens, err := parseStreamTokens()
 	if err != nil {
 		return Env{}, err
@@ -135,6 +145,7 @@ func GetEnv() (Env, error) {
 		STREAM_MAX_BUFFER_BYTES: maxBufferBytes,
 		BUFFER_WORKING_SPACE:    workingSpace,
 		TRUSTED_PROXIES:         trustedProxies,
+		STREAM_IDLE_TIMEOUT:     idleTimeout,
 
 		STREAM_TOKENS: streamTokens,
 	}, nil
@@ -212,6 +223,25 @@ func parseBindAddr() (string, error) {
 		return "", fmt.Errorf("invalid SL_BIND_ADDR value %q: not a valid IP address", raw)
 	}
 	return raw, nil
+}
+
+// parseStreamIdleTimeout reads SL_STREAM_IDLE_TIMEOUT from the environment.
+// Returns DefaultStreamIdleTimeout when the variable is unset or empty.
+// Accepts Go duration strings (e.g. "2m", "90s"). A value of "0" disables
+// reaping. Returns an error for negative or unparseable values.
+func parseStreamIdleTimeout() (time.Duration, error) {
+	raw := os.Getenv("SL_STREAM_IDLE_TIMEOUT")
+	if raw == "" {
+		return DefaultStreamIdleTimeout, nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, fmt.Errorf("invalid SL_STREAM_IDLE_TIMEOUT value %q: %w", raw, err)
+	}
+	if d < 0 {
+		return 0, fmt.Errorf("SL_STREAM_IDLE_TIMEOUT must be non-negative, got %s", d)
+	}
+	return d, nil
 }
 
 const streamTokenPrefix = "SL_STREAM_"

@@ -1862,3 +1862,176 @@ func TestEvictStaleInitEntries_SingleGeneration_NoOp(t *testing.T) {
 	_, ok := s.GetInitEntry(0)
 	assert.True(t, ok, "single generation init should never be evicted")
 }
+
+// --- NewestTimestampMs tests ---
+
+func TestNewestTimestampMs_NoSegments(t *testing.T) {
+	now := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	clk := clock.NewMock(now)
+	store := NewStore(clk)
+
+	meta := Metadata{TargetDurationSecs: 2}
+	mustInit(t, store, "s", meta, []byte("init"), testCap, testSegmentBytes, testBackwardBufferSize)
+
+	s := store.Get("s")
+	require.NotNil(t, s)
+
+	got := s.NewestTimestampMs()
+	assert.Equal(t, now.UnixMilli(), got, "should return createdAtMs when no segments exist")
+}
+
+func TestNewestTimestampMs_WithSegments(t *testing.T) {
+	now := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	clk := clock.NewMock(now)
+	store := NewStore(clk)
+
+	meta := Metadata{TargetDurationSecs: 2}
+	mustInit(t, store, "s", meta, []byte("init"), testCap, testSegmentBytes, testBackwardBufferSize)
+
+	s := store.Get("s")
+	base := now.UnixMilli()
+	mustCommitSlot(t, s, 0, []byte("seg0"), base, 2000)
+	mustCommitSlot(t, s, 1, []byte("seg1"), base+2000, 2000)
+	mustCommitSlot(t, s, 2, []byte("seg2"), base+4000, 2000)
+
+	got := s.NewestTimestampMs()
+	assert.Equal(t, base+4000, got, "should return the last segment's timestamp")
+}
+
+// --- ReapIdleStreams tests ---
+
+func TestReapIdleStreams_ReapsStale(t *testing.T) {
+	now := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	clk := clock.NewMock(now)
+	store := NewStore(clk)
+
+	meta := Metadata{TargetDurationSecs: 2}
+	// Don't use mustInit since we want the reaper to delete these, not t.Cleanup.
+	err := store.Init("a", meta, []byte("init"), 0, testCap, testSegmentBytes, testBackwardBufferSize, 0, testPlaylistWindowSize)
+	require.NoError(t, err)
+	err = store.Init("b", meta, []byte("init"), 0, testCap, testSegmentBytes, testBackwardBufferSize, 0, testPlaylistWindowSize)
+	require.NoError(t, err)
+
+	sa := store.Get("a")
+	sb := store.Get("b")
+	mustCommitSlot(t, sa, 0, []byte("d"), now.UnixMilli(), 2000)
+	mustCommitSlot(t, sb, 0, []byte("d"), now.UnixMilli(), 2000)
+
+	// Advance clock past idle timeout.
+	clk.Set(now.Add(3 * time.Minute))
+
+	n := store.ReapIdleStreams(2 * time.Minute)
+	assert.Equal(t, 2, n, "should reap both stale streams")
+	assert.Nil(t, store.Get("a"))
+	assert.Nil(t, store.Get("b"))
+}
+
+func TestReapIdleStreams_SparesFresh(t *testing.T) {
+	now := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	clk := clock.NewMock(now)
+	store := NewStore(clk)
+
+	meta := Metadata{TargetDurationSecs: 2}
+	err := store.Init("stale", meta, []byte("init"), 0, testCap, testSegmentBytes, testBackwardBufferSize, 0, testPlaylistWindowSize)
+	require.NoError(t, err)
+	err = store.Init("fresh", meta, []byte("init"), 0, testCap, testSegmentBytes, testBackwardBufferSize, 0, testPlaylistWindowSize)
+	require.NoError(t, err)
+	t.Cleanup(func() { store.Delete("fresh") })
+
+	stale := store.Get("stale")
+	fresh := store.Get("fresh")
+	mustCommitSlot(t, stale, 0, []byte("d"), now.UnixMilli(), 2000)
+	mustCommitSlot(t, fresh, 0, []byte("d"), now.UnixMilli(), 2000)
+
+	// Advance clock, then push a fresh segment.
+	later := now.Add(3 * time.Minute)
+	clk.Set(later)
+	mustCommitSlot(t, fresh, 1, []byte("d"), later.UnixMilli(), 2000)
+
+	n := store.ReapIdleStreams(2 * time.Minute)
+	assert.Equal(t, 1, n, "should only reap the stale stream")
+	assert.Nil(t, store.Get("stale"))
+	assert.NotNil(t, store.Get("fresh"))
+}
+
+func TestReapIdleStreams_EmptyStream(t *testing.T) {
+	now := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	clk := clock.NewMock(now)
+	store := NewStore(clk)
+
+	meta := Metadata{TargetDurationSecs: 2}
+	err := store.Init("empty", meta, []byte("init"), 0, testCap, testSegmentBytes, testBackwardBufferSize, 0, testPlaylistWindowSize)
+	require.NoError(t, err)
+
+	// Advance past timeout — empty stream should be reaped based on createdAtMs.
+	clk.Set(now.Add(3 * time.Minute))
+
+	n := store.ReapIdleStreams(2 * time.Minute)
+	assert.Equal(t, 1, n)
+	assert.Nil(t, store.Get("empty"))
+}
+
+func TestReapIdleStreams_ZeroTimeout(t *testing.T) {
+	now := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	clk := clock.NewMock(now)
+	store := NewStore(clk)
+
+	meta := Metadata{TargetDurationSecs: 2}
+	mustInit(t, store, "s", meta, []byte("init"), testCap, testSegmentBytes, testBackwardBufferSize)
+
+	s := store.Get("s")
+	mustCommitSlot(t, s, 0, []byte("d"), now.UnixMilli(), 2000)
+
+	clk.Set(now.Add(10 * time.Minute))
+
+	n := store.ReapIdleStreams(0)
+	assert.Equal(t, 0, n, "zero timeout should disable reaping")
+	assert.NotNil(t, store.Get("s"))
+}
+
+func TestReapIdleStreams_AlreadyDeleted(t *testing.T) {
+	now := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	clk := clock.NewMock(now)
+	store := NewStore(clk)
+
+	meta := Metadata{TargetDurationSecs: 2}
+	err := store.Init("s", meta, []byte("init"), 0, testCap, testSegmentBytes, testBackwardBufferSize, 0, testPlaylistWindowSize)
+	require.NoError(t, err)
+
+	s := store.Get("s")
+	mustCommitSlot(t, s, 0, []byte("d"), now.UnixMilli(), 2000)
+
+	// Delete manually before reaping.
+	store.Delete("s")
+
+	clk.Set(now.Add(3 * time.Minute))
+	n := store.ReapIdleStreams(2 * time.Minute)
+	assert.Equal(t, 0, n, "should not panic or double-delete")
+}
+
+func TestReapIdleStreams_DoubleCheckPreventsFalseReap(t *testing.T) {
+	now := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	clk := clock.NewMock(now)
+	store := NewStore(clk)
+
+	meta := Metadata{TargetDurationSecs: 2}
+	err := store.Init("s", meta, []byte("init"), 0, testCap, testSegmentBytes, testBackwardBufferSize, 0, testPlaylistWindowSize)
+	require.NoError(t, err)
+	t.Cleanup(func() { store.Delete("s") })
+
+	s := store.Get("s")
+	mustCommitSlot(t, s, 0, []byte("d"), now.UnixMilli(), 2000)
+
+	// Advance clock past timeout to make the stream appear stale.
+	later := now.Add(3 * time.Minute)
+	clk.Set(later)
+
+	// Simulate a push landing after the snapshot but before deleteIfStale:
+	// push a segment with a fresh timestamp so the double-check sees it.
+	mustCommitSlot(t, s, 1, []byte("d"), later.UnixMilli(), 2000)
+
+	// The stream should survive because the newest timestamp is now fresh.
+	n := store.ReapIdleStreams(2 * time.Minute)
+	assert.Equal(t, 0, n, "double-check should prevent reaping a freshly-pushed stream")
+	assert.NotNil(t, store.Get("s"))
+}

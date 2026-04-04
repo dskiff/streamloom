@@ -10,6 +10,7 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/dskiff/streamloom/pkg/clock"
 	"github.com/dskiff/streamloom/pkg/pool"
@@ -131,6 +132,11 @@ type Stream struct {
 	clock    clock.Clock
 	metadata Metadata
 
+	// createdAtMs is the wall-clock time (unix ms) when the stream was
+	// created via Init. Used as the staleness baseline for streams with
+	// no segments.
+	createdAtMs int64
+
 	// initEntries holds per-generation init segment data, keyed by generation.
 	// Entries are added via Init (first generation) and AddInitEntry (subsequent).
 	// Stale entries are evicted during CommitSlot when their generation is below
@@ -197,6 +203,20 @@ func (s *Stream) TotalSegmentCount() int64 {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.totalSegmentCount
+}
+
+// NewestTimestampMs returns the timestamp (unix ms) of the newest segment,
+// or the stream creation time if no segments have been committed.
+// Safe for concurrent use.
+func (s *Stream) NewestTimestampMs() int64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if len(s.segments) == 0 {
+		return s.createdAtMs
+	}
+	// segments is sorted by Index; the ordering invariant guarantees
+	// the last element has the highest timestamp.
+	return s.segments[len(s.segments)-1].Timestamp
 }
 
 // SegmentLoad returns the current number of buffered segments and the capacity.
@@ -594,8 +614,9 @@ func (s *Store) Init(id string, meta Metadata, initData []byte, generation int64
 	}
 
 	st := &Stream{
-		clock:    s.clock,
-		metadata: meta,
+		clock:       s.clock,
+		metadata:    meta,
+		createdAtMs: s.clock.Now().UnixMilli(),
 		initEntries: map[int64]*InitEntry{
 			generation: {InitData: cloned},
 		},
@@ -688,4 +709,64 @@ func (s *Store) Delete(id string) bool {
 		<-st.stopped
 	}
 	return ok
+}
+
+// ReapIdleStreams deletes streams whose newest content is older than
+// timeout. Returns the number of streams reaped. A timeout of 0 or
+// negative disables reaping and returns 0.
+func (s *Store) ReapIdleStreams(timeout time.Duration) int {
+	if timeout <= 0 {
+		return 0
+	}
+	thresholdMs := s.clock.Now().Add(-timeout).UnixMilli()
+	candidates := s.idleStreams(thresholdMs)
+
+	reaped := 0
+	for _, id := range candidates {
+		if s.deleteIfStale(id, thresholdMs) {
+			reaped++
+		}
+	}
+	return reaped
+}
+
+// idleStreams returns the IDs of streams whose newest content timestamp
+// is below thresholdMs. The Store read-lock is held only during the
+// snapshot; individual Stream read-locks are acquired per-stream.
+func (s *Store) idleStreams(thresholdMs int64) []string {
+	s.mu.RLock()
+	var idle []string
+	for id, st := range s.streams {
+		if st.NewestTimestampMs() < thresholdMs {
+			idle = append(idle, id)
+		}
+	}
+	s.mu.RUnlock()
+	return idle
+}
+
+// deleteIfStale removes the stream only if it still exists and its
+// newest timestamp is still below the threshold. Returns true if deleted.
+// This double-check prevents deleting a stream that received a new
+// segment between the idleStreams snapshot and this call.
+// See also: Delete, which unconditionally removes a stream.
+func (s *Store) deleteIfStale(id string, thresholdMs int64) bool {
+	s.mu.Lock()
+	st, ok := s.streams[id]
+	if !ok {
+		s.mu.Unlock()
+		return false
+	}
+	// Re-check freshness under the write lock. NewestTimestampMs acquires
+	// Stream.mu (RLock) — safe because Store.mu is always acquired first.
+	if st.NewestTimestampMs() >= thresholdMs {
+		s.mu.Unlock()
+		return false
+	}
+	close(st.done)
+	delete(s.streams, id)
+	s.mu.Unlock()
+
+	<-st.stopped
+	return true
 }

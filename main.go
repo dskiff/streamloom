@@ -96,6 +96,25 @@ func main() {
 		}
 	}()
 
+	if env.STREAM_IDLE_TIMEOUT > 0 {
+		logger.Info("stream idle reaping enabled", "timeout", env.STREAM_IDLE_TIMEOUT)
+		go func() {
+			ticker := time.NewTicker(config.ReaperScanInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					n := store.ReapIdleStreams(env.STREAM_IDLE_TIMEOUT)
+					if n > 0 {
+						logger.Info("reaped idle streams", "count", n)
+					}
+				}
+			}
+		}()
+	}
+
 	serverWg := sync.WaitGroup{}
 
 	// Bind address priority: SL_BIND_ADDR env var > mode default.
