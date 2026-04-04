@@ -269,21 +269,6 @@ func (s *Stream) WriteInitDataForGenerationTo(w io.Writer, generation int64) (in
 	return w.Write(e.InitData)
 }
 
-// RunWithInitEntry looks up the init entry for the given generation under a
-// read lock, then calls fn with the data length and bytes outside the lock.
-// The InitEntry's data is immutable (cloned on creation), so the captured
-// pointer remains valid after the lock is released. Returns
-// ErrMissingInitForGeneration if no entry exists for the generation.
-func (s *Stream) RunWithInitEntry(generation int64, fn func(dataLen int, data []byte) error) error {
-	s.mu.RLock()
-	e, ok := s.initEntries[generation]
-	s.mu.RUnlock()
-	if !ok {
-		return ErrMissingInitForGeneration
-	}
-	return fn(len(e.InitData), e.InitData)
-}
-
 // CurrentGeneration returns the stream's current generation value.
 func (s *Stream) CurrentGeneration() int64 {
 	s.mu.RLock()
