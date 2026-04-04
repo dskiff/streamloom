@@ -146,9 +146,7 @@ func (s *Stream) runPlaylistRenderer(windowSize int) {
 				select {
 				case <-timer.C():
 				case <-s.notifyCh:
-					if !timer.Stop() {
-						<-timer.C()
-					}
+					timer.Stop()
 				case <-s.done:
 					timer.Stop()
 					return
@@ -159,9 +157,7 @@ func (s *Stream) runPlaylistRenderer(windowSize int) {
 			select {
 			case <-timer.C():
 			case <-s.notifyCh:
-				if !timer.Stop() {
-					<-timer.C()
-				}
+				timer.Stop()
 			case <-s.done:
 				timer.Stop()
 				return
