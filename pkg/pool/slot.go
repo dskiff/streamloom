@@ -23,6 +23,12 @@ func (s *BufferSlot) Len() int {
 	return len(s.buf)
 }
 
+// Bytes returns the valid data bytes in the slot.
+// The returned slice shares the underlying array; callers must not modify it.
+func (s *BufferSlot) Bytes() []byte {
+	return s.buf
+}
+
 // WriteTo writes the slot's data to w. Implements io.WriterTo.
 func (s *BufferSlot) WriteTo(w io.Writer) (int64, error) {
 	n, err := w.Write(s.buf)
