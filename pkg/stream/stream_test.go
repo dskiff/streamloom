@@ -1610,6 +1610,20 @@ func TestCommitSlot_ZeroGenerationStaleAfterAdvance(t *testing.T) {
 	assert.ErrorIs(t, err, ErrStaleGeneration)
 }
 
+func TestStoreInit_NegativeGeneration(t *testing.T) {
+	store := NewStore(clock.Real{})
+	meta := Metadata{Bandwidth: 1, Codecs: "avc1.64001f", Width: 1, Height: 1, FrameRate: 30, TargetDurationSecs: 2}
+	err := store.Init("s", meta, []byte("init"), -1, 10, testSegmentBytes, 5, 0, testPlaylistWindowSize)
+	assert.ErrorIs(t, err, ErrNegativeGeneration)
+}
+
+func TestStoreInit_EmptyInitData(t *testing.T) {
+	store := NewStore(clock.Real{})
+	meta := Metadata{Bandwidth: 1, Codecs: "avc1.64001f", Width: 1, Height: 1, FrameRate: 30, TargetDurationSecs: 2}
+	err := store.Init("s", meta, []byte{}, 0, 10, testSegmentBytes, 5, 0, testPlaylistWindowSize)
+	assert.ErrorIs(t, err, ErrEmptyInitData)
+}
+
 func TestStoreInit_NonZeroGeneration(t *testing.T) {
 	// First init at generation 5: stream should start with currentGeneration=5,
 	// only init entry for gen 5, and reject segments at earlier generations.

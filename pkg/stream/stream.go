@@ -532,6 +532,12 @@ var ErrInvalidWorkingSpace = errors.New("workingSpace must be >= 0 and segmentCa
 // it must be >= 1 and < segmentCapacity.
 // playlistWindowSize is the maximum number of segments in the media playlist.
 func (s *Store) Init(id string, meta Metadata, initData []byte, generation int64, segmentCapacity, segmentBytes, backwardBufferSize, workingSpace, playlistWindowSize int) error {
+	if generation < 0 {
+		return ErrNegativeGeneration
+	}
+	if len(initData) == 0 {
+		return ErrEmptyInitData
+	}
 	if meta.TargetDurationSecs <= 0 {
 		return ErrInvalidTargetDuration
 	}
