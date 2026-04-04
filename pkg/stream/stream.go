@@ -387,6 +387,7 @@ func (s *Stream) ReleaseSlot(buf *pool.BufferSlot) {
 // dropped).
 //
 // Returns ErrStaleGeneration if generation is older than the stream's current,
+// ErrMissingInitForGeneration if no init entry exists for the generation,
 // ErrDuplicateIndex if a segment with the same index already exists,
 // ErrBufferFull if the segment list is at capacity, ErrTimestampInPast if
 // the timestamp is before the current time and the stream is non-empty, or
@@ -525,7 +526,9 @@ var ErrInvalidWorkingSpace = errors.New("workingSpace must be >= 0 and segmentCa
 
 // Init creates or replaces a stream's init state, clearing any existing segments.
 // The initData slice is cloned so that the caller cannot mutate the stored bytes.
-// generation identifies the encoding generation for this init entry.
+// generation identifies the encoding generation for this init entry; it must be
+// non-negative (returns ErrNegativeGeneration otherwise). initData must be
+// non-empty (returns ErrEmptyInitData otherwise).
 // workingSpace extra slots are added to the BufferPool beyond segmentCapacity to
 // allow concurrent handlers to hold buffers before committing.
 // backwardBufferSize controls how many past segments are retained during eviction;

@@ -389,7 +389,7 @@ func TestE2E_SubsequentInitMalformedMetadata(t *testing.T) {
 	req.Header.Set("X-SL-BANDWIDTH", "not-a-number")
 	rec = httptest.NewRecorder()
 	apiRouter.ServeHTTP(rec, req)
-	assert.Equal(t, http.StatusConflict, rec.Code)
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
 }
 
 func TestE2E_SubsequentInitPreviousGeneration(t *testing.T) {
