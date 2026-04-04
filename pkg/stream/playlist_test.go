@@ -390,12 +390,11 @@ func TestRenderMediaPlaylist_DiscontinuitySequence_AllPreWindowEvicted(t *testin
 	// which is all 2 remaining. start = max(2-3, 0) = 0.
 	//
 	// The gen 0→1 boundary was between evicted index 1 (gen 0) and evicted
-	// index 2 (gen 1). evictedDiscontinuities captured that. But the boundary
+	// index 2 (gen 1). evictedDiscontinuities captured that. The boundary
 	// between the last evicted segment (index 3, gen 1) and segments[0]
 	// (index 4, gen 1) has no transition, so no extra increment.
-	//
-	// To test the start==0 boundary case, we need the last evicted segment
-	// to differ from segments[0]. Let's set up that scenario directly.
+	// The case where lastEvictedGeneration differs from segments[0] is
+	// covered by TestRenderMediaPlaylist_DiscontinuitySequence_EvictedBoundaryAtStartZero.
 
 	s.mu.RLock()
 	playlist, _ := s.renderMediaPlaylist(11000, 3)

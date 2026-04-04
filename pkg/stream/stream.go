@@ -256,14 +256,14 @@ func (s *Stream) InitDataLenForGeneration(generation int64) int {
 }
 
 // WriteInitDataForGenerationTo writes the init segment bytes for the given
-// generation to w under a read lock. Returns 0 and ErrSegmentNotFound if
-// the generation has no init entry.
+// generation to w under a read lock. Returns 0 and ErrMissingInitForGeneration
+// if the generation has no init entry.
 func (s *Stream) WriteInitDataForGenerationTo(w io.Writer, generation int64) (int, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	e, ok := s.initEntries[generation]
 	if !ok {
-		return 0, ErrSegmentNotFound
+		return 0, ErrMissingInitForGeneration
 	}
 	return w.Write(e.InitData)
 }
