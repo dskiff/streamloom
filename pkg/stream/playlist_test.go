@@ -1,6 +1,7 @@
 package stream
 
 import (
+	"bytes"
 	"fmt"
 	"strings"
 	"testing"
@@ -652,4 +653,156 @@ func TestAddInitEntry_ClonesData(t *testing.T) {
 	entry, ok := s.GetInitEntry(1)
 	require.True(t, ok)
 	assert.Equal(t, byte(0x01), entry.InitData[0], "AddInitEntry should clone input")
+}
+
+// --- Renderer notify tests ---
+
+func TestRunPlaylistRenderer_NotifyDuringMinRenderInterval(t *testing.T) {
+	// Regression test: when the renderer enters the minRenderInterval throttle
+	// path (sleepMs <= 0), a notifyCh signal must wake it and cause a re-render
+	// rather than waiting for the timer.
+	//
+	// Scenario: clock advances between the two clock reads in the render loop
+	// (nowMs at render time vs. sleepMs calculation), putting the renderer into
+	// the minRenderInterval path. The mock timer target (clock + 50ms) is never
+	// reached because the test doesn't advance the clock further. Without
+	// notifyCh in the select, the renderer would deadlock.
+	clk := clock.NewMock(time.UnixMilli(0))
+	store := NewStore(clk)
+	meta := Metadata{
+		Bandwidth:          4000000,
+		Codecs:             "avc1.64001f",
+		Width:              1920,
+		Height:             1080,
+		FrameRate:          23.976,
+		TargetDurationSecs: 2,
+	}
+	err := store.Init("1", meta, []byte("init"), 0, 20, testSegmentBytes, 10, 2, 12)
+	require.NoError(t, err)
+	t.Cleanup(func() { store.Delete("1") })
+
+	s := store.Get("1")
+	require.NotNil(t, s)
+
+	// Push a segment with a future timestamp (ts=5000) while clock is at 0.
+	buf, ok := s.AcquireSlot()
+	require.True(t, ok)
+	_, _ = buf.ReadFrom(bytes.NewReader([]byte("seg0")))
+	require.NoError(t, s.CommitSlot(0, buf, 5000, 2000, 0))
+
+	// Advance clock past the segment so it becomes eligible. The renderer
+	// will wake (timer target was 5000), render segment_0, and then see no
+	// future segments → wait on notifyCh.
+	clk.Set(time.UnixMilli(6000))
+
+	// Wait for the renderer to produce a playlist with segment_0.
+	require.Eventually(t, func() bool {
+		p := s.CachedPlaylist()
+		return p != "" && strings.Contains(p, "segment_0.m4s")
+	}, 2*time.Second, 10*time.Millisecond)
+
+	// Now push a segment at ts=7000 (future, > clock 6000).
+	buf, ok = s.AcquireSlot()
+	require.True(t, ok)
+	_, _ = buf.ReadFrom(bytes.NewReader([]byte("seg1")))
+	require.NoError(t, s.CommitSlot(1, buf, 7000, 2000, 0))
+
+	// The renderer wakes from notifyCh, renders (segment_1 not yet eligible
+	// at clock 6000), and computes sleepMs = 7000 - 6000 = 1000. Timer target
+	// = 6000 + 1000 = 7000.
+	//
+	// Now advance clock to 8000 (past the timer target) so the renderer wakes,
+	// but then also push segment_2 at ts=9000 before the renderer completes
+	// its next loop iteration. This sets up the race where the second clock
+	// read (sleepMs) sees 8000 while the render used nowMs from the first
+	// clock read which might be stale.
+	clk.Set(time.UnixMilli(8000))
+
+	// Push segment_2 at ts=9000 to signal notifyCh. The renderer may be in
+	// the minRenderInterval path if it hit sleepMs <= 0 due to the clock race.
+	buf, ok = s.AcquireSlot()
+	require.True(t, ok)
+	_, _ = buf.ReadFrom(bytes.NewReader([]byte("seg2")))
+	require.NoError(t, s.CommitSlot(2, buf, 9000, 2000, 0))
+
+	// Advance clock past segment_2's timestamp so it's eligible.
+	clk.Set(time.UnixMilli(10000))
+
+	// Push segment_3 to wake the renderer one more time.
+	buf, ok = s.AcquireSlot()
+	require.True(t, ok)
+	_, _ = buf.ReadFrom(bytes.NewReader([]byte("seg3")))
+	require.NoError(t, s.CommitSlot(3, buf, 11000, 2000, 0))
+
+	// The renderer must eventually produce a playlist containing segment_2.
+	// Before the fix (adding notifyCh to minRenderInterval select), this
+	// would time out because the renderer could get stuck on a mock timer
+	// that never fires.
+	require.Eventually(t, func() bool {
+		p := s.CachedPlaylist()
+		return p != "" && strings.Contains(p, "segment_2.m4s")
+	}, 2*time.Second, 10*time.Millisecond)
+}
+
+func TestRunPlaylistRenderer_NotifyRacesWithTimer(t *testing.T) {
+	// Verify that a notifyCh signal arriving at the same time as a timer fire
+	// does not deadlock or lose the notification.
+	clk := clock.NewMock(time.UnixMilli(0))
+	store := NewStore(clk)
+	meta := Metadata{
+		Bandwidth:          4000000,
+		Codecs:             "avc1.64001f",
+		Width:              1920,
+		Height:             1080,
+		FrameRate:          23.976,
+		TargetDurationSecs: 2,
+	}
+	err := store.Init("1", meta, []byte("init"), 0, 20, testSegmentBytes, 10, 2, 12)
+	require.NoError(t, err)
+	t.Cleanup(func() { store.Delete("1") })
+
+	s := store.Get("1")
+	require.NotNil(t, s)
+
+	// Push segment_0 at ts=2000, advance clock to make it eligible.
+	buf, ok := s.AcquireSlot()
+	require.True(t, ok)
+	_, _ = buf.ReadFrom(bytes.NewReader([]byte("seg0")))
+	require.NoError(t, s.CommitSlot(0, buf, 2000, 2000, 0))
+	clk.Set(time.UnixMilli(3000))
+
+	require.Eventually(t, func() bool {
+		p := s.CachedPlaylist()
+		return p != "" && strings.Contains(p, "segment_0.m4s")
+	}, 2*time.Second, 10*time.Millisecond)
+
+	// Push segment_1 at ts=5000. The renderer will set a timer for 5000.
+	buf, ok = s.AcquireSlot()
+	require.True(t, ok)
+	_, _ = buf.ReadFrom(bytes.NewReader([]byte("seg1")))
+	require.NoError(t, s.CommitSlot(1, buf, 5000, 2000, 0))
+
+	// Simultaneously: advance clock past the timer target AND push a new
+	// segment. Both the timer fire (from Set) and the notifyCh signal
+	// (from CommitSlot) arrive at the renderer's select. This must not
+	// deadlock regardless of which one the select picks.
+	clk.Set(time.UnixMilli(6000))
+	buf, ok = s.AcquireSlot()
+	require.True(t, ok)
+	_, _ = buf.ReadFrom(bytes.NewReader([]byte("seg2")))
+	require.NoError(t, s.CommitSlot(2, buf, 8000, 2000, 0))
+
+	// Advance past segment_2 and push one more to ensure the renderer
+	// processes everything.
+	clk.Set(time.UnixMilli(9000))
+	buf, ok = s.AcquireSlot()
+	require.True(t, ok)
+	_, _ = buf.ReadFrom(bytes.NewReader([]byte("seg3")))
+	require.NoError(t, s.CommitSlot(3, buf, 10000, 2000, 0))
+
+	// All segments through segment_2 must appear.
+	require.Eventually(t, func() bool {
+		p := s.CachedPlaylist()
+		return p != "" && strings.Contains(p, "segment_2.m4s")
+	}, 2*time.Second, 10*time.Millisecond)
 }
