@@ -136,16 +136,16 @@ func Stream(logger *slog.Logger, env config.Env, store *stream.Store, requestLog
 			}
 		})
 
-		r.Get("/init-{initID}.mp4", func(w http.ResponseWriter, r *http.Request) {
+		r.Get("/init_{initID}.mp4", func(w http.ResponseWriter, r *http.Request) {
 			streamID := chi.URLParam(r, "streamID")
 			initIDStr := chi.URLParam(r, "initID")
-			initID, err := strconv.ParseInt(initIDStr, 10, 64)
-			if err != nil {
+			generation, err := strconv.ParseInt(initIDStr, 10, 64)
+			if err != nil || generation < 0 {
 				logger.Warn("invalid init ID", "value", initIDStr, "error", err)
 				w.WriteHeader(http.StatusBadRequest)
 				return
 			}
-			logger.Debug("handling init segment request", "streamID", streamID, "initID", initID)
+			logger.Debug("handling init segment request", "streamID", streamID, "generation", generation)
 
 			s, status := getStream(store, streamID)
 			if s == nil {
@@ -157,15 +157,15 @@ func Stream(logger *slog.Logger, env config.Env, store *stream.Store, requestLog
 				return
 			}
 
-			if s.InitTimestampMs() != initID {
+			if _, ok := s.GetInitEntry(generation); !ok {
 				w.WriteHeader(http.StatusNotFound)
 				return
 			}
 
 			w.Header().Set("Content-Type", config.MP4_MIME_TYPE)
-			w.Header().Set("Cache-Control", "public, max-age=604800, immutable")
-			w.Header().Set("Content-Length", strconv.Itoa(s.InitDataLen()))
-			if _, err := s.WriteInitDataTo(w); err != nil {
+			w.Header().Set("Cache-Control", "no-cache")
+			w.Header().Set("Content-Length", strconv.Itoa(s.InitDataLenForGeneration(generation)))
+			if _, err := s.WriteInitDataForGenerationTo(w, generation); err != nil {
 				logger.Error("failed to write response", "error", err)
 			}
 		})

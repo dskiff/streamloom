@@ -81,7 +81,7 @@ func initStream(t *testing.T, store *stream.Store, id string) {
 		FrameRate:          23.976,
 		TargetDurationSecs: 2,
 	}
-	err := store.Init(id, meta, []byte("init-data"), 10, 1024, 5, 2, config.DefaultMediaWindowSize)
+	err := store.Init(id, meta, []byte("init-data"), 0, 10, 1024, 5, 2, config.DefaultMediaWindowSize)
 	require.NoError(t, err)
 	t.Cleanup(func() { store.Delete(id) })
 }
@@ -113,6 +113,19 @@ func initHeaders() map[string]string {
 		"X-SL-SEGMENT-BYTES":        "1024",
 		"X-SL-BACKWARD-BUFFER-SIZE": "5",
 	}
+}
+
+// postInitForGeneration posts init data for a subsequent generation on an
+// existing stream. Only sends X-SL-GENERATION + body (no metadata/capacity headers).
+func postInitForGeneration(router http.Handler, streamID string, token string, generation string, body []byte) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/stream/"+streamID+"/init", bytes.NewReader(body))
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	req.Header.Set("X-SL-GENERATION", generation)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	return rec
 }
 
 func postInit(router http.Handler, streamID string, token string, headers map[string]string, body []byte) *httptest.ResponseRecorder {

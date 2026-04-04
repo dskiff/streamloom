@@ -25,7 +25,7 @@ const testPlaylistWindowSize = 12
 // Registers cleanup to stop the renderer goroutine.
 func mustInit(t *testing.T, s *Store, id string, meta Metadata, initData []byte, segmentCapacity, segmentBytes, backwardBufferSize int) {
 	t.Helper()
-	err := s.Init(id, meta, initData, segmentCapacity, segmentBytes, backwardBufferSize, 0, testPlaylistWindowSize)
+	err := s.Init(id, meta, initData, 0, segmentCapacity, segmentBytes, backwardBufferSize, 0, testPlaylistWindowSize)
 	require.NoError(t, err, "Init(%s)", id)
 	t.Cleanup(func() { s.Delete(id) })
 }
@@ -124,7 +124,7 @@ func TestInitAndGet(t *testing.T) {
 	assert.Equal(t, meta.FrameRate, got.FrameRate)
 
 	var buf bytes.Buffer
-	_, err := stream.WriteInitDataTo(&buf)
+	_, err := stream.WriteInitDataForGenerationTo(&buf, 0)
 	require.NoError(t, err)
 	assert.Equal(t, initData, buf.Bytes())
 }
@@ -139,7 +139,7 @@ func TestInitClonesData(t *testing.T) {
 
 	stream := s.Get("1")
 	var buf bytes.Buffer
-	_, _ = stream.WriteInitDataTo(&buf)
+	_, _ = stream.WriteInitDataForGenerationTo(&buf, 0)
 	assert.Equal(t, byte(0x01), buf.Bytes()[0], "Init did not clone the input; caller mutation leaked into store")
 }
 
@@ -151,9 +151,9 @@ func TestWriteInitDataIsImmutable(t *testing.T) {
 
 	// Two reads should produce identical results.
 	var buf1, buf2 bytes.Buffer
-	_, _ = stream.WriteInitDataTo(&buf1)
-	_, _ = stream.WriteInitDataTo(&buf2)
-	assert.Equal(t, buf1.Bytes(), buf2.Bytes(), "WriteInitDataTo returned different results on successive calls")
+	_, _ = stream.WriteInitDataForGenerationTo(&buf1, 0)
+	_, _ = stream.WriteInitDataForGenerationTo(&buf2, 0)
+	assert.Equal(t, buf1.Bytes(), buf2.Bytes(), "WriteInitDataForGenerationTo returned different results on successive calls")
 }
 
 func TestReInitOverwrites(t *testing.T) {
@@ -166,7 +166,7 @@ func TestReInitOverwrites(t *testing.T) {
 
 	assert.Equal(t, 2000, stream.Metadata().Bandwidth)
 	var buf bytes.Buffer
-	_, _ = stream.WriteInitDataTo(&buf)
+	_, _ = stream.WriteInitDataForGenerationTo(&buf, 0)
 	assert.Equal(t, []byte{0x02, 0x03}, buf.Bytes())
 }
 
@@ -192,7 +192,7 @@ func TestConcurrentAccess(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			err := s.Init("50", Metadata{Bandwidth: i, TargetDurationSecs: 1}, []byte{byte(i)}, testCap, testSegmentBytes, testBackwardBufferSize, 0, testPlaylistWindowSize)
+			err := s.Init("50", Metadata{Bandwidth: i, TargetDurationSecs: 1}, []byte{byte(i)}, 0, testCap, testSegmentBytes, testBackwardBufferSize, 0, testPlaylistWindowSize)
 			assert.NoError(t, err, "Init(%d)", i)
 		}(i)
 	}
@@ -206,7 +206,7 @@ func TestConcurrentAccess(t *testing.T) {
 			if stream != nil {
 				_ = stream.Metadata()
 				var buf bytes.Buffer
-				_, _ = stream.WriteInitDataTo(&buf)
+				_, _ = stream.WriteInitDataForGenerationTo(&buf, 0)
 			}
 		}()
 	}
@@ -222,19 +222,19 @@ func TestInitRejectsInvalidBackwardBufferSize(t *testing.T) {
 	s := NewStore(clock.Real{})
 
 	// backwardBufferSize=0 should fail.
-	err := s.Init("1", Metadata{TargetDurationSecs: 1}, []byte{0x00}, 10, testSegmentBytes, 0, 0, testPlaylistWindowSize)
+	err := s.Init("1", Metadata{TargetDurationSecs: 1}, []byte{0x00}, 0, 10, testSegmentBytes, 0, 0, testPlaylistWindowSize)
 	assert.ErrorIs(t, err, ErrInvalidBackwardBufferSize, "size=0")
 
 	// backwardBufferSize equal to segmentCapacity should fail.
-	err = s.Init("1", Metadata{TargetDurationSecs: 1}, []byte{0x00}, 10, testSegmentBytes, 10, 0, testPlaylistWindowSize)
+	err = s.Init("1", Metadata{TargetDurationSecs: 1}, []byte{0x00}, 0, 10, testSegmentBytes, 10, 0, testPlaylistWindowSize)
 	assert.ErrorIs(t, err, ErrInvalidBackwardBufferSize, "size=cap")
 
 	// backwardBufferSize greater than segmentCapacity should fail.
-	err = s.Init("1", Metadata{TargetDurationSecs: 1}, []byte{0x00}, 10, testSegmentBytes, 11, 0, testPlaylistWindowSize)
+	err = s.Init("1", Metadata{TargetDurationSecs: 1}, []byte{0x00}, 0, 10, testSegmentBytes, 11, 0, testPlaylistWindowSize)
 	assert.ErrorIs(t, err, ErrInvalidBackwardBufferSize, "size>cap")
 
 	// Valid backwardBufferSize should succeed.
-	err = s.Init("1", Metadata{TargetDurationSecs: 1}, []byte{0x00}, 10, testSegmentBytes, 9, 0, testPlaylistWindowSize)
+	err = s.Init("1", Metadata{TargetDurationSecs: 1}, []byte{0x00}, 0, 10, testSegmentBytes, 9, 0, testPlaylistWindowSize)
 	assert.NoError(t, err, "valid size")
 	t.Cleanup(func() { s.Delete("1") })
 }
@@ -243,19 +243,19 @@ func TestInitRejectsInvalidWorkingSpace(t *testing.T) {
 	s := NewStore(clock.Real{})
 
 	// Negative workingSpace should fail.
-	err := s.Init("1", Metadata{TargetDurationSecs: 1}, []byte{0x00}, 10, testSegmentBytes, 9, -1, testPlaylistWindowSize)
+	err := s.Init("1", Metadata{TargetDurationSecs: 1}, []byte{0x00}, 0, 10, testSegmentBytes, 9, -1, testPlaylistWindowSize)
 	assert.ErrorIs(t, err, ErrInvalidWorkingSpace, "negative")
 
 	// Overflow: segmentCapacity + workingSpace > MaxInt.
-	err = s.Init("1", Metadata{TargetDurationSecs: 1}, []byte{0x00}, math.MaxInt, testSegmentBytes, 1, 1, testPlaylistWindowSize)
+	err = s.Init("1", Metadata{TargetDurationSecs: 1}, []byte{0x00}, 0, math.MaxInt, testSegmentBytes, 1, 1, testPlaylistWindowSize)
 	assert.ErrorIs(t, err, ErrInvalidWorkingSpace, "overflow")
 
 	// Zero workingSpace should succeed.
-	err = s.Init("1", Metadata{TargetDurationSecs: 1}, []byte{0x00}, 10, testSegmentBytes, 9, 0, testPlaylistWindowSize)
+	err = s.Init("1", Metadata{TargetDurationSecs: 1}, []byte{0x00}, 0, 10, testSegmentBytes, 9, 0, testPlaylistWindowSize)
 	assert.NoError(t, err, "zero")
 
 	// Positive workingSpace should succeed (re-init closes old goroutine).
-	err = s.Init("1", Metadata{TargetDurationSecs: 1}, []byte{0x00}, 10, testSegmentBytes, 9, 5, testPlaylistWindowSize)
+	err = s.Init("1", Metadata{TargetDurationSecs: 1}, []byte{0x00}, 0, 10, testSegmentBytes, 9, 5, testPlaylistWindowSize)
 	assert.NoError(t, err, "positive")
 	t.Cleanup(func() { s.Delete("1") })
 }
@@ -379,7 +379,7 @@ func TestBufferOverwrite(t *testing.T) {
 	clk := clock.NewMock(time.Now().Add(-1 * time.Hour))
 	store := NewStore(clk)
 	// workingSpace=1 so we can acquire a slot to attempt the 4th push.
-	require.NoError(t, store.Init("1", Metadata{Bandwidth: 1000, TargetDurationSecs: 1}, []byte{0x00}, 3, testSegmentBytes, 2, 1, testPlaylistWindowSize))
+	require.NoError(t, store.Init("1", Metadata{Bandwidth: 1000, TargetDurationSecs: 1}, []byte{0x00}, 0, 3, testSegmentBytes, 2, 1, testPlaylistWindowSize))
 	t.Cleanup(func() { store.Delete("1") })
 	s := store.Get("1")
 
@@ -421,7 +421,7 @@ func TestBufferFull(t *testing.T) {
 	clk := clock.NewMock(time.Now().Add(-1 * time.Hour))
 	store := NewStore(clk)
 	// workingSpace=1 so we can acquire a slot to attempt the 4th push.
-	require.NoError(t, store.Init("1", Metadata{Bandwidth: 1000, TargetDurationSecs: 1}, []byte{0x00}, 3, testSegmentBytes, 2, 1, testPlaylistWindowSize))
+	require.NoError(t, store.Init("1", Metadata{Bandwidth: 1000, TargetDurationSecs: 1}, []byte{0x00}, 0, 3, testSegmentBytes, 2, 1, testPlaylistWindowSize))
 	t.Cleanup(func() { store.Delete("1") })
 	s := store.Get("1")
 
@@ -479,7 +479,7 @@ func TestSegmentCount(t *testing.T) {
 func TestSegmentOverflow(t *testing.T) {
 	clk := clock.NewMock(time.Now().Add(-1 * time.Hour))
 	store := NewStore(clk)
-	err := store.Init("1", Metadata{Bandwidth: 1000, TargetDurationSecs: 1}, []byte{0x00}, testCap, 4, testBackwardBufferSize, 0, testPlaylistWindowSize) // 4 bytes per slot
+	err := store.Init("1", Metadata{Bandwidth: 1000, TargetDurationSecs: 1}, []byte{0x00}, 0, testCap, 4, testBackwardBufferSize, 0, testPlaylistWindowSize) // 4 bytes per slot
 	require.NoError(t, err)
 	t.Cleanup(func() { store.Delete("1") })
 	s := store.Get("1")
@@ -655,7 +655,7 @@ func TestEvictionRemovesOldBackwardSegments(t *testing.T) {
 
 	store := NewStore(clk)
 	// workingSpace=1 so commitSlot can acquire a slot when ring is near-full after eviction.
-	require.NoError(t, store.Init("1", Metadata{Bandwidth: 1000, TargetDurationSecs: 1}, []byte{0x00}, 10, testSegmentBytes, 2, 1, testPlaylistWindowSize))
+	require.NoError(t, store.Init("1", Metadata{Bandwidth: 1000, TargetDurationSecs: 1}, []byte{0x00}, 0, 10, testSegmentBytes, 2, 1, testPlaylistWindowSize))
 	t.Cleanup(func() { store.Delete("1") })
 	s := store.Get("1")
 
@@ -689,7 +689,7 @@ func TestEvictionPreservesForwardSegments(t *testing.T) {
 	clk := clock.NewMock(t0)
 
 	store := NewStore(clk)
-	require.NoError(t, store.Init("1", Metadata{Bandwidth: 1000, TargetDurationSecs: 1}, []byte{0x00}, 10, testSegmentBytes, 1, 1, testPlaylistWindowSize))
+	require.NoError(t, store.Init("1", Metadata{Bandwidth: 1000, TargetDurationSecs: 1}, []byte{0x00}, 0, 10, testSegmentBytes, 1, 1, testPlaylistWindowSize))
 	t.Cleanup(func() { store.Delete("1") })
 	s := store.Get("1")
 
@@ -726,7 +726,7 @@ func TestEvictionBufferStillFull(t *testing.T) {
 
 	store := NewStore(clk)
 	// capacity=3, backwardBufferSize=2, workingSpace=1, all segments in the future.
-	require.NoError(t, store.Init("1", Metadata{Bandwidth: 1000, TargetDurationSecs: 1}, []byte{0x00}, 3, testSegmentBytes, 2, 1, testPlaylistWindowSize))
+	require.NoError(t, store.Init("1", Metadata{Bandwidth: 1000, TargetDurationSecs: 1}, []byte{0x00}, 0, 3, testSegmentBytes, 2, 1, testPlaylistWindowSize))
 	t.Cleanup(func() { store.Delete("1") })
 	s := store.Get("1")
 
@@ -745,7 +745,7 @@ func TestEvictionBoundaryExactCount(t *testing.T) {
 	clk := clock.NewMock(t0)
 
 	store := NewStore(clk)
-	require.NoError(t, store.Init("1", Metadata{Bandwidth: 1000, TargetDurationSecs: 1}, []byte{0x00}, 10, testSegmentBytes, 3, 1, testPlaylistWindowSize))
+	require.NoError(t, store.Init("1", Metadata{Bandwidth: 1000, TargetDurationSecs: 1}, []byte{0x00}, 0, 10, testSegmentBytes, 3, 1, testPlaylistWindowSize))
 	t.Cleanup(func() { store.Delete("1") })
 	s := store.Get("1")
 
@@ -774,7 +774,7 @@ func TestEvictionOnEveryAdd(t *testing.T) {
 	clk := clock.NewMock(t0)
 
 	store := NewStore(clk)
-	require.NoError(t, store.Init("1", Metadata{Bandwidth: 1000, TargetDurationSecs: 1}, []byte{0x00}, 10, testSegmentBytes, 1, 1, testPlaylistWindowSize))
+	require.NoError(t, store.Init("1", Metadata{Bandwidth: 1000, TargetDurationSecs: 1}, []byte{0x00}, 0, 10, testSegmentBytes, 1, 1, testPlaylistWindowSize))
 	t.Cleanup(func() { store.Delete("1") })
 	s := store.Get("1")
 
@@ -813,7 +813,7 @@ func TestEvictionWithAllForwardSegments(t *testing.T) {
 	nowMs := fixedTime.UnixMilli()
 
 	store := NewStore(clk)
-	require.NoError(t, store.Init("1", Metadata{Bandwidth: 1000, TargetDurationSecs: 1}, []byte{0x00}, 5, testSegmentBytes, 1, 1, testPlaylistWindowSize))
+	require.NoError(t, store.Init("1", Metadata{Bandwidth: 1000, TargetDurationSecs: 1}, []byte{0x00}, 0, 5, testSegmentBytes, 1, 1, testPlaylistWindowSize))
 	t.Cleanup(func() { store.Delete("1") })
 	s := store.Get("1")
 
@@ -840,7 +840,7 @@ func TestPoolBufferReuse(t *testing.T) {
 
 	store := NewStore(clk)
 	// workingSpace=1 so commitSlot can acquire a slot after eviction frees some.
-	require.NoError(t, store.Init("1", Metadata{Bandwidth: 1000, TargetDurationSecs: 1}, []byte{0x00}, segCap, testSegmentBytes, bbs, 1, testPlaylistWindowSize))
+	require.NoError(t, store.Init("1", Metadata{Bandwidth: 1000, TargetDurationSecs: 1}, []byte{0x00}, 0, segCap, testSegmentBytes, bbs, 1, testPlaylistWindowSize))
 	t.Cleanup(func() { store.Delete("1") })
 	s := store.Get("1")
 
@@ -945,7 +945,7 @@ func TestWorkingSpaceAllowsConcurrentAcquire(t *testing.T) {
 	clk := clock.NewMock(time.Now().Add(-1 * time.Hour))
 	store := NewStore(clk)
 	// Ring buffer capacity=3, working space=5 → pool has 8 slots.
-	err := store.Init("1", Metadata{Bandwidth: 1000, TargetDurationSecs: 1}, []byte{0x00}, 3, testSegmentBytes, 2, 5, testPlaylistWindowSize)
+	err := store.Init("1", Metadata{Bandwidth: 1000, TargetDurationSecs: 1}, []byte{0x00}, 0, 3, testSegmentBytes, 2, 5, testPlaylistWindowSize)
 	require.NoError(t, err)
 	t.Cleanup(func() { store.Delete("1") })
 	s := store.Get("1")
@@ -983,7 +983,7 @@ func TestEvictionPreservesSegmentWithActiveReader(t *testing.T) {
 
 	store := NewStore(clk)
 	// backwardBufferSize=1, so eviction wants to keep only 1 backward segment.
-	require.NoError(t, store.Init("1", Metadata{Bandwidth: 1000, TargetDurationSecs: 1}, []byte{0x00}, 10, testSegmentBytes, 1, 1, testPlaylistWindowSize))
+	require.NoError(t, store.Init("1", Metadata{Bandwidth: 1000, TargetDurationSecs: 1}, []byte{0x00}, 0, 10, testSegmentBytes, 1, 1, testPlaylistWindowSize))
 	t.Cleanup(func() { store.Delete("1") })
 	s := store.Get("1")
 
@@ -1042,7 +1042,7 @@ func TestEvictionSkipsOnlyLeadingActiveReaders(t *testing.T) {
 
 	store := NewStore(clk)
 	// backwardBufferSize=1.
-	require.NoError(t, store.Init("1", Metadata{Bandwidth: 1000, TargetDurationSecs: 1}, []byte{0x00}, 10, testSegmentBytes, 1, 1, testPlaylistWindowSize))
+	require.NoError(t, store.Init("1", Metadata{Bandwidth: 1000, TargetDurationSecs: 1}, []byte{0x00}, 0, 10, testSegmentBytes, 1, 1, testPlaylistWindowSize))
 	t.Cleanup(func() { store.Delete("1") })
 	s := store.Get("1")
 
@@ -1084,7 +1084,7 @@ func TestConcurrentReadersAndEviction(t *testing.T) {
 	clk := clock.NewMock(t0)
 
 	store := NewStore(clk)
-	require.NoError(t, store.Init("1", Metadata{Bandwidth: 1000, TargetDurationSecs: 1}, []byte{0x00}, 20, testSegmentBytes, 2, 2, testPlaylistWindowSize))
+	require.NoError(t, store.Init("1", Metadata{Bandwidth: 1000, TargetDurationSecs: 1}, []byte{0x00}, 0, 20, testSegmentBytes, 2, 2, testPlaylistWindowSize))
 	t.Cleanup(func() { store.Delete("1") })
 	s := store.Get("1")
 
@@ -1169,7 +1169,7 @@ func TestHasSegments_ClosedOnFirstCommit(t *testing.T) {
 	clk := clock.NewMock(time.UnixMilli(0))
 
 	store := NewStore(clk)
-	require.NoError(t, store.Init("1", Metadata{Bandwidth: 1000, TargetDurationSecs: 2}, []byte{0x00}, 10, testSegmentBytes, 1, 1, testPlaylistWindowSize))
+	require.NoError(t, store.Init("1", Metadata{Bandwidth: 1000, TargetDurationSecs: 2}, []byte{0x00}, 0, 10, testSegmentBytes, 1, 1, testPlaylistWindowSize))
 	t.Cleanup(func() { store.Delete("1") })
 	s := store.Get("1")
 	require.NotNil(t, s)
@@ -1203,7 +1203,7 @@ func TestRendererGoroutine_UpdatesCachedPlaylist(t *testing.T) {
 	clk := clock.NewMock(time.UnixMilli(0))
 
 	store := NewStore(clk)
-	require.NoError(t, store.Init("1", Metadata{Bandwidth: 1000, TargetDurationSecs: 2}, []byte{0x00}, 10, testSegmentBytes, 1, 1, testPlaylistWindowSize))
+	require.NoError(t, store.Init("1", Metadata{Bandwidth: 1000, TargetDurationSecs: 2}, []byte{0x00}, 0, 10, testSegmentBytes, 1, 1, testPlaylistWindowSize))
 	t.Cleanup(func() { store.Delete("1") })
 	s := store.Get("1")
 	require.NotNil(t, s)
@@ -1227,7 +1227,7 @@ func TestRendererGoroutine_StopsOnDelete(t *testing.T) {
 	clk := clock.NewMock(time.UnixMilli(0))
 
 	store := NewStore(clk)
-	require.NoError(t, store.Init("1", Metadata{Bandwidth: 1000, TargetDurationSecs: 2}, []byte{0x00}, 10, testSegmentBytes, 1, 1, testPlaylistWindowSize))
+	require.NoError(t, store.Init("1", Metadata{Bandwidth: 1000, TargetDurationSecs: 2}, []byte{0x00}, 0, 10, testSegmentBytes, 1, 1, testPlaylistWindowSize))
 	t.Cleanup(func() { store.Delete("1") })
 	s := store.Get("1")
 	require.NotNil(t, s)
@@ -1247,15 +1247,15 @@ func TestInitRejectsZeroTargetDuration(t *testing.T) {
 	store := NewStore(clock.Real{})
 
 	// TargetDurationSecs=0 should fail.
-	err := store.Init("1", Metadata{TargetDurationSecs: 0}, []byte{0x00}, 10, testSegmentBytes, 9, 0, testPlaylistWindowSize)
+	err := store.Init("1", Metadata{TargetDurationSecs: 0}, []byte{0x00}, 0, 10, testSegmentBytes, 9, 0, testPlaylistWindowSize)
 	assert.ErrorIs(t, err, ErrInvalidTargetDuration, "zero")
 
 	// Negative TargetDurationSecs should fail.
-	err = store.Init("1", Metadata{TargetDurationSecs: -1}, []byte{0x00}, 10, testSegmentBytes, 9, 0, testPlaylistWindowSize)
+	err = store.Init("1", Metadata{TargetDurationSecs: -1}, []byte{0x00}, 0, 10, testSegmentBytes, 9, 0, testPlaylistWindowSize)
 	assert.ErrorIs(t, err, ErrInvalidTargetDuration, "negative")
 
 	// Valid TargetDurationSecs should succeed.
-	err = store.Init("1", Metadata{TargetDurationSecs: 2}, []byte{0x00}, 10, testSegmentBytes, 9, 0, testPlaylistWindowSize)
+	err = store.Init("1", Metadata{TargetDurationSecs: 2}, []byte{0x00}, 0, 10, testSegmentBytes, 9, 0, testPlaylistWindowSize)
 	assert.NoError(t, err, "valid")
 	t.Cleanup(func() { store.Delete("1") })
 }
@@ -1264,15 +1264,15 @@ func TestInitRejectsZeroPlaylistWindowSize(t *testing.T) {
 	store := NewStore(clock.Real{})
 
 	// playlistWindowSize=0 should fail.
-	err := store.Init("1", Metadata{TargetDurationSecs: 2}, []byte{0x00}, 10, testSegmentBytes, 9, 0, 0)
+	err := store.Init("1", Metadata{TargetDurationSecs: 2}, []byte{0x00}, 0, 10, testSegmentBytes, 9, 0, 0)
 	assert.ErrorIs(t, err, ErrInvalidPlaylistWindowSize, "zero")
 
 	// Negative playlistWindowSize should fail.
-	err = store.Init("1", Metadata{TargetDurationSecs: 2}, []byte{0x00}, 10, testSegmentBytes, 9, 0, -1)
+	err = store.Init("1", Metadata{TargetDurationSecs: 2}, []byte{0x00}, 0, 10, testSegmentBytes, 9, 0, -1)
 	assert.ErrorIs(t, err, ErrInvalidPlaylistWindowSize, "negative")
 
 	// Valid playlistWindowSize should succeed.
-	err = store.Init("1", Metadata{TargetDurationSecs: 2}, []byte{0x00}, 10, testSegmentBytes, 9, 0, 5)
+	err = store.Init("1", Metadata{TargetDurationSecs: 2}, []byte{0x00}, 0, 10, testSegmentBytes, 9, 0, 5)
 	assert.NoError(t, err, "valid")
 	t.Cleanup(func() { store.Delete("1") })
 }
@@ -1281,7 +1281,7 @@ func TestDone_ClosedOnDelete(t *testing.T) {
 	clk := clock.NewMock(time.UnixMilli(0))
 
 	store := NewStore(clk)
-	require.NoError(t, store.Init("1", Metadata{Bandwidth: 1000, TargetDurationSecs: 2}, []byte{0x00}, 10, testSegmentBytes, 1, 1, testPlaylistWindowSize))
+	require.NoError(t, store.Init("1", Metadata{Bandwidth: 1000, TargetDurationSecs: 2}, []byte{0x00}, 0, 10, testSegmentBytes, 1, 1, testPlaylistWindowSize))
 	s := store.Get("1")
 	require.NotNil(t, s)
 
@@ -1306,7 +1306,7 @@ func TestRendererGoroutine_ClearsPlaylistWhenEmpty(t *testing.T) {
 	clk := clock.NewMock(time.UnixMilli(0))
 
 	store := NewStore(clk)
-	require.NoError(t, store.Init("1", Metadata{Bandwidth: 1000, TargetDurationSecs: 2}, []byte{0x00}, 10, testSegmentBytes, 1, 1, testPlaylistWindowSize))
+	require.NoError(t, store.Init("1", Metadata{Bandwidth: 1000, TargetDurationSecs: 2}, []byte{0x00}, 0, 10, testSegmentBytes, 1, 1, testPlaylistWindowSize))
 	t.Cleanup(func() { store.Delete("1") })
 	s := store.Get("1")
 	require.NotNil(t, s)
@@ -1335,7 +1335,7 @@ func TestHasPlaylist_ClosedWhenRendererProducesPlaylist(t *testing.T) {
 	clk := clock.NewMock(time.UnixMilli(0))
 
 	store := NewStore(clk)
-	require.NoError(t, store.Init("1", Metadata{Bandwidth: 1000, TargetDurationSecs: 2}, []byte{0x00}, 10, testSegmentBytes, 1, 1, testPlaylistWindowSize))
+	require.NoError(t, store.Init("1", Metadata{Bandwidth: 1000, TargetDurationSecs: 2}, []byte{0x00}, 0, 10, testSegmentBytes, 1, 1, testPlaylistWindowSize))
 	t.Cleanup(func() { store.Delete("1") })
 	s := store.Get("1")
 	require.NotNil(t, s)
@@ -1366,7 +1366,7 @@ func TestHasPlaylist_NotClosedWhenNoSegmentsEligible(t *testing.T) {
 	clk := clock.NewMock(time.UnixMilli(0))
 
 	store := NewStore(clk)
-	require.NoError(t, store.Init("1", Metadata{Bandwidth: 1000, TargetDurationSecs: 2}, []byte{0x00}, 10, testSegmentBytes, 1, 1, testPlaylistWindowSize))
+	require.NoError(t, store.Init("1", Metadata{Bandwidth: 1000, TargetDurationSecs: 2}, []byte{0x00}, 0, 10, testSegmentBytes, 1, 1, testPlaylistWindowSize))
 	t.Cleanup(func() { store.Delete("1") })
 	s := store.Get("1")
 	require.NotNil(t, s)
@@ -1394,6 +1394,9 @@ func TestCommitSlot_StaleGeneration(t *testing.T) {
 	mustInit(t, store, "g", meta, []byte("init"), 10, testSegmentBytes, 5)
 	s := store.Get("g")
 
+	require.NoError(t, s.AddInitEntry(3, []byte("init3")))
+	require.NoError(t, s.AddInitEntry(5, []byte("init5")))
+
 	// Push gen=5.
 	err := commitSlotGen(t, s, 0, []byte("data"), 5000, 2000, 5)
 	require.NoError(t, err)
@@ -1410,6 +1413,8 @@ func TestCommitSlot_GenerationAdvance_DropsStaleSegments(t *testing.T) {
 	meta := Metadata{Bandwidth: 1, Codecs: "avc1.64001f", Width: 1, Height: 1, FrameRate: 30, TargetDurationSecs: 2}
 	mustInit(t, store, "g", meta, []byte("init"), 10, testSegmentBytes, 5)
 	s := store.Get("g")
+
+	require.NoError(t, s.AddInitEntry(1, []byte("init1")))
 
 	// Push 5 segments at gen=0.
 	for i := uint32(0); i < 5; i++ {
@@ -1461,10 +1466,12 @@ func TestCommitSlot_GenerationDropFreesCapacity(t *testing.T) {
 	// Capacity of 5, backward buffer 4, workingSpace 1 so AcquireSlot can
 	// succeed even when the segment list is full (the extra pool slot is
 	// needed to hold the new buffer before CommitSlot drops stale segments).
-	err := store.Init("g", meta, []byte("init"), 5, testSegmentBytes, 4, 1, testPlaylistWindowSize)
+	err := store.Init("g", meta, []byte("init"), 0, 5, testSegmentBytes, 4, 1, testPlaylistWindowSize)
 	require.NoError(t, err)
 	t.Cleanup(func() { store.Delete("g") })
 	s := store.Get("g")
+
+	require.NoError(t, s.AddInitEntry(1, []byte("init1")))
 
 	// Fill to capacity with gen=0.
 	for i := uint32(0); i < 5; i++ {
@@ -1490,6 +1497,8 @@ func TestCommitSlot_GenerationAdvanceThenContinue(t *testing.T) {
 	meta := Metadata{Bandwidth: 1, Codecs: "avc1.64001f", Width: 1, Height: 1, FrameRate: 30, TargetDurationSecs: 2}
 	mustInit(t, store, "g", meta, []byte("init"), 10, testSegmentBytes, 5)
 	s := store.Get("g")
+
+	require.NoError(t, s.AddInitEntry(1, []byte("init1")))
 
 	// Push gen=0 segments.
 	for i := uint32(0); i < 3; i++ {
@@ -1521,6 +1530,8 @@ func TestCommitSlot_SameGenDropsStaleOnSubsequentInsert(t *testing.T) {
 	meta := Metadata{Bandwidth: 1, Codecs: "avc1.64001f", Width: 1, Height: 1, FrameRate: 30, TargetDurationSecs: 2}
 	mustInit(t, store, "g", meta, []byte("init"), 20, testSegmentBytes, 15)
 	s := store.Get("g")
+
+	require.NoError(t, s.AddInitEntry(1, []byte("init1")))
 
 	// Push 10 gen=0 segments (indices 0-9).
 	for i := uint32(0); i < 10; i++ {
@@ -1587,6 +1598,8 @@ func TestCommitSlot_ZeroGenerationStaleAfterAdvance(t *testing.T) {
 	mustInit(t, store, "g", meta, []byte("init"), 10, testSegmentBytes, 5)
 	s := store.Get("g")
 
+	require.NoError(t, s.AddInitEntry(3, []byte("init3")))
+
 	// Advance to generation 3.
 	err := commitSlotGen(t, s, 0, []byte("data"), 5000, 2000, 3)
 	require.NoError(t, err)
@@ -1595,4 +1608,119 @@ func TestCommitSlot_ZeroGenerationStaleAfterAdvance(t *testing.T) {
 	// Push with generation 0 → stale.
 	err = commitSlotGen(t, s, 1, []byte("data2"), 7000, 2000, 0)
 	assert.ErrorIs(t, err, ErrStaleGeneration)
+}
+
+func TestStoreInit_NegativeGeneration(t *testing.T) {
+	store := NewStore(clock.Real{})
+	meta := Metadata{Bandwidth: 1, Codecs: "avc1.64001f", Width: 1, Height: 1, FrameRate: 30, TargetDurationSecs: 2}
+	err := store.Init("s", meta, []byte("init"), -1, 10, testSegmentBytes, 5, 0, testPlaylistWindowSize)
+	assert.ErrorIs(t, err, ErrNegativeGeneration)
+}
+
+func TestStoreInit_EmptyInitData(t *testing.T) {
+	store := NewStore(clock.Real{})
+	meta := Metadata{Bandwidth: 1, Codecs: "avc1.64001f", Width: 1, Height: 1, FrameRate: 30, TargetDurationSecs: 2}
+	err := store.Init("s", meta, []byte{}, 0, 10, testSegmentBytes, 5, 0, testPlaylistWindowSize)
+	assert.ErrorIs(t, err, ErrEmptyInitData)
+}
+
+func TestStoreInit_NonZeroGeneration(t *testing.T) {
+	// First init at generation 5: stream should start with currentGeneration=5,
+	// only init entry for gen 5, and reject segments at earlier generations.
+	clk := clock.NewMock(time.UnixMilli(0))
+	store := NewStore(clk)
+	meta := Metadata{Bandwidth: 1, Codecs: "avc1.64001f", Width: 1, Height: 1, FrameRate: 30, TargetDurationSecs: 2}
+	err := store.Init("s", meta, []byte("init-gen5"), 5, 10, testSegmentBytes, 5, 0, testPlaylistWindowSize)
+	require.NoError(t, err)
+	t.Cleanup(func() { store.Delete("s") })
+	s := store.Get("s")
+	require.NotNil(t, s)
+
+	assert.Equal(t, int64(5), s.CurrentGeneration())
+
+	// Init data for gen 5 should be retrievable.
+	var buf bytes.Buffer
+	_, err = s.WriteInitDataForGenerationTo(&buf, 5)
+	require.NoError(t, err)
+	assert.Equal(t, []byte("init-gen5"), buf.Bytes())
+
+	// Gen 0 init entry should not exist.
+	_, ok := s.GetInitEntry(0)
+	assert.False(t, ok, "gen 0 should not have an init entry")
+
+	// Segment at gen 4 → stale (< currentGeneration 5).
+	err = commitSlotGen(t, s, 0, []byte("data"), 5000, 2000, 4)
+	assert.ErrorIs(t, err, ErrStaleGeneration)
+
+	// Segment at gen 0 → stale.
+	err = commitSlotGen(t, s, 0, []byte("data"), 5000, 2000, 0)
+	assert.ErrorIs(t, err, ErrStaleGeneration)
+
+	// Segment at gen 5 → succeeds.
+	err = commitSlotGen(t, s, 0, []byte("data"), 5000, 2000, 5)
+	require.NoError(t, err)
+}
+
+func TestEviction_ActiveReaderStopsDiscontinuityTracking(t *testing.T) {
+	// When eviction stops at a segment with an active reader, discontinuity
+	// counting should only reflect segments actually evicted, not the one
+	// blocked by the reader.
+	clk := clock.NewMock(time.UnixMilli(0))
+	store := NewStore(clk)
+	meta := Metadata{Bandwidth: 1, Codecs: "avc1.64001f", Width: 1, Height: 1, FrameRate: 30, TargetDurationSecs: 2}
+	// backwardBufferSize=1, workingSpace=1
+	err := store.Init("s", meta, []byte("init0"), 0, 20, testSegmentBytes, 1, 1, 12)
+	require.NoError(t, err)
+	t.Cleanup(func() { store.Delete("s") })
+	s := store.Get("s")
+	require.NotNil(t, s)
+
+	require.NoError(t, s.AddInitEntry(1, []byte("init1")))
+
+	// Push: index 0 (gen=0), index 1 (gen=0), index 2 (gen=1), index 3 (gen=1)
+	mustCommitSlot(t, s, 0, []byte("d"), 1000, 2000)
+	mustCommitSlot(t, s, 1, []byte("d"), 3000, 2000)
+	require.NoError(t, commitSlotGen(t, s, 2, []byte("d"), 5000, 2000, 1))
+	require.NoError(t, commitSlotGen(t, s, 3, []byte("d"), 7000, 2000, 1))
+
+	// Acquire a reader on index 1 (gen=0). This will block eviction from
+	// proceeding past it.
+	var readerDone bool
+	err = s.RunWithSegmentSlot(1, func(slot *pool.BufferSlot) error {
+		// While the reader holds the reference, advance time and push a
+		// segment to trigger eviction.
+		clk.Set(time.UnixMilli(8000))
+		require.NoError(t, commitSlotGen(t, s, 4, []byte("d"), 9000, 2000, 1))
+
+		// Eviction should have evicted index 0 (gen=0) but stopped at
+		// index 1 because it has an active reader.
+		// evictedDiscontinuities: 0 (only gen=0 segments evicted so far,
+		// no generation change among them).
+		// lastEvictedGeneration: 0 (index 0 was gen=0).
+
+		// Verify index 0 is evicted and index 1 is kept.
+		_, readErr := readSegment(s, 0)
+		assert.ErrorIs(t, readErr, ErrSegmentNotFound, "index 0 should be evicted")
+		_, readErr = readSegment(s, 1)
+		assert.NoError(t, readErr, "index 1 should be kept (active reader)")
+
+		readerDone = true
+		return nil
+	})
+	require.NoError(t, err)
+	require.True(t, readerDone)
+
+	// Now the reader is released. Push another segment to trigger eviction again.
+	clk.Set(time.UnixMilli(10000))
+	require.NoError(t, commitSlotGen(t, s, 5, []byte("d"), 11000, 2000, 1))
+
+	// Now index 1 (gen=0) and index 2 (gen=1) should be evicted.
+	// The gen 0→1 transition should now be counted.
+	// Render and check the DISCONTINUITY-SEQUENCE.
+	s.mu.RLock()
+	playlist, _ := s.renderMediaPlaylist(11000, 12)
+	s.mu.RUnlock()
+
+	assert.Contains(t, playlist, "#EXT-X-DISCONTINUITY-SEQUENCE:1\n",
+		"gen 0→1 transition should be counted after reader released; got:\n%s", playlist)
 }
