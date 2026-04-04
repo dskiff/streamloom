@@ -165,6 +165,37 @@ func TestGetInitMP4_InvalidInitID(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
 }
 
+func TestGetInitMP4_EvictedGeneration_Returns404(t *testing.T) {
+	clk := clock.NewMock(time.UnixMilli(0))
+	router, store, _ := testStreamRouter(t, clk)
+	initStream(t, store, "1")
+
+	s := store.Get("1")
+	require.NotNil(t, s)
+
+	// Add gen=1 init and push gen=0 segment.
+	require.NoError(t, s.AddInitEntry(1, []byte("init1")))
+	commitSegmentGen(t, s, 0, []byte("d"), 5000, 0)
+
+	// Advance to gen=1 at index 0 — drops gen=0 segment, triggers init eviction.
+	commitSegmentGen(t, s, 0, []byte("n"), 5000, 1)
+
+	// Gen 0 init should be evicted — HTTP request should return 404.
+	req := httptest.NewRequest(http.MethodGet, "/stream/1/init_0.mp4", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusNotFound, rec.Code)
+
+	// Gen 1 init should still be served.
+	req = httptest.NewRequest(http.MethodGet, "/stream/1/init_1.mp4", nil)
+	rec = httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, []byte("init1"), rec.Body.Bytes())
+}
+
 // --- GET /stream/{streamID}/media.m3u8 tests ---
 
 func TestMediaPlaylist_UnconfiguredStream_Returns503(t *testing.T) {

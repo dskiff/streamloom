@@ -101,6 +101,20 @@ func commitSegment(t *testing.T, s *stream.Stream, index uint32, data []byte, ts
 	require.NoError(t, err)
 }
 
+// commitSegmentGen adds a segment with a specific generation.
+func commitSegmentGen(t *testing.T, s *stream.Stream, index uint32, data []byte, tsMs int64, gen int64) {
+	t.Helper()
+	buf, ok := s.AcquireSlot()
+	require.True(t, ok, "AcquireSlot should succeed")
+	_, err := buf.ReadFrom(bytes.NewReader(data))
+	require.NoError(t, err)
+	err = s.CommitSlot(index, buf, tsMs, 2000, gen)
+	if err != nil {
+		s.ReleaseSlot(buf)
+	}
+	require.NoError(t, err)
+}
+
 // initHeaders returns the minimum set of valid init headers.
 func initHeaders() map[string]string {
 	return map[string]string{

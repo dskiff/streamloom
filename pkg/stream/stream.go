@@ -133,7 +133,8 @@ type Stream struct {
 
 	// initEntries holds per-generation init segment data, keyed by generation.
 	// Entries are added via Init (first generation) and AddInitEntry (subsequent).
-	// The map grows unbounded; reaping is deferred to a separate project.
+	// Stale entries are evicted during CommitSlot when their generation is below
+	// currentGeneration and no buffered segments reference them.
 	initEntries map[int64]*InitEntry
 
 	segments          []Slot // sorted by Index
@@ -357,6 +358,29 @@ func (s *Stream) evictOldLocked() {
 	s.segments = s.segments[:n]
 }
 
+// evictStaleInitEntriesLocked removes init entries whose generation is below
+// currentGeneration and not referenced by any buffered segment. This prevents
+// unbounded growth of the initEntries map across encoder restarts.
+//
+// Must be called with s.mu held.
+func (s *Stream) evictStaleInitEntriesLocked() {
+	if len(s.initEntries) <= 1 {
+		return
+	}
+	// Build set of generations referenced by buffered segments.
+	activeGens := make(map[int64]struct{}, 2)
+	for i := range s.segments {
+		activeGens[s.segments[i].Generation] = struct{}{}
+	}
+	for gen := range s.initEntries {
+		if gen < s.currentGeneration {
+			if _, active := activeGens[gen]; !active {
+				delete(s.initEntries, gen)
+			}
+		}
+	}
+}
+
 // AcquireSlot obtains a BufferSlot from the pool. The caller must either
 // pass the slot to CommitSlot (on success) or return it via ReleaseSlot
 // (on error / abort). Returns (nil, false) if the pool is exhausted.
@@ -431,6 +455,7 @@ func (s *Stream) CommitSlot(index uint32, buf *pool.BufferSlot, timestamp int64,
 	// (newer) generation inserted earlier in the list must still clean up
 	// stale segments between it and the first new-generation segment.
 	s.dropStaleGenerationLocked(idx)
+	s.evictStaleInitEntriesLocked()
 
 	if len(s.segments) >= s.segmentCap {
 		return ErrBufferFull
