@@ -407,13 +407,13 @@ func (s *Stream) CommitSlot(index uint32, buf *pool.BufferSlot, timestamp int64,
 		return ErrMissingInitForGeneration
 	}
 
-	if s.currentGeneration < generation {
-		s.currentGeneration = generation
-	}
-
 	// Reject past timestamps unless the stream is empty (first segment exception).
 	if timestamp < s.clock.Now().UnixMilli() && len(s.segments) > 0 {
 		return ErrTimestampInPast
+	}
+
+	if s.currentGeneration < generation {
+		s.currentGeneration = generation
 	}
 
 	s.bufPool.AssertCheckedOut(buf)
