@@ -333,7 +333,7 @@ func TestE2E_DiscontinuitySequenceIncrements(t *testing.T) {
 
 	// The gen 0→1 discontinuity has scrolled out of the window.
 	// EXT-X-DISCONTINUITY-SEQUENCE should be at least 1.
-	assert.Contains(t, body, "#EXT-X-DISCONTINUITY-SEQUENCE:1",
+	assert.Contains(t, body, "#EXT-X-DISCONTINUITY-SEQUENCE:1\n",
 		"discontinuity sequence should increment when transition scrolls out; got:\n%s", body)
 
 	// The window should contain only gen=1 segments (no discontinuity within window).
@@ -371,6 +371,25 @@ func TestE2E_SubsequentInitConflictingMetadata(t *testing.T) {
 	rec = httptest.NewRecorder()
 	apiRouter.ServeHTTP(rec, req)
 	assert.Equal(t, http.StatusCreated, rec.Code)
+}
+
+func TestE2E_SubsequentInitMalformedMetadata(t *testing.T) {
+	clk := clock.NewMock(time.UnixMilli(0))
+	_, apiRouter, store, _ := testBothRoutersWithToken(t, clk)
+
+	hdrs := initHeaders()
+	rec := postInit(apiRouter, "1", "test-token", hdrs, []byte("init-gen0"))
+	require.Equal(t, http.StatusCreated, rec.Code)
+	t.Cleanup(func() { store.Delete("1") })
+
+	// Subsequent init with a malformed bandwidth header should be rejected.
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/stream/1/init", bytes.NewReader([]byte("init-gen1")))
+	req.Header.Set("Authorization", "Bearer test-token")
+	req.Header.Set("X-SL-GENERATION", "1")
+	req.Header.Set("X-SL-BANDWIDTH", "not-a-number")
+	rec = httptest.NewRecorder()
+	apiRouter.ServeHTTP(rec, req)
+	assert.Equal(t, http.StatusConflict, rec.Code)
 }
 
 func TestE2E_SubsequentInitPreviousGeneration(t *testing.T) {

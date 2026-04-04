@@ -50,12 +50,18 @@ func parseResolution(s string) (width, height int, ok bool) {
 }
 
 // checkMetadataConflict inspects the HTTP request for metadata headers and
-// returns a non-empty description of the first conflict found against the
-// existing stream metadata. Returns "" if no metadata headers are present
-// or all present headers match the existing values.
+// returns a non-empty description of the first conflict or malformed value
+// found against the existing stream metadata. Returns "" if no metadata
+// headers are present or all present headers match the existing values.
+// A header that is present but unparseable is treated as an error to prevent
+// silently masking a real conflict.
 func checkMetadataConflict(r *http.Request, existing stream.Metadata) string {
 	if v := r.Header.Get("X-SL-BANDWIDTH"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n != existing.Bandwidth {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Sprintf("bandwidth: invalid value %q", v)
+		}
+		if n != existing.Bandwidth {
 			return fmt.Sprintf("bandwidth: header=%d existing=%d", n, existing.Bandwidth)
 		}
 	}
@@ -66,22 +72,37 @@ func checkMetadataConflict(r *http.Request, existing stream.Metadata) string {
 	}
 	if v := r.Header.Get("X-SL-RESOLUTION"); v != "" {
 		w, h, ok := parseResolution(v)
-		if ok && (w != existing.Width || h != existing.Height) {
+		if !ok {
+			return fmt.Sprintf("resolution: invalid value %q", v)
+		}
+		if w != existing.Width || h != existing.Height {
 			return fmt.Sprintf("resolution: header=%dx%d existing=%dx%d", w, h, existing.Width, existing.Height)
 		}
 	}
 	if v := r.Header.Get("X-SL-FRAMERATE"); v != "" {
-		if f, err := strconv.ParseFloat(v, 64); err == nil && f != existing.FrameRate {
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			return fmt.Sprintf("framerate: invalid value %q", v)
+		}
+		if f != existing.FrameRate {
 			return fmt.Sprintf("framerate: header=%g existing=%g", f, existing.FrameRate)
 		}
 	}
 	if v := r.Header.Get("X-SL-TARGET-DURATION"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n != existing.TargetDurationSecs {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Sprintf("target-duration: invalid value %q", v)
+		}
+		if n != existing.TargetDurationSecs {
 			return fmt.Sprintf("target-duration: header=%d existing=%d", n, existing.TargetDurationSecs)
 		}
 	}
 	if v := r.Header.Get("X-SL-SEGMENT-BYTES"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n != existing.SegmentByteCount {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Sprintf("segment-bytes: invalid value %q", v)
+		}
+		if n != existing.SegmentByteCount {
 			return fmt.Sprintf("segment-bytes: header=%d existing=%d", n, existing.SegmentByteCount)
 		}
 	}

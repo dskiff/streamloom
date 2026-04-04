@@ -1609,3 +1609,104 @@ func TestCommitSlot_ZeroGenerationStaleAfterAdvance(t *testing.T) {
 	err = commitSlotGen(t, s, 1, []byte("data2"), 7000, 2000, 0)
 	assert.ErrorIs(t, err, ErrStaleGeneration)
 }
+
+func TestStoreInit_NonZeroGeneration(t *testing.T) {
+	// First init at generation 5: stream should start with currentGeneration=5,
+	// only init entry for gen 5, and reject segments at earlier generations.
+	clk := clock.NewMock(time.UnixMilli(0))
+	store := NewStore(clk)
+	meta := Metadata{Bandwidth: 1, Codecs: "avc1.64001f", Width: 1, Height: 1, FrameRate: 30, TargetDurationSecs: 2}
+	err := store.Init("s", meta, []byte("init-gen5"), 5, 10, testSegmentBytes, 5, 0, testPlaylistWindowSize)
+	require.NoError(t, err)
+	t.Cleanup(func() { store.Delete("s") })
+	s := store.Get("s")
+	require.NotNil(t, s)
+
+	assert.Equal(t, int64(5), s.CurrentGeneration())
+
+	// Init data for gen 5 should be retrievable.
+	var buf bytes.Buffer
+	_, err = s.WriteInitDataForGenerationTo(&buf, 5)
+	require.NoError(t, err)
+	assert.Equal(t, []byte("init-gen5"), buf.Bytes())
+
+	// Gen 0 init entry should not exist.
+	_, ok := s.GetInitEntry(0)
+	assert.False(t, ok, "gen 0 should not have an init entry")
+
+	// Segment at gen 4 → stale (< currentGeneration 5).
+	err = commitSlotGen(t, s, 0, []byte("data"), 5000, 2000, 4)
+	assert.ErrorIs(t, err, ErrStaleGeneration)
+
+	// Segment at gen 0 → stale.
+	err = commitSlotGen(t, s, 0, []byte("data"), 5000, 2000, 0)
+	assert.ErrorIs(t, err, ErrStaleGeneration)
+
+	// Segment at gen 5 → succeeds.
+	err = commitSlotGen(t, s, 0, []byte("data"), 5000, 2000, 5)
+	require.NoError(t, err)
+}
+
+func TestEviction_ActiveReaderStopsDiscontinuityTracking(t *testing.T) {
+	// When eviction stops at a segment with an active reader, discontinuity
+	// counting should only reflect segments actually evicted, not the one
+	// blocked by the reader.
+	clk := clock.NewMock(time.UnixMilli(0))
+	store := NewStore(clk)
+	meta := Metadata{Bandwidth: 1, Codecs: "avc1.64001f", Width: 1, Height: 1, FrameRate: 30, TargetDurationSecs: 2}
+	// backwardBufferSize=1, workingSpace=1
+	err := store.Init("s", meta, []byte("init0"), 0, 20, testSegmentBytes, 1, 1, 12)
+	require.NoError(t, err)
+	t.Cleanup(func() { store.Delete("s") })
+	s := store.Get("s")
+	require.NotNil(t, s)
+
+	require.NoError(t, s.AddInitEntry(1, []byte("init1")))
+
+	// Push: index 0 (gen=0), index 1 (gen=0), index 2 (gen=1), index 3 (gen=1)
+	mustCommitSlot(t, s, 0, []byte("d"), 1000, 2000)
+	mustCommitSlot(t, s, 1, []byte("d"), 3000, 2000)
+	require.NoError(t, commitSlotGen(t, s, 2, []byte("d"), 5000, 2000, 1))
+	require.NoError(t, commitSlotGen(t, s, 3, []byte("d"), 7000, 2000, 1))
+
+	// Acquire a reader on index 1 (gen=0). This will block eviction from
+	// proceeding past it.
+	var readerDone bool
+	err = s.RunWithSegmentSlot(1, func(slot *pool.BufferSlot) error {
+		// While the reader holds the reference, advance time and push a
+		// segment to trigger eviction.
+		clk.Set(time.UnixMilli(8000))
+		require.NoError(t, commitSlotGen(t, s, 4, []byte("d"), 9000, 2000, 1))
+
+		// Eviction should have evicted index 0 (gen=0) but stopped at
+		// index 1 because it has an active reader.
+		// evictedDiscontinuities: 0 (only gen=0 segments evicted so far,
+		// no generation change among them).
+		// lastEvictedGeneration: 0 (index 0 was gen=0).
+
+		// Verify index 0 is evicted and index 1 is kept.
+		_, readErr := readSegment(s, 0)
+		assert.ErrorIs(t, readErr, ErrSegmentNotFound, "index 0 should be evicted")
+		_, readErr = readSegment(s, 1)
+		assert.NoError(t, readErr, "index 1 should be kept (active reader)")
+
+		readerDone = true
+		return nil
+	})
+	require.NoError(t, err)
+	require.True(t, readerDone)
+
+	// Now the reader is released. Push another segment to trigger eviction again.
+	clk.Set(time.UnixMilli(10000))
+	require.NoError(t, commitSlotGen(t, s, 5, []byte("d"), 11000, 2000, 1))
+
+	// Now index 1 (gen=0) and index 2 (gen=1) should be evicted.
+	// The gen 0→1 transition should now be counted.
+	// Render and check the DISCONTINUITY-SEQUENCE.
+	s.mu.RLock()
+	playlist, _ := s.renderMediaPlaylist(11000, 12)
+	s.mu.RUnlock()
+
+	assert.Contains(t, playlist, "#EXT-X-DISCONTINUITY-SEQUENCE:1\n",
+		"gen 0→1 transition should be counted after reader released; got:\n%s", playlist)
+}

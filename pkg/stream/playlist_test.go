@@ -240,7 +240,7 @@ func TestRenderMediaPlaylist_SingleGeneration_NoDiscontinuity(t *testing.T) {
 	assert.Equal(t, 1, strings.Count(playlist, "#EXT-X-MAP:URI="))
 	assert.Contains(t, playlist, "#EXT-X-MAP:URI=\"init_0.mp4\"")
 	// Discontinuity sequence should be 0.
-	assert.Contains(t, playlist, "#EXT-X-DISCONTINUITY-SEQUENCE:0")
+	assert.Contains(t, playlist, "#EXT-X-DISCONTINUITY-SEQUENCE:0\n")
 }
 
 func TestRenderMediaPlaylist_TwoGenerations_Discontinuity(t *testing.T) {
@@ -269,7 +269,7 @@ func TestRenderMediaPlaylist_TwoGenerations_Discontinuity(t *testing.T) {
 	assert.Contains(t, playlist, "#EXT-X-MAP:URI=\"init_0.mp4\"")
 	assert.Contains(t, playlist, "#EXT-X-MAP:URI=\"init_1.mp4\"")
 	// Discontinuity sequence still 0 (nothing scrolled out).
-	assert.Contains(t, playlist, "#EXT-X-DISCONTINUITY-SEQUENCE:0")
+	assert.Contains(t, playlist, "#EXT-X-DISCONTINUITY-SEQUENCE:0\n")
 	// All 4 segments present.
 	for i := range 4 {
 		assert.Contains(t, playlist, fmt.Sprintf("segment_%d.m4s", i))
@@ -343,7 +343,7 @@ func TestRenderMediaPlaylist_DiscontinuitySequence_AfterEviction(t *testing.T) {
 
 	// The eviction should have removed segments 0,1,2 (gen=0) and possibly 3 (gen=1).
 	// The discontinuity (gen 0→1) should have scrolled out, so DISCONTINUITY-SEQUENCE >= 1.
-	assert.Contains(t, playlist, "#EXT-X-DISCONTINUITY-SEQUENCE:1")
+	assert.Contains(t, playlist, "#EXT-X-DISCONTINUITY-SEQUENCE:1\n")
 }
 
 func TestRenderMediaPlaylist_DiscontinuitySequence_AllPreWindowEvicted(t *testing.T) {
@@ -402,7 +402,7 @@ func TestRenderMediaPlaylist_DiscontinuitySequence_AllPreWindowEvicted(t *testin
 	s.mu.RUnlock()
 
 	// The gen 0→1 transition was among the evicted segments.
-	assert.Contains(t, playlist, "#EXT-X-DISCONTINUITY-SEQUENCE:1",
+	assert.Contains(t, playlist, "#EXT-X-DISCONTINUITY-SEQUENCE:1\n",
 		"evicted gen 0→1 transition should be counted; got:\n%s", playlist)
 
 	// No discontinuity within the window (all remaining segments are gen 1).
@@ -470,7 +470,7 @@ func TestRenderMediaPlaylist_DiscontinuitySequence_EvictedBoundaryAtStartZero(t 
 
 	// The gen0→1 and gen1→2 transitions should both be in DISCONTINUITY-SEQUENCE.
 	// The window contains only gen=2 segments, so no in-window discontinuity.
-	assert.Contains(t, playlist, "#EXT-X-DISCONTINUITY-SEQUENCE:2",
+	assert.Contains(t, playlist, "#EXT-X-DISCONTINUITY-SEQUENCE:2\n",
 		"both scrolled-out transitions should be counted; got:\n%s", playlist)
 	assert.NotContains(t, playlist, "#EXT-X-DISCONTINUITY\n",
 		"no in-window discontinuity expected; got:\n%s", playlist)
@@ -496,7 +496,7 @@ func TestRenderMediaPlaylist_DiscontinuitySequence_WindowBoundary(t *testing.T) 
 	playlist, _ := s.renderMediaPlaylist(20000, 2)
 	s.mu.RUnlock()
 
-	assert.Contains(t, playlist, "#EXT-X-DISCONTINUITY-SEQUENCE:1",
+	assert.Contains(t, playlist, "#EXT-X-DISCONTINUITY-SEQUENCE:1\n",
 		"window-boundary transition should be counted; got:\n%s", playlist)
 	assert.NotContains(t, playlist, "#EXT-X-DISCONTINUITY\n",
 		"no in-window discontinuity expected; got:\n%s", playlist)
@@ -522,8 +522,46 @@ func TestRenderMediaPlaylist_DiscontinuitySequence_WindowBoundaryMultiple(t *tes
 	s.mu.RUnlock()
 
 	// Both 0→1 and 1→2 transitions scrolled out.
-	assert.Contains(t, playlist, "#EXT-X-DISCONTINUITY-SEQUENCE:2",
+	assert.Contains(t, playlist, "#EXT-X-DISCONTINUITY-SEQUENCE:2\n",
 		"both transitions should be counted; got:\n%s", playlist)
+}
+
+func TestRenderMediaPlaylist_SkippedGeneration(t *testing.T) {
+	// Init entries exist for gen 0, 1, and 2, but segments exist only at
+	// gen 0 and gen 2 (gen 1 is skipped). The playlist should show a
+	// discontinuity between gen 0 and gen 2, and MAP should reference
+	// init_2.mp4 (not init_1.mp4).
+	_, s := setupStreamForPlaylist(t, 2)
+
+	require.NoError(t, s.AddInitEntry(1, []byte("init1")))
+	require.NoError(t, s.AddInitEntry(2, []byte("init2")))
+
+	// Gen 0 segments.
+	mustCommitSlot(t, s, 0, []byte("d"), 0, 2000)
+	mustCommitSlot(t, s, 1, []byte("d"), 2000, 2000)
+
+	// Skip gen 1 entirely — go straight to gen 2.
+	require.NoError(t, commitSlotGen(t, s, 2, []byte("d"), 4000, 2000, 2))
+	require.NoError(t, commitSlotGen(t, s, 3, []byte("d"), 6000, 2000, 2))
+
+	s.mu.RLock()
+	playlist, _ := s.renderMediaPlaylist(20000, 12)
+	s.mu.RUnlock()
+
+	// One discontinuity (gen 0→2, skipping 1).
+	assert.Equal(t, 1, strings.Count(playlist, "#EXT-X-DISCONTINUITY\n"))
+
+	// MAP entries: gen 0 and gen 2 (NOT gen 1).
+	assert.Contains(t, playlist, `#EXT-X-MAP:URI="init_0.mp4"`)
+	assert.NotContains(t, playlist, `#EXT-X-MAP:URI="init_1.mp4"`)
+	assert.Contains(t, playlist, `#EXT-X-MAP:URI="init_2.mp4"`)
+
+	// All 4 segments present.
+	for i := range 4 {
+		assert.Contains(t, playlist, fmt.Sprintf("segment_%d.m4s", i))
+	}
+
+	assert.Contains(t, playlist, "#EXT-X-DISCONTINUITY-SEQUENCE:0\n")
 }
 
 func TestRenderMediaPlaylist_DiscontinuityOrder(t *testing.T) {
