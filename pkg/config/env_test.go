@@ -5,6 +5,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -411,4 +412,43 @@ func TestGetEnvRequestLogFileUnset(t *testing.T) {
 	env, err := GetEnv()
 	require.NoError(t, err)
 	assert.Empty(t, env.REQUEST_LOG_FILE)
+}
+
+func TestParseStreamIdleTimeoutDefault(t *testing.T) {
+	t.Setenv("SL_STREAM_IDLE_TIMEOUT", "")
+
+	v, err := parseStreamIdleTimeout()
+	require.NoError(t, err)
+	assert.Equal(t, DefaultStreamIdleTimeout, v)
+}
+
+func TestParseStreamIdleTimeoutCustom(t *testing.T) {
+	t.Setenv("SL_STREAM_IDLE_TIMEOUT", "90s")
+
+	v, err := parseStreamIdleTimeout()
+	require.NoError(t, err)
+	assert.Equal(t, 90*time.Second, v)
+}
+
+func TestParseStreamIdleTimeoutZeroDisables(t *testing.T) {
+	t.Setenv("SL_STREAM_IDLE_TIMEOUT", "0")
+
+	// "0" is not a valid Go duration; "0s" is. But time.ParseDuration accepts "0".
+	v, err := parseStreamIdleTimeout()
+	require.NoError(t, err)
+	assert.Equal(t, time.Duration(0), v)
+}
+
+func TestParseStreamIdleTimeoutNegativeRejected(t *testing.T) {
+	t.Setenv("SL_STREAM_IDLE_TIMEOUT", "-5s")
+
+	_, err := parseStreamIdleTimeout()
+	assert.Error(t, err, "expected error for negative value")
+}
+
+func TestParseStreamIdleTimeoutInvalid(t *testing.T) {
+	t.Setenv("SL_STREAM_IDLE_TIMEOUT", "not-a-duration")
+
+	_, err := parseStreamIdleTimeout()
+	assert.Error(t, err, "expected error for invalid format")
 }

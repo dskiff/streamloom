@@ -34,3 +34,10 @@ const DefaultAPIPort = 8081
 
 // MinTokenLength is the minimum number of characters required for a stream token.
 const MinTokenLength = 32
+
+// DefaultStreamIdleTimeout is the default duration after which a stream
+// with no new segments is considered idle and eligible for reaping.
+const DefaultStreamIdleTimeout = 2 * time.Minute
+
+// ReaperScanInterval is how often the reaper scans for idle streams.
+const ReaperScanInterval = 30 * time.Second
