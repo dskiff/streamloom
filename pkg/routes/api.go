@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/dskiff/streamloom/pkg/config"
+	"github.com/dskiff/streamloom/pkg/fmp4"
 	mw "github.com/dskiff/streamloom/pkg/middleware"
 	"github.com/dskiff/streamloom/pkg/pool"
 	"github.com/dskiff/streamloom/pkg/stream"
@@ -269,6 +270,20 @@ func API(logger *slog.Logger, env config.Env, store *stream.Store, requestLogger
 				return
 			}
 
+			// Parse fMP4 timing from init data (best-effort, never rejects).
+			var initTracks []stream.TrackTimescale
+			if initTiming, parseErr := fmp4.ParseInitTiming(initData); parseErr != nil {
+				logger.Warn("failed to parse init segment timing",
+					"streamID", streamID, "generation", generation, "error", parseErr)
+			} else {
+				initTracks = make([]stream.TrackTimescale, len(initTiming.Tracks))
+				for i, t := range initTiming.Tracks {
+					initTracks[i] = stream.TrackTimescale{TrackID: t.TrackID, Timescale: t.Timescale}
+				}
+				logger.Info("init segment timing parsed",
+					"streamID", streamID, "generation", generation, "tracks", initTracks)
+			}
+
 			// Check if the stream already exists: subsequent inits only need
 			// generation + body to add a new init entry.
 			if s := store.Get(streamID); s != nil {
@@ -310,6 +325,9 @@ func API(logger *slog.Logger, env config.Env, store *stream.Store, requestLogger
 					logger.Error("failed to add init entry", "error", err)
 					w.WriteHeader(http.StatusInternalServerError)
 					return
+				}
+				if initTracks != nil {
+					s.SetInitTracks(generation, initTracks)
 				}
 				logger.Info("init entry added", "streamID", streamID, "generation", generation)
 				w.WriteHeader(http.StatusCreated)
@@ -388,6 +406,11 @@ func API(logger *slog.Logger, env config.Env, store *stream.Store, requestLogger
 				"segmentBytes", meta.SegmentByteCount,
 				"backwardBufferSize", backwardBufferSize,
 			)
+			if initTracks != nil {
+				if s := store.Get(streamID); s != nil {
+					s.SetInitTracks(generation, initTracks)
+				}
+			}
 
 			w.WriteHeader(http.StatusCreated)
 		})
@@ -519,6 +542,57 @@ func API(logger *slog.Logger, env config.Env, store *stream.Store, requestLogger
 				logger.Warn("empty segment body")
 				w.WriteHeader(http.StatusBadRequest)
 				return
+			}
+
+			// Parse fMP4 timing from segment data (best-effort, never rejects).
+			if segTiming, parseErr := fmp4.ParseSegmentTiming(buf.Bytes()); parseErr != nil {
+				logger.Warn("failed to parse segment timing",
+					"streamID", streamID, "index", index, "generation", generation,
+					"error", parseErr)
+			} else if initEntry, ok := s.GetInitEntry(generation); ok && initEntry.Tracks != nil {
+				for _, track := range segTiming.Tracks {
+					var timescale uint32
+					for _, it := range initEntry.Tracks {
+						if it.TrackID == track.TrackID {
+							timescale = it.Timescale
+							break
+						}
+					}
+					if timescale == 0 {
+						logger.Warn("segment track has no matching init timescale",
+							"streamID", streamID, "index", index,
+							"trackID", track.TrackID, "generation", generation)
+						continue
+					}
+
+					mp4DurationMs := track.TotalDuration * 1000 / uint64(timescale)
+					logger.Info("segment timing",
+						"streamID", streamID,
+						"index", index,
+						"generation", generation,
+						"trackID", track.TrackID,
+						"baseDecodeTime", track.BaseMediaDecodeTime,
+						"sampleCount", track.SampleCount,
+						"mp4DurationMs", mp4DurationMs,
+						"headerDurationMs", durationMs,
+					)
+
+					diff := int64(mp4DurationMs) - int64(durationMs)
+					if diff < 0 {
+						diff = -diff
+					}
+					if diff > 10 {
+						logger.Warn("segment duration mismatch: mp4 box duration differs from header",
+							"streamID", streamID,
+							"index", index,
+							"generation", generation,
+							"trackID", track.TrackID,
+							"mp4DurationMs", mp4DurationMs,
+							"headerDurationMs", durationMs,
+							"diffMs", diff,
+						)
+					}
+				}
 			}
 
 			if err := s.CommitSlot(uint32(index), buf, timestampNum, uint32(durationMs), generation); err != nil {

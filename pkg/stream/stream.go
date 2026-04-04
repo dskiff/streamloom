@@ -117,12 +117,20 @@ type Metadata struct {
 	TargetDurationSecs int     // EXT-X-TARGETDURATION value (seconds)
 }
 
+// TrackTimescale holds the media timescale for one track, parsed from the
+// init segment's mdhd box. Used to cross-validate segment timing.
+type TrackTimescale struct {
+	TrackID   uint32
+	Timescale uint32 // media timescale from mdhd (ticks per second)
+}
+
 // InitEntry holds the init segment data for a single encoding generation.
 // InitData is cloned on creation and must not be modified by callers.
 // Treat it as read-only; mutating the slice will corrupt shared state and
 // race with concurrent readers.
 type InitEntry struct {
 	InitData []byte
+	Tracks   []TrackTimescale // parsed timing info; nil if parsing failed
 }
 
 // Stream holds the complete in-memory state for a single HLS stream.
@@ -634,6 +642,16 @@ func (s *Stream) AddInitEntry(generation int64, initData []byte) error {
 	copy(cloned, initData)
 	s.initEntries[generation] = &InitEntry{InitData: cloned}
 	return nil
+}
+
+// SetInitTracks attaches parsed track timescale info to an existing init entry.
+// This is a no-op if the generation does not exist.
+func (s *Stream) SetInitTracks(generation int64, tracks []TrackTimescale) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if e, ok := s.initEntries[generation]; ok {
+		e.Tracks = tracks
+	}
 }
 
 // Clock returns the clock used by this store and its streams.
