@@ -49,64 +49,75 @@ func parseResolution(s string) (width, height int, ok bool) {
 	return w, h, true
 }
 
+// errMalformedHeader indicates a metadata header is present but unparseable.
+type errMalformedHeader struct{ detail string }
+
+func (e *errMalformedHeader) Error() string { return e.detail }
+
+// errMetadataConflict indicates a metadata header's value differs from
+// the existing stream metadata.
+type errMetadataConflict struct{ detail string }
+
+func (e *errMetadataConflict) Error() string { return e.detail }
+
 // checkMetadataConflict inspects the HTTP request for metadata headers and
-// checks them against the existing stream metadata. Returns a non-empty
-// description and isBadRequest=true if a header is present but unparseable,
-// or a non-empty description and isBadRequest=false if a header's value
-// conflicts with the existing metadata. Returns ("", false) if no metadata
-// headers are present or all present headers match the existing values.
-func checkMetadataConflict(r *http.Request, existing stream.Metadata) (description string, isBadRequest bool) {
+// checks them against the existing stream metadata. Returns
+// *errMalformedHeader if a header is present but unparseable,
+// *errMetadataConflict if a header's value differs from the existing
+// metadata, or nil if no metadata headers are present or all present
+// headers match.
+func checkMetadataConflict(r *http.Request, existing stream.Metadata) error {
 	if v := r.Header.Get("X-SL-BANDWIDTH"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
-			return fmt.Sprintf("bandwidth: invalid value %q", v), true
+			return &errMalformedHeader{fmt.Sprintf("bandwidth: invalid value %q", v)}
 		}
 		if n != existing.Bandwidth {
-			return fmt.Sprintf("bandwidth: header=%d existing=%d", n, existing.Bandwidth), false
+			return &errMetadataConflict{fmt.Sprintf("bandwidth: header=%d existing=%d", n, existing.Bandwidth)}
 		}
 	}
 	if v := r.Header.Get("X-SL-CODECS"); v != "" {
 		if v != existing.Codecs {
-			return fmt.Sprintf("codecs: header=%q existing=%q", v, existing.Codecs), false
+			return &errMetadataConflict{fmt.Sprintf("codecs: header=%q existing=%q", v, existing.Codecs)}
 		}
 	}
 	if v := r.Header.Get("X-SL-RESOLUTION"); v != "" {
 		w, h, ok := parseResolution(v)
 		if !ok {
-			return fmt.Sprintf("resolution: invalid value %q", v), true
+			return &errMalformedHeader{fmt.Sprintf("resolution: invalid value %q", v)}
 		}
 		if w != existing.Width || h != existing.Height {
-			return fmt.Sprintf("resolution: header=%dx%d existing=%dx%d", w, h, existing.Width, existing.Height), false
+			return &errMetadataConflict{fmt.Sprintf("resolution: header=%dx%d existing=%dx%d", w, h, existing.Width, existing.Height)}
 		}
 	}
 	if v := r.Header.Get("X-SL-FRAMERATE"); v != "" {
 		f, err := strconv.ParseFloat(v, 64)
 		if err != nil {
-			return fmt.Sprintf("framerate: invalid value %q", v), true
+			return &errMalformedHeader{fmt.Sprintf("framerate: invalid value %q", v)}
 		}
 		if f != existing.FrameRate {
-			return fmt.Sprintf("framerate: header=%g existing=%g", f, existing.FrameRate), false
+			return &errMetadataConflict{fmt.Sprintf("framerate: header=%g existing=%g", f, existing.FrameRate)}
 		}
 	}
 	if v := r.Header.Get("X-SL-TARGET-DURATION"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
-			return fmt.Sprintf("target-duration: invalid value %q", v), true
+			return &errMalformedHeader{fmt.Sprintf("target-duration: invalid value %q", v)}
 		}
 		if n != existing.TargetDurationSecs {
-			return fmt.Sprintf("target-duration: header=%d existing=%d", n, existing.TargetDurationSecs), false
+			return &errMetadataConflict{fmt.Sprintf("target-duration: header=%d existing=%d", n, existing.TargetDurationSecs)}
 		}
 	}
 	if v := r.Header.Get("X-SL-SEGMENT-BYTES"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
-			return fmt.Sprintf("segment-bytes: invalid value %q", v), true
+			return &errMalformedHeader{fmt.Sprintf("segment-bytes: invalid value %q", v)}
 		}
 		if n != existing.SegmentByteCount {
-			return fmt.Sprintf("segment-bytes: header=%d existing=%d", n, existing.SegmentByteCount), false
+			return &errMetadataConflict{fmt.Sprintf("segment-bytes: header=%d existing=%d", n, existing.SegmentByteCount)}
 		}
 	}
-	return "", false
+	return nil
 }
 
 // API constructs the chi router for the authenticated push API server.
@@ -220,16 +231,17 @@ func API(logger *slog.Logger, env config.Env, store *stream.Store, requestLogger
 			// Check if the stream already exists: subsequent inits only need
 			// generation + body to add a new init entry.
 			if s := store.Get(streamID); s != nil {
-				// Reject if any metadata headers are present and conflict
-				// with the existing stream-level metadata.
-				if conflict, isBadRequest := checkMetadataConflict(r, s.Metadata()); conflict != "" {
-					if isBadRequest {
+				// Reject if any metadata headers are present and either
+				// malformed or conflicting with the existing metadata.
+				if err := checkMetadataConflict(r, s.Metadata()); err != nil {
+					switch err.(type) {
+					case *errMalformedHeader:
 						logger.Warn("malformed metadata header on subsequent init",
-							"streamID", streamID, "detail", conflict)
+							"streamID", streamID, "detail", err)
 						w.WriteHeader(http.StatusBadRequest)
-					} else {
+					case *errMetadataConflict:
 						logger.Warn("metadata conflict on subsequent init",
-							"streamID", streamID, "conflict", conflict)
+							"streamID", streamID, "conflict", err)
 						w.WriteHeader(http.StatusConflict)
 					}
 					return
