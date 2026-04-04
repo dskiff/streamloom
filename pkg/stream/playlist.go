@@ -145,6 +145,10 @@ func (s *Stream) runPlaylistRenderer(windowSize int) {
 				timer.Reset(minRenderInterval)
 				select {
 				case <-timer.C():
+				case <-s.notifyCh:
+					if !timer.Stop() {
+						<-timer.C()
+					}
 				case <-s.done:
 					timer.Stop()
 					return
