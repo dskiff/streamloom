@@ -292,7 +292,8 @@ func API(logger *slog.Logger, env config.Env, store *stream.Store, requestLogger
 					return
 				}
 
-				if err := s.AddInitEntry(generation, initData); err != nil {
+				_, err := s.AddInitEntry(generation, initData)
+				if err != nil {
 					if errors.Is(err, stream.ErrDuplicateGeneration) ||
 						errors.Is(err, stream.ErrGenerationNotMonotonic) {
 						logger.Warn("rejected init generation",

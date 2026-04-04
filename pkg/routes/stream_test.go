@@ -174,7 +174,8 @@ func TestGetInitMP4_EvictedGeneration_Returns404(t *testing.T) {
 	require.NotNil(t, s)
 
 	// Add gen=1 init and push gen=0 segment.
-	require.NoError(t, s.AddInitEntry(1, []byte("init1")))
+	_, err := s.AddInitEntry(1, []byte("init1"))
+	require.NoError(t, err)
 	commitSegmentGen(t, s, 0, []byte("d"), 5000, 0)
 
 	// Advance to gen=1 at index 0 — drops gen=0 segment, triggers init eviction.

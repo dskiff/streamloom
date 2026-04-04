@@ -247,7 +247,7 @@ func TestRenderMediaPlaylist_SingleGeneration_NoDiscontinuity(t *testing.T) {
 func TestRenderMediaPlaylist_TwoGenerations_Discontinuity(t *testing.T) {
 	_, s := setupStreamForPlaylist(t, 2)
 
-	require.NoError(t, s.AddInitEntry(1, []byte("init1")))
+	mustAddInit(t, s, 1, []byte("init1"))
 
 	// Gen 0 segments.
 	mustCommitSlot(t, s, 0, []byte("d"), 0, 2000)
@@ -280,8 +280,8 @@ func TestRenderMediaPlaylist_TwoGenerations_Discontinuity(t *testing.T) {
 func TestRenderMediaPlaylist_ThreeGenerations(t *testing.T) {
 	_, s := setupStreamForPlaylist(t, 2)
 
-	require.NoError(t, s.AddInitEntry(1, []byte("init1")))
-	require.NoError(t, s.AddInitEntry(2, []byte("init2")))
+	mustAddInit(t, s, 1, []byte("init1"))
+	mustAddInit(t, s, 2, []byte("init2"))
 
 	mustCommitSlot(t, s, 0, []byte("d"), 0, 2000)
 	err := commitSlotGen(t, s, 1, []byte("d"), 2000, 2000, 1)
@@ -317,7 +317,7 @@ func TestRenderMediaPlaylist_DiscontinuitySequence_AfterEviction(t *testing.T) {
 	s := store.Get("1")
 	require.NotNil(t, s)
 
-	require.NoError(t, s.AddInitEntry(1, []byte("init1")))
+	mustAddInit(t, s, 1, []byte("init1"))
 
 	// Push gen=0 segments at timestamps 1000, 3000, 5000.
 	mustCommitSlot(t, s, 0, []byte("d"), 1000, 2000)
@@ -368,7 +368,7 @@ func TestRenderMediaPlaylist_DiscontinuitySequence_AllPreWindowEvicted(t *testin
 	s := store.Get("1")
 	require.NotNil(t, s)
 
-	require.NoError(t, s.AddInitEntry(1, []byte("init1")))
+	mustAddInit(t, s, 1, []byte("init1"))
 
 	// Push 2 gen=0 segments.
 	mustCommitSlot(t, s, 0, []byte("d"), 1000, 2000)
@@ -431,7 +431,7 @@ func TestRenderMediaPlaylist_DiscontinuitySequence_EvictedBoundaryAtStartZero(t 
 	s := store.Get("1")
 	require.NotNil(t, s)
 
-	require.NoError(t, s.AddInitEntry(1, []byte("init1")))
+	mustAddInit(t, s, 1, []byte("init1"))
 
 	// Push 1 gen=0 segment.
 	mustCommitSlot(t, s, 0, []byte("d"), 1000, 2000)
@@ -456,7 +456,7 @@ func TestRenderMediaPlaylist_DiscontinuitySequence_EvictedBoundaryAtStartZero(t 
 	clk.Set(time.UnixMilli(8000))
 	require.NoError(t, commitSlotGen(t, s, 4, []byte("d"), 9000, 2000, 1))
 
-	require.NoError(t, s.AddInitEntry(2, []byte("init2")))
+	mustAddInit(t, s, 2, []byte("init2"))
 	require.NoError(t, commitSlotGen(t, s, 5, []byte("d"), 11000, 2000, 2))
 
 	// Now advance and evict so the gen1→gen2 boundary is at start==0.
@@ -482,7 +482,7 @@ func TestRenderMediaPlaylist_DiscontinuitySequence_WindowBoundary(t *testing.T) 
 	// segments[start-1] → segments[start] must be counted.
 	_, s := setupStreamForPlaylist(t, 2)
 
-	require.NoError(t, s.AddInitEntry(1, []byte("init1")))
+	mustAddInit(t, s, 1, []byte("init1"))
 
 	// Push 2 gen=0 segments, then 2 gen=1 segments.
 	mustCommitSlot(t, s, 0, []byte("d"), 0, 2000)
@@ -508,8 +508,8 @@ func TestRenderMediaPlaylist_DiscontinuitySequence_WindowBoundaryMultiple(t *tes
 	// Multiple transitions scroll out via windowing alone (no eviction).
 	_, s := setupStreamForPlaylist(t, 2)
 
-	require.NoError(t, s.AddInitEntry(1, []byte("init1")))
-	require.NoError(t, s.AddInitEntry(2, []byte("init2")))
+	mustAddInit(t, s, 1, []byte("init1"))
+	mustAddInit(t, s, 2, []byte("init2"))
 
 	// gen=0, gen=1, gen=2, gen=2 — window=2 shows only the last 2 (gen=2).
 	mustCommitSlot(t, s, 0, []byte("d"), 0, 2000)
@@ -533,8 +533,8 @@ func TestRenderMediaPlaylist_SkippedGeneration(t *testing.T) {
 	// init_2.mp4 (not init_1.mp4).
 	_, s := setupStreamForPlaylist(t, 2)
 
-	require.NoError(t, s.AddInitEntry(1, []byte("init1")))
-	require.NoError(t, s.AddInitEntry(2, []byte("init2")))
+	mustAddInit(t, s, 1, []byte("init1"))
+	mustAddInit(t, s, 2, []byte("init2"))
 
 	// Gen 0 segments.
 	mustCommitSlot(t, s, 0, []byte("d"), 0, 2000)
@@ -568,7 +568,7 @@ func TestRenderMediaPlaylist_DiscontinuityOrder(t *testing.T) {
 	// Verify the exact ordering: DISCONTINUITY comes before MAP for new generation.
 	_, s := setupStreamForPlaylist(t, 2)
 
-	require.NoError(t, s.AddInitEntry(1, []byte("init1")))
+	mustAddInit(t, s, 1, []byte("init1"))
 
 	mustCommitSlot(t, s, 0, []byte("d"), 0, 2000)
 	err := commitSlotGen(t, s, 1, []byte("d"), 2000, 2000, 1)
@@ -609,31 +609,31 @@ func TestAddInitEntry_Validation(t *testing.T) {
 	s := store.Get("g")
 
 	// Negative generation should fail.
-	err := s.AddInitEntry(-1, []byte("init"))
+	_, err := s.AddInitEntry(-1, []byte("init"))
 	assert.ErrorIs(t, err, ErrNegativeGeneration)
 
 	// Empty init data should fail.
-	err = s.AddInitEntry(1, []byte{})
+	_, err = s.AddInitEntry(1, []byte{})
 	assert.ErrorIs(t, err, ErrEmptyInitData)
 
 	// Generation 0 already has an init entry (created by Init) → duplicate.
-	err = s.AddInitEntry(0, []byte("init-dup"))
+	_, err = s.AddInitEntry(0, []byte("init-dup"))
 	assert.ErrorIs(t, err, ErrDuplicateGeneration)
 
 	// Adding generation 1 (> max existing gen 0) should succeed.
-	err = s.AddInitEntry(1, []byte("init1"))
+	_, err = s.AddInitEntry(1, []byte("init1"))
 	assert.NoError(t, err)
 
 	// Adding generation 1 again → duplicate.
-	err = s.AddInitEntry(1, []byte("init1-dup"))
+	_, err = s.AddInitEntry(1, []byte("init1-dup"))
 	assert.ErrorIs(t, err, ErrDuplicateGeneration)
 
 	// Adding generation 3 (skipping 2) should succeed.
-	err = s.AddInitEntry(3, []byte("init3"))
+	_, err = s.AddInitEntry(3, []byte("init3"))
 	assert.NoError(t, err)
 
 	// Adding generation 2 (less than max existing 3) → not monotonic.
-	err = s.AddInitEntry(2, []byte("init2"))
+	_, err = s.AddInitEntry(2, []byte("init2"))
 	assert.ErrorIs(t, err, ErrGenerationNotMonotonic)
 }
 
@@ -645,7 +645,7 @@ func TestAddInitEntry_ClonesData(t *testing.T) {
 	s := store.Get("g")
 
 	data := []byte{0x01, 0x02, 0x03}
-	require.NoError(t, s.AddInitEntry(1, data))
+	mustAddInit(t, s, 1, data)
 
 	// Mutate the caller's slice.
 	data[0] = 0xFF
@@ -653,6 +653,105 @@ func TestAddInitEntry_ClonesData(t *testing.T) {
 	entry, ok := s.GetInitEntry(1)
 	require.True(t, ok)
 	assert.Equal(t, byte(0x01), entry.InitData[0], "AddInitEntry should clone input")
+}
+
+func TestInitDedup_SuppressesDiscontinuity(t *testing.T) {
+	// When a new generation's init is binary-identical to the current, the
+	// playlist should NOT contain a #EXT-X-DISCONTINUITY between them.
+	clk := clock.NewMock(time.UnixMilli(0))
+	store := NewStore(clk)
+	meta := Metadata{Bandwidth: 1, Codecs: "avc1.64001f", Width: 1, Height: 1, FrameRate: 30, TargetDurationSecs: 2}
+	mustInit(t, store, "g", meta, []byte("init-data"), 20, testSegmentBytes, 5)
+	s := store.Get("g")
+
+	// Push gen=0 segments.
+	mustCommitSlot(t, s, 0, []byte("seg0"), 1000, 2000)
+	mustCommitSlot(t, s, 1, []byte("seg1"), 3000, 2000)
+
+	// Add gen=1 with IDENTICAL init data.
+	mustAddInit(t, s, 1, []byte("init-data"))
+
+	// Push gen=1 segments (these overwrite stale gen=0 segments at/after insertion).
+	commitSlotGen(t, s, 2, []byte("seg2"), 5000, 2000, 1)
+	commitSlotGen(t, s, 3, []byte("seg3"), 7000, 2000, 1)
+
+	// All segments should be eligible.
+	clk.Set(time.UnixMilli(8000))
+
+	s.mu.RLock()
+	playlist, _ := s.renderMediaPlaylist(8000, 10)
+	s.mu.RUnlock()
+
+	// No #EXT-X-DISCONTINUITY should appear — inits are identical.
+	assert.NotContains(t, playlist, "#EXT-X-DISCONTINUITY\n",
+		"identical init should suppress discontinuity")
+
+	// But segments from both generations should be present.
+	assert.Contains(t, playlist, "segment_0.m4s")
+	assert.Contains(t, playlist, "segment_3.m4s")
+}
+
+func TestInitDedup_PreservesDiscontinuityWhenDifferent(t *testing.T) {
+	// When a new generation has DIFFERENT init data, discontinuity is preserved.
+	clk := clock.NewMock(time.UnixMilli(0))
+	store := NewStore(clk)
+	meta := Metadata{Bandwidth: 1, Codecs: "avc1.64001f", Width: 1, Height: 1, FrameRate: 30, TargetDurationSecs: 2}
+	mustInit(t, store, "g", meta, []byte("init-v1"), 20, testSegmentBytes, 5)
+	s := store.Get("g")
+
+	mustCommitSlot(t, s, 0, []byte("seg0"), 1000, 2000)
+	mustCommitSlot(t, s, 1, []byte("seg1"), 3000, 2000)
+
+	// Add gen=1 with DIFFERENT init data.
+	mustAddInit(t, s, 1, []byte("init-v2"))
+
+	commitSlotGen(t, s, 2, []byte("seg2"), 5000, 2000, 1)
+	commitSlotGen(t, s, 3, []byte("seg3"), 7000, 2000, 1)
+
+	clk.Set(time.UnixMilli(8000))
+
+	s.mu.RLock()
+	playlist, _ := s.renderMediaPlaylist(8000, 10)
+	s.mu.RUnlock()
+
+	// #EXT-X-DISCONTINUITY should be present — inits differ.
+	assert.Contains(t, playlist, "#EXT-X-DISCONTINUITY\n",
+		"different init should produce discontinuity")
+}
+
+func TestInitDedup_OverwritesOldSegments(t *testing.T) {
+	// Critical: even when init is deduped, generation changes must still
+	// overwrite (drop) old segments at/after the new segment's position.
+	clk := clock.NewMock(time.UnixMilli(0))
+	store := NewStore(clk)
+	meta := Metadata{Bandwidth: 1, Codecs: "avc1.64001f", Width: 1, Height: 1, FrameRate: 30, TargetDurationSecs: 2}
+	mustInit(t, store, "g", meta, []byte("init-data"), 20, testSegmentBytes, 5)
+	s := store.Get("g")
+
+	// Push gen=0 segments at indices 0-3.
+	mustCommitSlot(t, s, 0, []byte("old0"), 1000, 2000)
+	mustCommitSlot(t, s, 1, []byte("old1"), 3000, 2000)
+	mustCommitSlot(t, s, 2, []byte("old2"), 5000, 2000)
+	mustCommitSlot(t, s, 3, []byte("old3"), 7000, 2000)
+
+	// Add gen=1 with IDENTICAL init data.
+	mustAddInit(t, s, 1, []byte("init-data"))
+
+	// Push gen=1 segment at index 2 — must drop old segments at index 2 and 3.
+	err := commitSlotGen(t, s, 2, []byte("new2"), 5000, 2000, 1)
+	require.NoError(t, err)
+
+	// Verify old segment at index 3 was dropped.
+	clk.Set(time.UnixMilli(8000))
+
+	s.mu.RLock()
+	playlist, _ := s.renderMediaPlaylist(8000, 10)
+	s.mu.RUnlock()
+
+	assert.Contains(t, playlist, "segment_0.m4s", "old gen=0 before insertion should remain")
+	assert.Contains(t, playlist, "segment_1.m4s", "old gen=0 before insertion should remain")
+	assert.Contains(t, playlist, "segment_2.m4s", "new gen=1 segment should be present")
+	assert.NotContains(t, playlist, "segment_3.m4s", "old gen=0 segment at index 3 should be dropped")
 }
 
 // --- Renderer notify tests ---

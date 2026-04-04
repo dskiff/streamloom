@@ -23,7 +23,8 @@ func (s *Stream) discontinuitySequence(start int) int {
 	// This applies regardless of whether start is 0: if eviction removed all
 	// pre-window segments, the transition still scrolled out of the window.
 	// lastEvictedGeneration == -1 means no segments have been evicted yet.
-	if s.lastEvictedGeneration >= 0 && len(s.segments) > 0 && s.segments[0].Generation != s.lastEvictedGeneration {
+	if s.lastEvictedGeneration >= 0 && len(s.segments) > 0 &&
+		s.initGroupGeneration(s.segments[0].Generation) != s.initGroupGeneration(s.lastEvictedGeneration) {
 		discSeq++
 	}
 
@@ -32,7 +33,7 @@ func (s *Stream) discontinuitySequence(start int) int {
 	// Using <= start (not < start) ensures the transition at segments[start-1]
 	// → segments[start] is counted when windowing pushes it out.
 	for i := 1; i <= start; i++ {
-		if s.segments[i].Generation != s.segments[i-1].Generation {
+		if s.initGroupGeneration(s.segments[i].Generation) != s.initGroupGeneration(s.segments[i-1].Generation) {
 			discSeq++
 		}
 	}
@@ -88,15 +89,20 @@ func (s *Stream) renderMediaPlaylist(nowMs int64, windowSize int) (string, int64
 	fmt.Fprintf(&b, "#EXT-X-MEDIA-SEQUENCE:%d\n", window[0].Index)
 	fmt.Fprintf(&b, "#EXT-X-DISCONTINUITY-SEQUENCE:%d\n", discSeq)
 
-	var prevGeneration int64
+	var prevInitGroup int64
 	for i, seg := range window {
-		if i == 0 || seg.Generation != prevGeneration {
+		// Use the init equivalence group to decide whether a discontinuity is
+		// needed. When two generations share binary-identical init segments,
+		// they belong to the same group and no #EXT-X-DISCONTINUITY is emitted
+		// — the player's decoder doesn't need to reinitialize.
+		initGroup := s.initGroupGeneration(seg.Generation)
+		if i == 0 || initGroup != prevInitGroup {
 			if i > 0 {
 				b.WriteString("#EXT-X-DISCONTINUITY\n")
 			}
 			fmt.Fprintf(&b, "#EXT-X-MAP:URI=\"init_%d.mp4\"\n", seg.Generation)
 		}
-		prevGeneration = seg.Generation
+		prevInitGroup = initGroup
 
 		ts := time.UnixMilli(seg.Timestamp).UTC().Format("2006-01-02T15:04:05.000Z")
 		dur := float64(seg.DurationMs) / 1000.0

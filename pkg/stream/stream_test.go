@@ -23,6 +23,13 @@ const testPlaylistWindowSize = 12
 
 // mustInit is a test helper that calls Store.Init and fails the test on error.
 // Registers cleanup to stop the renderer goroutine.
+// mustAddInit adds an init entry for a generation, failing the test on error.
+func mustAddInit(t *testing.T, s *Stream, generation int64, initData []byte) {
+	t.Helper()
+	_, err := s.AddInitEntry(generation, initData)
+	require.NoError(t, err, "AddInitEntry(%d)", generation)
+}
+
 func mustInit(t *testing.T, s *Store, id string, meta Metadata, initData []byte, segmentCapacity, segmentBytes, backwardBufferSize int) {
 	t.Helper()
 	err := s.Init(id, meta, initData, 0, segmentCapacity, segmentBytes, backwardBufferSize, 0, testPlaylistWindowSize)
@@ -1394,8 +1401,8 @@ func TestCommitSlot_StaleGeneration(t *testing.T) {
 	mustInit(t, store, "g", meta, []byte("init"), 10, testSegmentBytes, 5)
 	s := store.Get("g")
 
-	require.NoError(t, s.AddInitEntry(3, []byte("init3")))
-	require.NoError(t, s.AddInitEntry(5, []byte("init5")))
+	mustAddInit(t, s, 3, []byte("init3"))
+	mustAddInit(t, s, 5, []byte("init5"))
 
 	// Push gen=5.
 	err := commitSlotGen(t, s, 0, []byte("data"), 5000, 2000, 5)
@@ -1414,7 +1421,7 @@ func TestCommitSlot_GenerationAdvance_DropsStaleSegments(t *testing.T) {
 	mustInit(t, store, "g", meta, []byte("init"), 10, testSegmentBytes, 5)
 	s := store.Get("g")
 
-	require.NoError(t, s.AddInitEntry(1, []byte("init1")))
+	mustAddInit(t, s, 1, []byte("init1"))
 
 	// Push 5 segments at gen=0.
 	for i := uint32(0); i < 5; i++ {
@@ -1471,7 +1478,7 @@ func TestCommitSlot_GenerationDropFreesCapacity(t *testing.T) {
 	t.Cleanup(func() { store.Delete("g") })
 	s := store.Get("g")
 
-	require.NoError(t, s.AddInitEntry(1, []byte("init1")))
+	mustAddInit(t, s, 1, []byte("init1"))
 
 	// Fill to capacity with gen=0.
 	for i := uint32(0); i < 5; i++ {
@@ -1498,7 +1505,7 @@ func TestCommitSlot_GenerationAdvanceThenContinue(t *testing.T) {
 	mustInit(t, store, "g", meta, []byte("init"), 10, testSegmentBytes, 5)
 	s := store.Get("g")
 
-	require.NoError(t, s.AddInitEntry(1, []byte("init1")))
+	mustAddInit(t, s, 1, []byte("init1"))
 
 	// Push gen=0 segments.
 	for i := uint32(0); i < 3; i++ {
@@ -1531,7 +1538,7 @@ func TestCommitSlot_SameGenDropsStaleOnSubsequentInsert(t *testing.T) {
 	mustInit(t, store, "g", meta, []byte("init"), 20, testSegmentBytes, 15)
 	s := store.Get("g")
 
-	require.NoError(t, s.AddInitEntry(1, []byte("init1")))
+	mustAddInit(t, s, 1, []byte("init1"))
 
 	// Push 10 gen=0 segments (indices 0-9).
 	for i := uint32(0); i < 10; i++ {
@@ -1598,7 +1605,7 @@ func TestCommitSlot_ZeroGenerationStaleAfterAdvance(t *testing.T) {
 	mustInit(t, store, "g", meta, []byte("init"), 10, testSegmentBytes, 5)
 	s := store.Get("g")
 
-	require.NoError(t, s.AddInitEntry(3, []byte("init3")))
+	mustAddInit(t, s, 3, []byte("init3"))
 
 	// Advance to generation 3.
 	err := commitSlotGen(t, s, 0, []byte("data"), 5000, 2000, 3)
@@ -1675,7 +1682,7 @@ func TestEviction_ActiveReaderStopsDiscontinuityTracking(t *testing.T) {
 	s := store.Get("s")
 	require.NotNil(t, s)
 
-	require.NoError(t, s.AddInitEntry(1, []byte("init1")))
+	mustAddInit(t, s, 1, []byte("init1"))
 
 	// Push: index 0 (gen=0), index 1 (gen=0), index 2 (gen=1), index 3 (gen=1)
 	mustCommitSlot(t, s, 0, []byte("d"), 1000, 2000)
@@ -1738,7 +1745,7 @@ func TestEvictStaleInitEntries_BasicEviction(t *testing.T) {
 	mustInit(t, store, "s", meta, []byte("init0"), 10, testSegmentBytes, 5)
 	s := store.Get("s")
 
-	require.NoError(t, s.AddInitEntry(1, []byte("init1")))
+	mustAddInit(t, s, 1, []byte("init1"))
 
 	// Push gen=0 segments.
 	for i := uint32(0); i < 3; i++ {
@@ -1772,7 +1779,7 @@ func TestEvictStaleInitEntries_RetainedWhileSegmentsExist(t *testing.T) {
 	t.Cleanup(func() { store.Delete("s") })
 	s := store.Get("s")
 
-	require.NoError(t, s.AddInitEntry(1, []byte("init1")))
+	mustAddInit(t, s, 1, []byte("init1"))
 
 	// Push gen=0 segments at indices 0-2.
 	for i := uint32(0); i < 3; i++ {
@@ -1806,7 +1813,7 @@ func TestEvictStaleInitEntries_CurrentGenerationRetained(t *testing.T) {
 	mustInit(t, store, "s", meta, []byte("init0"), 10, testSegmentBytes, 1)
 	s := store.Get("s")
 
-	require.NoError(t, s.AddInitEntry(1, []byte("init1")))
+	mustAddInit(t, s, 1, []byte("init1"))
 
 	// Push one gen=0 segment, then advance to gen=1. Gen=0 segment gets dropped.
 	require.NoError(t, commitSlotGen(t, s, 0, []byte("d"), 5000, 2000, 0))
@@ -1830,8 +1837,8 @@ func TestEvictStaleInitEntries_MultipleGenerations(t *testing.T) {
 	mustInit(t, store, "s", meta, []byte("init0"), 10, testSegmentBytes, 5)
 	s := store.Get("s")
 
-	require.NoError(t, s.AddInitEntry(1, []byte("init1")))
-	require.NoError(t, s.AddInitEntry(2, []byte("init2")))
+	mustAddInit(t, s, 1, []byte("init1"))
+	mustAddInit(t, s, 2, []byte("init2"))
 
 	// Push gen=0, then advance to gen=1, then advance to gen=2.
 	require.NoError(t, commitSlotGen(t, s, 0, []byte("d"), 5000, 2000, 0))

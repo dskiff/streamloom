@@ -276,7 +276,8 @@ func TestE2E_DiscontinuitySequenceIncrements(t *testing.T) {
 	s := store.Get("1")
 	require.NotNil(t, s)
 
-	require.NoError(t, s.AddInitEntry(1, []byte("init-gen1")))
+	_, err = s.AddInitEntry(1, []byte("init-gen1"))
+	require.NoError(t, err)
 
 	// Push gen=0 segments at indices 0-2, timestamps 1000,3000,5000.
 	for i := uint32(0); i < 3; i++ {

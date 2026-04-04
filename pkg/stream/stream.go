@@ -2,6 +2,7 @@
 package stream
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -136,6 +137,14 @@ type Stream struct {
 	// Stale entries are evicted during CommitSlot when their generation is below
 	// currentGeneration and no buffered segments reference them.
 	initEntries map[int64]*InitEntry
+
+	// initEquivalences maps a newer generation to an older generation when
+	// their init segments are binary-identical. The playlist renderer uses
+	// this to suppress #EXT-X-DISCONTINUITY tags between equivalent
+	// generations (since the decoder doesn't need to reinitialize).
+	// Segment storage and stale-drop logic use the REAL generation — only
+	// the playlist rendering is affected.
+	initEquivalences map[int64]int64
 
 	segments          []Slot // sorted by Index
 	segmentCap        int    // maximum number of segments
@@ -340,7 +349,10 @@ func (s *Stream) evictOldLocked() {
 		}
 
 		// Track generation transitions for EXT-X-DISCONTINUITY-SEQUENCE.
-		if s.lastEvictedGeneration >= 0 && s.segments[i].Generation != s.lastEvictedGeneration {
+		// Use init equivalence groups: transitions between generations with
+		// identical init segments don't produce discontinuities.
+		if s.lastEvictedGeneration >= 0 &&
+			s.initGroupGeneration(s.segments[i].Generation) != s.initGroupGeneration(s.lastEvictedGeneration) {
 			s.evictedDiscontinuities++
 		}
 		s.lastEvictedGeneration = s.segments[i].Generation
@@ -624,41 +636,77 @@ func (s *Store) Init(id string, meta Metadata, initData []byte, generation int64
 	return nil
 }
 
+// initGroupGeneration returns the canonical generation for playlist rendering.
+// If this generation's init is equivalent to an earlier generation's init,
+// returns that earlier generation. Otherwise returns the generation unchanged.
+// Must be called with s.mu held (read or write).
+func (s *Stream) initGroupGeneration(generation int64) int64 {
+	if s.initEquivalences != nil {
+		if target, ok := s.initEquivalences[generation]; ok {
+			return target
+		}
+	}
+	return generation
+}
+
 // AddInitEntry adds a new init segment for the given generation to an existing
 // stream. The initData slice is cloned. This does NOT modify segments, the
 // buffer pool, the renderer, or currentGeneration.
+//
+// If the new init segment is binary-identical to the current generation's init,
+// the generation is aliased to the current generation and the returned value
+// is the aliased (current) generation. This avoids an unnecessary
+// #EXT-X-DISCONTINUITY in the playlist. Otherwise, the returned value equals
+// the input generation.
 //
 // Returns ErrNegativeGeneration if generation < 0, ErrEmptyInitData if
 // initData is empty, ErrGenerationNotMonotonic if generation is not strictly
 // greater than the highest existing init generation, or ErrDuplicateGeneration
 // if an init entry for this generation already exists.
-func (s *Stream) AddInitEntry(generation int64, initData []byte) error {
+func (s *Stream) AddInitEntry(generation int64, initData []byte) (int64, error) {
 	if generation < 0 {
-		return ErrNegativeGeneration
+		return 0, ErrNegativeGeneration
 	}
 	if len(initData) == 0 {
-		return ErrEmptyInitData
+		return 0, ErrEmptyInitData
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if _, ok := s.initEntries[generation]; ok {
-		return ErrDuplicateGeneration
+		return 0, ErrDuplicateGeneration
 	}
 
 	// The new generation must be strictly greater than all existing init
 	// generations to maintain forward-only ordering.
 	for existingGen := range s.initEntries {
 		if generation < existingGen {
-			return ErrGenerationNotMonotonic
+			return 0, ErrGenerationNotMonotonic
 		}
 	}
 
+	// Always create a real init entry so that CommitSlot's init-existence
+	// check passes and the generation can advance normally (preserving
+	// stale-segment overwrite behavior).
 	cloned := make([]byte, len(initData))
 	copy(cloned, initData)
 	s.initEntries[generation] = &InitEntry{InitData: cloned}
-	return nil
+
+	// If the new init is binary-identical to the current generation's init,
+	// record an equivalence. The playlist renderer uses this to suppress
+	// #EXT-X-DISCONTINUITY between equivalent generations (the decoder
+	// doesn't need to reinitialize when the init hasn't changed).
+	if currentEntry, ok := s.initEntries[s.currentGeneration]; ok {
+		if bytes.Equal(currentEntry.InitData, initData) {
+			if s.initEquivalences == nil {
+				s.initEquivalences = make(map[int64]int64)
+			}
+			s.initEquivalences[generation] = s.currentGeneration
+		}
+	}
+
+	return generation, nil
 }
 
 // Clock returns the clock used by this store and its streams.
