@@ -636,17 +636,21 @@ func (s *Store) Init(id string, meta Metadata, initData []byte, generation int64
 	return nil
 }
 
-// initGroupGeneration returns the canonical generation for playlist rendering.
-// If this generation's init is equivalent to an earlier generation's init,
-// returns that earlier generation. Otherwise returns the generation unchanged.
+// initGroupGeneration returns the canonical (root) generation for playlist
+// rendering by following the equivalence chain transitively.  For example,
+// if gen=2→1 and gen=1→0, this returns 0 for all three.
 // Must be called with s.mu held (read or write).
 func (s *Stream) initGroupGeneration(generation int64) int64 {
-	if s.initEquivalences != nil {
-		if target, ok := s.initEquivalences[generation]; ok {
-			return target
-		}
+	if s.initEquivalences == nil {
+		return generation
 	}
-	return generation
+	for {
+		target, ok := s.initEquivalences[generation]
+		if !ok {
+			return generation
+		}
+		generation = target
+	}
 }
 
 // AddInitEntry adds a new init segment for the given generation to an existing
@@ -697,12 +701,14 @@ func (s *Stream) AddInitEntry(generation int64, initData []byte) (int64, error) 
 	// record an equivalence. The playlist renderer uses this to suppress
 	// #EXT-X-DISCONTINUITY between equivalent generations (the decoder
 	// doesn't need to reinitialize when the init hasn't changed).
+	// Always alias to the root (canonical) generation so that all equivalent
+	// generations resolve to the same group in a single lookup.
 	if currentEntry, ok := s.initEntries[s.currentGeneration]; ok {
 		if bytes.Equal(currentEntry.InitData, initData) {
 			if s.initEquivalences == nil {
 				s.initEquivalences = make(map[int64]int64)
 			}
-			s.initEquivalences[generation] = s.currentGeneration
+			s.initEquivalences[generation] = s.initGroupGeneration(s.currentGeneration)
 		}
 	}
 

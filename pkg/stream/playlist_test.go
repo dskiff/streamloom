@@ -719,6 +719,44 @@ func TestInitDedup_PreservesDiscontinuityWhenDifferent(t *testing.T) {
 		"different init should produce discontinuity")
 }
 
+func TestInitDedup_ThreeGenerationsNoDiscontinuity(t *testing.T) {
+	// Three consecutive generations with identical init data must produce
+	// NO discontinuities. This exercises transitive equivalence resolution:
+	// gen=2 aliases to gen=1, which aliases to gen=0.
+	clk := clock.NewMock(time.UnixMilli(0))
+	store := NewStore(clk)
+	meta := Metadata{Bandwidth: 1, Codecs: "avc1.64001f", Width: 1, Height: 1, FrameRate: 30, TargetDurationSecs: 2}
+	mustInit(t, store, "g", meta, []byte("init-data"), 30, testSegmentBytes, 5)
+	s := store.Get("g")
+
+	// Gen 0 segments.
+	mustCommitSlot(t, s, 0, []byte("s0"), 1000, 2000)
+	mustCommitSlot(t, s, 1, []byte("s1"), 3000, 2000)
+
+	// Gen 1 — identical init.
+	mustAddInit(t, s, 1, []byte("init-data"))
+	commitSlotGen(t, s, 2, []byte("s2"), 5000, 2000, 1)
+	commitSlotGen(t, s, 3, []byte("s3"), 7000, 2000, 1)
+
+	// Gen 2 — identical init again.
+	mustAddInit(t, s, 2, []byte("init-data"))
+	commitSlotGen(t, s, 4, []byte("s4"), 9000, 2000, 2)
+	commitSlotGen(t, s, 5, []byte("s5"), 11000, 2000, 2)
+
+	clk.Set(time.UnixMilli(12000))
+
+	s.mu.RLock()
+	playlist, _ := s.renderMediaPlaylist(12000, 20)
+	s.mu.RUnlock()
+
+	assert.NotContains(t, playlist, "#EXT-X-DISCONTINUITY\n",
+		"three identical-init generations should produce no discontinuities;\nplaylist:\n%s", playlist)
+
+	// All segments should be present.
+	assert.Contains(t, playlist, "segment_0.m4s")
+	assert.Contains(t, playlist, "segment_5.m4s")
+}
+
 func TestInitDedup_OverwritesOldSegments(t *testing.T) {
 	// Critical: even when init is deduped, generation changes must still
 	// overwrite (drop) old segments at/after the new segment's position.
