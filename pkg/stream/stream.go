@@ -443,13 +443,20 @@ func (s *Stream) CommitSlot(index uint32, buf *pool.BufferSlot, timestamp int64,
 		return ErrMissingInitForGeneration
 	}
 
-	// Reject past timestamps unless the stream is empty (first segment exception).
-	if timestamp < s.clock.Now().UnixMilli() && len(s.segments) > 0 {
-		return ErrTimestampInPast
-	}
+	generationAdvancing := s.currentGeneration < generation
 
 	if s.currentGeneration < generation {
 		s.currentGeneration = generation
+	}
+
+	// Reject past timestamps unless the stream is empty or the generation is
+	// advancing.  New-generation segments legitimately have past timestamps
+	// when pipeline startup takes longer than the initial lead time (e.g.
+	// subtitle burn-in, slow hardware encoder init).  Rejecting them would
+	// leave a gap between the old generation's last segment and the new
+	// generation's catch-up point, causing viewer-visible stutter.
+	if !generationAdvancing && timestamp < s.clock.Now().UnixMilli() && len(s.segments) > 0 {
+		return ErrTimestampInPast
 	}
 
 	s.bufPool.AssertCheckedOut(buf)
