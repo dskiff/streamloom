@@ -989,3 +989,207 @@ func TestRunPlaylistRenderer_NotifyRacesWithTimer(t *testing.T) {
 		return p != "" && strings.Contains(p, "segment_2.m4s")
 	}, 2*time.Second, 10*time.Millisecond)
 }
+
+// ---------------------------------------------------------------------------
+// Full generation-change lifecycle integration test
+// ---------------------------------------------------------------------------
+
+// TestGenerationChangeLifecycle simulates the exact production scenario:
+//
+//  1. Old pipeline (gen=0) is running and has pushed segments well ahead of now.
+//  2. Schedule change: new init is pushed (identical binary), gen=1 segments
+//     replace the old future segments.
+//  3. The playlist is checked at multiple time points for anomalies:
+//     - No #EXT-X-DISCONTINUITY (init is identical)
+//     - No #EXT-X-MAP change (MAP URI stays at canonical generation)
+//     - Continuous #EXT-X-PROGRAM-DATE-TIME (no gaps or overlaps)
+//     - Monotonically increasing segment indices
+//
+// This test uses epoch-scale timestamps and indices to match production.
+func TestGenerationChangeLifecycle(t *testing.T) {
+	baseMs := int64(1_775_340_000_000) // ~2026-04-04
+	segDur := int64(2000)
+	segDurU32 := uint32(2000)
+	windowSize := 8
+
+	clk := clock.NewMock(time.UnixMilli(baseMs))
+	store := NewStore(clk)
+	meta := Metadata{
+		Bandwidth:          6_000_000,
+		Codecs:             "hvc1.1.6.L120.90,mp4a.40.2",
+		Width:              1920,
+		Height:             1080,
+		FrameRate:          23.976,
+		TargetDurationSecs: 2,
+	}
+	initData := []byte("identical-init-segment-binary-data")
+	err := store.Init("s", meta, initData, 0, 50, 4096, 10, 5, windowSize)
+	require.NoError(t, err)
+	s := store.Get("s")
+	require.NotNil(t, s)
+	t.Cleanup(func() { store.Delete("s") })
+
+	// --- Phase 1: Old pipeline (gen=0) pushes segments way ahead of now ---
+	baseIdx := uint32(baseMs / segDur)
+	for i := uint32(0); i < 20; i++ {
+		idx := baseIdx + i
+		ts := baseMs + int64(i)*segDur
+		err := commitSlotGen(t, s, idx, []byte("old-data"), ts, segDurU32, 0)
+		require.NoError(t, err, "gen=0 segment %d", idx)
+	}
+
+	// --- Verify playlist before generation change ---
+	nowMs := baseMs + 10*segDur
+	clk.Set(time.UnixMilli(nowMs))
+
+	s.mu.RLock()
+	playlistBefore, _ := s.renderMediaPlaylist(nowMs, windowSize)
+	s.mu.RUnlock()
+
+	require.NotEmpty(t, playlistBefore, "should have playlist before gen change")
+	assert.NotContains(t, playlistBefore, "#EXT-X-DISCONTINUITY\n",
+		"no discontinuity before gen change")
+	assert.Contains(t, playlistBefore, `#EXT-X-MAP:URI="init_0.mp4"`)
+
+	t.Log("=== Playlist BEFORE generation change ===")
+	t.Log(playlistBefore)
+
+	// --- Phase 2: Generation change ---
+	mustAddInit(t, s, 1, initData)
+
+	newRefMs := nowMs + 4*segDur // new pipeline ~4 segments ahead
+	newBaseIdx := uint32(newRefMs / segDur)
+
+	for i := uint32(0); i < 10; i++ {
+		idx := newBaseIdx + i
+		ts := newRefMs + int64(i)*segDur
+		err := commitSlotGen(t, s, idx, []byte("new-data"), ts, segDurU32, 1)
+		require.NoError(t, err, "gen=1 segment %d", idx)
+	}
+
+	// --- Phase 3: Check playlist immediately after generation change ---
+	s.mu.RLock()
+	playlistAfter, _ := s.renderMediaPlaylist(nowMs, windowSize)
+	s.mu.RUnlock()
+
+	t.Log("=== Playlist AFTER generation change ===")
+	t.Log(playlistAfter)
+
+	assert.NotContains(t, playlistAfter, "#EXT-X-DISCONTINUITY\n",
+		"no discontinuity after gen change with identical init")
+	assertSingleMapURI(t, playlistAfter, "init_0.mp4")
+
+	// --- Phase 4: Advance time past all old segments ---
+	futureMs := newRefMs + 10*segDur
+	clk.Set(time.UnixMilli(futureMs))
+
+	s.mu.RLock()
+	playlistFuture, _ := s.renderMediaPlaylist(futureMs, windowSize)
+	s.mu.RUnlock()
+
+	t.Log("=== Playlist AFTER all old segments expired ===")
+	t.Log(playlistFuture)
+
+	assert.NotContains(t, playlistFuture, "#EXT-X-DISCONTINUITY\n",
+		"no discontinuity even after old segments expired")
+	assertSingleMapURI(t, playlistFuture, "init_0.mp4")
+
+	// --- Phase 4b: Check at the exact transition point ---
+	// Advance to where the first gen=1 segment just became eligible.
+	transitionMs := newRefMs
+	clk.Set(time.UnixMilli(transitionMs))
+
+	s.mu.RLock()
+	playlistTransition, _ := s.renderMediaPlaylist(transitionMs, windowSize)
+	s.mu.RUnlock()
+
+	t.Log("=== Playlist at TRANSITION point (first gen=1 segment eligible) ===")
+	t.Log(playlistTransition)
+
+	assert.NotContains(t, playlistTransition, "#EXT-X-DISCONTINUITY\n",
+		"no discontinuity at transition point")
+	assertSingleMapURI(t, playlistTransition, "init_0.mp4")
+
+	// --- Phase 5: Verify continuous PDTs in ALL phases ---
+	for _, pl := range []struct {
+		name     string
+		playlist string
+	}{
+		{"before", playlistBefore},
+		{"after", playlistAfter},
+		{"transition", playlistTransition},
+		{"future", playlistFuture},
+	} {
+		assertContinuousPDTs(t, pl.playlist, segDur, pl.name)
+		assertMonotonicIndices(t, pl.playlist, pl.name)
+	}
+}
+
+func assertSingleMapURI(t *testing.T, playlist, expectedFile string) {
+	t.Helper()
+	count := strings.Count(playlist, "#EXT-X-MAP:")
+	assert.Equal(t, 1, count,
+		"expected exactly 1 #EXT-X-MAP, got %d\nplaylist:\n%s", count, playlist)
+	expected := fmt.Sprintf(`#EXT-X-MAP:URI="%s"`, expectedFile)
+	assert.Contains(t, playlist, expected,
+		"MAP URI should be %s\nplaylist:\n%s", expectedFile, playlist)
+}
+
+func assertContinuousPDTs(t *testing.T, playlist string, expectedDurMs int64, label string) {
+	t.Helper()
+	lines := strings.Split(playlist, "\n")
+
+	var pdts []time.Time
+	var durs []float64
+
+	for _, line := range lines {
+		if strings.HasPrefix(line, "#EXT-X-PROGRAM-DATE-TIME:") {
+			tsStr := strings.TrimPrefix(line, "#EXT-X-PROGRAM-DATE-TIME:")
+			ts, err := time.Parse("2006-01-02T15:04:05.000Z", tsStr)
+			require.NoError(t, err, "parse PDT %q in %s", tsStr, label)
+			pdts = append(pdts, ts)
+		}
+		if strings.HasPrefix(line, "#EXTINF:") {
+			durStr := strings.TrimPrefix(line, "#EXTINF:")
+			durStr = strings.TrimSuffix(durStr, ",")
+			var dur float64
+			_, err := fmt.Sscanf(durStr, "%f", &dur)
+			require.NoError(t, err, "parse EXTINF %q in %s", durStr, label)
+			durs = append(durs, dur)
+		}
+	}
+
+	require.Equal(t, len(pdts), len(durs),
+		"PDT count (%d) != EXTINF count (%d) in %s", len(pdts), len(durs), label)
+
+	for i := 1; i < len(pdts); i++ {
+		prevEnd := pdts[i-1].Add(time.Duration(durs[i-1]*1000) * time.Millisecond)
+		gap := pdts[i].Sub(prevEnd)
+		assert.InDelta(t, 0, gap.Milliseconds(), 1,
+			"PDT gap of %dms between seg %d and %d in %s\nplaylist:\n%s",
+			gap.Milliseconds(), i-1, i, label, playlist)
+	}
+}
+
+func assertMonotonicIndices(t *testing.T, playlist, label string) {
+	t.Helper()
+	lines := strings.Split(playlist, "\n")
+
+	var indices []uint32
+	for _, line := range lines {
+		if strings.HasPrefix(line, "segment_") && strings.HasSuffix(line, ".m4s") {
+			numStr := strings.TrimPrefix(line, "segment_")
+			numStr = strings.TrimSuffix(numStr, ".m4s")
+			var idx uint32
+			_, err := fmt.Sscanf(numStr, "%d", &idx)
+			require.NoError(t, err, "parse segment index %q in %s", numStr, label)
+			indices = append(indices, idx)
+		}
+	}
+
+	for i := 1; i < len(indices); i++ {
+		assert.Equal(t, indices[i-1]+1, indices[i],
+			"non-consecutive indices: %d then %d in %s\nplaylist:\n%s",
+			indices[i-1], indices[i], label, playlist)
+	}
+}
