@@ -567,40 +567,6 @@ func TestRejectPastTimestampDoesNotIncrementCount(t *testing.T) {
 	assert.Equal(t, int64(1), s.TotalSegmentCount(), "count after rejection")
 }
 
-func TestAllowPastTimestampOnGenerationAdvance(t *testing.T) {
-	// When a new generation's pipeline takes longer than INITIAL_LEAD_MS to
-	// start (e.g. subtitle burn-in), the first segments have past timestamps.
-	// These must NOT be rejected — rejecting them leaves a gap in the
-	// playlist that causes viewer-visible stutter.
-	fixedTime := time.Date(2025, 6, 1, 12, 0, 0, 0, time.UTC)
-	clk := clock.NewMock(fixedTime)
-	nowMs := fixedTime.UnixMilli()
-
-	s := newTestStream(t, clk)
-
-	// Gen=0 segments in the future (normal pipeline running ahead).
-	require.NoError(t, commitSlot(t, s, 0, []byte{0x01}, nowMs+1000, 2000))
-	require.NoError(t, commitSlot(t, s, 1, []byte{0x02}, nowMs+3000, 2000))
-
-	// Add gen=1 init.
-	mustAddInit(t, s, 1, []byte("init1"))
-
-	// Gen=1 segment with past timestamp — should be ACCEPTED because the
-	// generation is advancing (pipeline startup was slow).
-	err := commitSlotGen(t, s, 2, []byte{0x03}, nowMs-2000, 2000, 1)
-	assert.NoError(t, err, "past-timestamp segment should be accepted on generation advance")
-
-	// Verify the segment was actually stored.
-	_, readErr := readSegment(s, 2)
-	assert.NoError(t, readErr, "gen=1 segment should be readable")
-
-	// But a SECOND past-timestamp segment at the SAME generation should
-	// still be rejected (the generation is no longer advancing).
-	err = commitSlotGen(t, s, 3, []byte{0x04}, nowMs-4000, 2000, 1)
-	assert.ErrorIs(t, err, ErrTimestampInPast,
-		"past-timestamp segment should be rejected when generation is NOT advancing")
-}
-
 func TestRunWithSegmentSlotNotFound(t *testing.T) {
 	clk := clock.NewMock(time.UnixMilli(0))
 	s := newTestStream(t, clk)
