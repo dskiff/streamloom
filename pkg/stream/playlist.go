@@ -100,7 +100,7 @@ func (s *Stream) renderMediaPlaylist(nowMs int64, windowSize int) (string, int64
 			if i > 0 {
 				b.WriteString("#EXT-X-DISCONTINUITY\n")
 			}
-			fmt.Fprintf(&b, "#EXT-X-MAP:URI=\"init_%d.mp4\"\n", seg.Generation)
+			fmt.Fprintf(&b, "#EXT-X-MAP:URI=\"init_%d.mp4\"\n", initGroup)
 		}
 		prevInitGroup = initGroup
 

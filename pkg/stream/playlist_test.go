@@ -755,6 +755,52 @@ func TestInitDedup_ThreeGenerationsNoDiscontinuity(t *testing.T) {
 	// All segments should be present.
 	assert.Contains(t, playlist, "segment_0.m4s")
 	assert.Contains(t, playlist, "segment_5.m4s")
+
+	// MAP URI should use the canonical (gen=0) init for all segments.
+	assert.Contains(t, playlist, `#EXT-X-MAP:URI="init_0.mp4"`)
+	assert.NotContains(t, playlist, `#EXT-X-MAP:URI="init_1.mp4"`)
+	assert.NotContains(t, playlist, `#EXT-X-MAP:URI="init_2.mp4"`)
+}
+
+func TestInitDedup_MapUriStableAfterWindowShift(t *testing.T) {
+	// After all gen=0 segments expire from the window, the MAP URI must
+	// still reference the canonical init (init_0.mp4), not init_1.mp4.
+	// A URI change would cause the player to re-download the (identical)
+	// init and reinitialize its decoder — causing stutter.
+	clk := clock.NewMock(time.UnixMilli(0))
+	store := NewStore(clk)
+	meta := Metadata{Bandwidth: 1, Codecs: "avc1.64001f", Width: 1, Height: 1, FrameRate: 30, TargetDurationSecs: 2}
+	mustInit(t, store, "g", meta, []byte("init-data"), 30, testSegmentBytes, 2)
+	s := store.Get("g")
+
+	// Push gen=0 segments.
+	mustCommitSlot(t, s, 0, []byte("s0"), 1000, 2000)
+	mustCommitSlot(t, s, 1, []byte("s1"), 3000, 2000)
+
+	// Gen 1 — identical init.
+	mustAddInit(t, s, 1, []byte("init-data"))
+	commitSlotGen(t, s, 2, []byte("s2"), 5000, 2000, 1)
+	commitSlotGen(t, s, 3, []byte("s3"), 7000, 2000, 1)
+	commitSlotGen(t, s, 4, []byte("s4"), 9000, 2000, 1)
+	commitSlotGen(t, s, 5, []byte("s5"), 11000, 2000, 1)
+
+	// Advance clock so all segments are eligible and old ones get evicted.
+	clk.Set(time.UnixMilli(12000))
+
+	// Use a small window so gen=0 segments are pushed out.
+	s.mu.RLock()
+	playlist, _ := s.renderMediaPlaylist(12000, 3)
+	s.mu.RUnlock()
+
+	// The window should contain only gen=1 segments.
+	assert.NotContains(t, playlist, "segment_0.m4s")
+	assert.Contains(t, playlist, "segment_5.m4s")
+
+	// MAP URI must still be init_0.mp4 (the canonical generation).
+	assert.Contains(t, playlist, `#EXT-X-MAP:URI="init_0.mp4"`,
+		"MAP URI should use canonical gen even after all gen=0 segments expired;\nplaylist:\n%s", playlist)
+	assert.NotContains(t, playlist, `#EXT-X-MAP:URI="init_1.mp4"`,
+		"MAP URI should NOT switch to init_1.mp4;\nplaylist:\n%s", playlist)
 }
 
 func TestInitDedup_OverwritesOldSegments(t *testing.T) {
