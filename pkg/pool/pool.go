@@ -76,6 +76,9 @@ func (p *BufferPool) Put(slot *BufferSlot) {
 	if isFree {
 		panic(Unrecoverable{"pool: Put called on an already-free buffer; possible double-return"})
 	}
+	if r := slot.Readers(); r != 0 {
+		panic(Unrecoverable{fmt.Sprintf("pool: Put called on slot with %d active readers", r)})
+	}
 	p.isFree[slot] = true
 	p.free = append(p.free, slot)
 }

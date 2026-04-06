@@ -1,8 +1,8 @@
 package stream
 
 import (
-	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -77,6 +77,7 @@ func (s *Stream) renderMediaPlaylist(nowMs int64, windowSize int) (string, int64
 	discSeq := s.discontinuitySequence(start)
 
 	var b strings.Builder
+	var scratch [64]byte
 
 	// Estimate capacity: ~150 bytes per segment entry + ~200 bytes header.
 	b.Grow(200 + len(window)*150)
@@ -84,9 +85,18 @@ func (s *Stream) renderMediaPlaylist(nowMs int64, windowSize int) (string, int64
 	b.WriteString("#EXTM3U\n")
 	b.WriteString("#EXT-X-VERSION:7\n")
 	b.WriteString("#EXT-X-INDEPENDENT-SEGMENTS\n")
-	fmt.Fprintf(&b, "#EXT-X-TARGETDURATION:%d\n", s.metadata.TargetDurationSecs)
-	fmt.Fprintf(&b, "#EXT-X-MEDIA-SEQUENCE:%d\n", window[0].Index)
-	fmt.Fprintf(&b, "#EXT-X-DISCONTINUITY-SEQUENCE:%d\n", discSeq)
+
+	b.WriteString("#EXT-X-TARGETDURATION:")
+	b.Write(strconv.AppendInt(scratch[:0], int64(s.metadata.TargetDurationSecs), 10))
+	b.WriteByte('\n')
+
+	b.WriteString("#EXT-X-MEDIA-SEQUENCE:")
+	b.Write(strconv.AppendUint(scratch[:0], uint64(window[0].Index), 10))
+	b.WriteByte('\n')
+
+	b.WriteString("#EXT-X-DISCONTINUITY-SEQUENCE:")
+	b.Write(strconv.AppendInt(scratch[:0], int64(discSeq), 10))
+	b.WriteByte('\n')
 
 	var prevGeneration int64
 	for i, seg := range window {
@@ -94,15 +104,24 @@ func (s *Stream) renderMediaPlaylist(nowMs int64, windowSize int) (string, int64
 			if i > 0 {
 				b.WriteString("#EXT-X-DISCONTINUITY\n")
 			}
-			fmt.Fprintf(&b, "#EXT-X-MAP:URI=\"init_%d.mp4\"\n", seg.Generation)
+			b.WriteString("#EXT-X-MAP:URI=\"init_")
+			b.Write(strconv.AppendInt(scratch[:0], seg.Generation, 10))
+			b.WriteString(".mp4\"\n")
 		}
 		prevGeneration = seg.Generation
 
-		ts := time.UnixMilli(seg.Timestamp).UTC().Format("2006-01-02T15:04:05.000Z")
+		b.WriteString("#EXT-X-PROGRAM-DATE-TIME:")
+		b.Write(time.UnixMilli(seg.Timestamp).UTC().AppendFormat(scratch[:0], "2006-01-02T15:04:05.000Z"))
+		b.WriteByte('\n')
+
 		dur := float64(seg.DurationMs) / 1000.0
-		fmt.Fprintf(&b, "#EXT-X-PROGRAM-DATE-TIME:%s\n", ts)
-		fmt.Fprintf(&b, "#EXTINF:%.3f,\n", dur)
-		fmt.Fprintf(&b, "segment_%d.m4s\n", seg.Index)
+		b.WriteString("#EXTINF:")
+		b.Write(strconv.AppendFloat(scratch[:0], dur, 'f', 3, 64))
+		b.WriteString(",\n")
+
+		b.WriteString("segment_")
+		b.Write(strconv.AppendUint(scratch[:0], uint64(seg.Index), 10))
+		b.WriteString(".m4s\n")
 	}
 
 	result := b.String()

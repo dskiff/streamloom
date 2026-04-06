@@ -343,16 +343,20 @@ func (s *Stream) evictStaleInitEntriesLocked() {
 	if len(s.initEntries) <= 1 {
 		return
 	}
-	// Build set of generations referenced by buffered segments.
-	activeGens := make(map[int64]struct{}, 2)
-	for i := range s.segments {
-		activeGens[s.segments[i].Generation] = struct{}{}
-	}
 	for gen := range s.initEntries {
-		if gen < s.currentGeneration {
-			if _, active := activeGens[gen]; !active {
-				delete(s.initEntries, gen)
+		if gen >= s.currentGeneration {
+			continue
+		}
+		// Check if any buffered segment still references this generation.
+		referenced := false
+		for i := range s.segments {
+			if s.segments[i].Generation == gen {
+				referenced = true
+				break
 			}
+		}
+		if !referenced {
+			delete(s.initEntries, gen)
 		}
 	}
 }
