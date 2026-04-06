@@ -250,6 +250,22 @@ func TestReaderDecPanicsOnUnderflow(t *testing.T) {
 	slot.ReaderDec() // no matching ReaderInc — should panic
 }
 
+func TestPutPanicsOnNonZeroReaderCount(t *testing.T) {
+	p := NewBufferPool(1, 64)
+	slot, _ := p.Get()
+	slot.ReaderInc() // simulate leaked reader
+
+	defer func() {
+		r := recover()
+		require.NotNil(t, r, "Put with active readers should panic")
+		u, ok := r.(Unrecoverable)
+		require.True(t, ok, "panic value should be Unrecoverable, got %T", r)
+		assert.Contains(t, u.Msg, "active readers")
+	}()
+
+	p.Put(slot)
+}
+
 func TestBufferSlotReadFromEmpty(t *testing.T) {
 	p := NewBufferPool(1, 64)
 	slot, _ := p.Get()
