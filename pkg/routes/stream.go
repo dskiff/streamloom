@@ -157,7 +157,7 @@ func Stream(logger *slog.Logger, env config.Env, store *stream.Store, requestLog
 				return
 			}
 
-			entry, ok := s.GetInitEntry(generation)
+			initData, ok := s.GetInit(generation)
 			if !ok {
 				w.WriteHeader(http.StatusNotFound)
 				return
@@ -165,8 +165,8 @@ func Stream(logger *slog.Logger, env config.Env, store *stream.Store, requestLog
 
 			w.Header().Set("Content-Type", config.MP4_MIME_TYPE)
 			w.Header().Set("Cache-Control", "no-cache")
-			w.Header().Set("Content-Length", strconv.Itoa(len(entry.InitData)))
-			if _, err := w.Write(entry.InitData); err != nil {
+			w.Header().Set("Content-Length", strconv.Itoa(len(initData)))
+			if _, err := w.Write(initData); err != nil {
 				logger.Error("failed to write response", "error", err)
 			}
 		})

@@ -123,10 +123,9 @@ func TestInitAndGet(t *testing.T) {
 	assert.Equal(t, meta.Height, got.Height)
 	assert.Equal(t, meta.FrameRate, got.FrameRate)
 
-	var buf bytes.Buffer
-	_, err := stream.WriteInitDataForGenerationTo(&buf, 0)
-	require.NoError(t, err)
-	assert.Equal(t, initData, buf.Bytes())
+	got2, ok := stream.GetInit(0)
+	require.True(t, ok)
+	assert.Equal(t, initData, got2)
 }
 
 func TestInitClonesData(t *testing.T) {
@@ -138,22 +137,23 @@ func TestInitClonesData(t *testing.T) {
 	original[0] = 0xFF
 
 	stream := s.Get("1")
-	var buf bytes.Buffer
-	_, _ = stream.WriteInitDataForGenerationTo(&buf, 0)
-	assert.Equal(t, byte(0x01), buf.Bytes()[0], "Init did not clone the input; caller mutation leaked into store")
+	got, ok := stream.GetInit(0)
+	require.True(t, ok)
+	assert.Equal(t, byte(0x01), got[0], "Init did not clone the input; caller mutation leaked into store")
 }
 
-func TestWriteInitDataIsImmutable(t *testing.T) {
+func TestGetInitIsImmutable(t *testing.T) {
 	s := NewStore(clock.Real{})
 	mustInit(t, s, "1", Metadata{TargetDurationSecs: 1}, []byte{0x01, 0x02, 0x03}, testCap, testSegmentBytes, testBackwardBufferSize)
 
 	stream := s.Get("1")
 
 	// Two reads should produce identical results.
-	var buf1, buf2 bytes.Buffer
-	_, _ = stream.WriteInitDataForGenerationTo(&buf1, 0)
-	_, _ = stream.WriteInitDataForGenerationTo(&buf2, 0)
-	assert.Equal(t, buf1.Bytes(), buf2.Bytes(), "WriteInitDataForGenerationTo returned different results on successive calls")
+	got1, ok1 := stream.GetInit(0)
+	got2, ok2 := stream.GetInit(0)
+	require.True(t, ok1)
+	require.True(t, ok2)
+	assert.Equal(t, got1, got2, "GetInit returned different results on successive calls")
 }
 
 func TestReInitOverwrites(t *testing.T) {
@@ -165,9 +165,9 @@ func TestReInitOverwrites(t *testing.T) {
 	require.NotNil(t, stream, "expected stream after re-init")
 
 	assert.Equal(t, 2000, stream.Metadata().Bandwidth)
-	var buf bytes.Buffer
-	_, _ = stream.WriteInitDataForGenerationTo(&buf, 0)
-	assert.Equal(t, []byte{0x02, 0x03}, buf.Bytes())
+	got, ok := stream.GetInit(0)
+	require.True(t, ok)
+	assert.Equal(t, []byte{0x02, 0x03}, got)
 }
 
 func TestMultipleStreams(t *testing.T) {
@@ -205,8 +205,7 @@ func TestConcurrentAccess(t *testing.T) {
 			stream := s.Get("50")
 			if stream != nil {
 				_ = stream.Metadata()
-				var buf bytes.Buffer
-				_, _ = stream.WriteInitDataForGenerationTo(&buf, 0)
+				_, _ = stream.GetInit(0)
 			}
 		}()
 	}
@@ -1639,13 +1638,12 @@ func TestStoreInit_NonZeroGeneration(t *testing.T) {
 	assert.Equal(t, int64(5), s.CurrentGeneration())
 
 	// Init data for gen 5 should be retrievable.
-	var buf bytes.Buffer
-	_, err = s.WriteInitDataForGenerationTo(&buf, 5)
-	require.NoError(t, err)
-	assert.Equal(t, []byte("init-gen5"), buf.Bytes())
+	initBytes, ok := s.GetInit(5)
+	require.True(t, ok)
+	assert.Equal(t, []byte("init-gen5"), initBytes)
 
 	// Gen 0 init entry should not exist.
-	_, ok := s.GetInitEntry(0)
+	_, ok = s.GetInit(0)
 	assert.False(t, ok, "gen 0 should not have an init entry")
 
 	// Segment at gen 4 → stale (< currentGeneration 5).
@@ -1745,18 +1743,18 @@ func TestEvictStaleInitEntries_BasicEviction(t *testing.T) {
 		require.NoError(t, commitSlotGen(t, s, i, []byte("d"), int64(5000+i*2000), 2000, 0))
 	}
 	// Gen 0 init should still be present.
-	_, ok := s.GetInitEntry(0)
+	_, ok := s.GetInit(0)
 	require.True(t, ok, "gen 0 init should exist while gen 0 segments are buffered")
 
 	// Advance to gen=1 at index 0 — drops all gen=0 segments at/after idx 0.
 	require.NoError(t, commitSlotGen(t, s, 0, []byte("n"), 5000, 2000, 1))
 
 	// Gen 0 init should now be evicted (no gen 0 segments remain).
-	_, ok = s.GetInitEntry(0)
+	_, ok = s.GetInit(0)
 	assert.False(t, ok, "gen 0 init should be evicted")
 
 	// Gen 1 init remains.
-	_, ok = s.GetInitEntry(1)
+	_, ok = s.GetInit(1)
 	assert.True(t, ok, "gen 1 init should still exist")
 }
 
@@ -1782,7 +1780,7 @@ func TestEvictStaleInitEntries_RetainedWhileSegmentsExist(t *testing.T) {
 	// Advance to gen=1 at index 3 — gen=0 segments at 0-2 remain (before insertion point).
 	require.NoError(t, commitSlotGen(t, s, 3, []byte("n"), 11000, 2000, 1))
 
-	_, ok := s.GetInitEntry(0)
+	_, ok := s.GetInit(0)
 	assert.True(t, ok, "gen 0 init should be retained while gen 0 segments exist in buffer")
 
 	// Advance clock so all gen 0 segments are in the past and push gen=1
@@ -1794,7 +1792,7 @@ func TestEvictStaleInitEntries_RetainedWhileSegmentsExist(t *testing.T) {
 
 	// Gen 0 segments should have been evicted by time-based eviction.
 	// Gen 0 init should now be gone.
-	_, ok = s.GetInitEntry(0)
+	_, ok = s.GetInit(0)
 	assert.False(t, ok, "gen 0 init should be evicted after all gen 0 segments are evicted")
 }
 
@@ -1818,7 +1816,7 @@ func TestEvictStaleInitEntries_CurrentGenerationRetained(t *testing.T) {
 
 	// Gen 1 is current generation — init must be retained even if the first
 	// gen=1 segment was evicted.
-	_, ok := s.GetInitEntry(1)
+	_, ok := s.GetInit(1)
 	assert.True(t, ok, "current generation init must never be evicted")
 }
 
@@ -1839,11 +1837,11 @@ func TestEvictStaleInitEntries_MultipleGenerations(t *testing.T) {
 	require.NoError(t, commitSlotGen(t, s, 0, []byte("d"), 5000, 2000, 2))
 
 	// Only gen=2 segment remains. Both gen 0 and gen 1 inits should be evicted.
-	_, ok := s.GetInitEntry(0)
+	_, ok := s.GetInit(0)
 	assert.False(t, ok, "gen 0 init should be evicted")
-	_, ok = s.GetInitEntry(1)
+	_, ok = s.GetInit(1)
 	assert.False(t, ok, "gen 1 init should be evicted")
-	_, ok = s.GetInitEntry(2)
+	_, ok = s.GetInit(2)
 	assert.True(t, ok, "gen 2 init should be retained (current)")
 }
 
@@ -1859,6 +1857,6 @@ func TestEvictStaleInitEntries_SingleGeneration_NoOp(t *testing.T) {
 		require.NoError(t, commitSlotGen(t, s, i, []byte("d"), int64(5000+i*2000), 2000, 0))
 	}
 
-	_, ok := s.GetInitEntry(0)
+	_, ok := s.GetInit(0)
 	assert.True(t, ok, "single generation init should never be evicted")
 }

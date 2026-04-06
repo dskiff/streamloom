@@ -4,7 +4,6 @@ package stream
 import (
 	"errors"
 	"fmt"
-	"io"
 	"math"
 	"slices"
 	"sort"
@@ -117,12 +116,10 @@ type Metadata struct {
 	TargetDurationSecs int     // EXT-X-TARGETDURATION value (seconds)
 }
 
-// InitEntry holds the init segment data for a single encoding generation.
-// InitData is cloned on creation and must not be modified by callers.
-// Treat it as read-only; mutating the slice will corrupt shared state and
-// race with concurrent readers.
-type InitEntry struct {
-	InitData []byte
+// initEntry holds the init segment data for a single encoding generation.
+// initData is cloned on creation and must not be modified.
+type initEntry struct {
+	initData []byte
 }
 
 // Stream holds the complete in-memory state for a single HLS stream.
@@ -135,7 +132,7 @@ type Stream struct {
 	// Entries are added via Init (first generation) and AddInitEntry (subsequent).
 	// Stale entries are evicted during CommitSlot when their generation is below
 	// currentGeneration and no buffered segments reference them.
-	initEntries map[int64]*InitEntry
+	initEntries map[int64]*initEntry
 
 	segments          []Slot // sorted by Index
 	segmentCap        int    // maximum number of segments
@@ -235,38 +232,17 @@ func (s *Stream) CachedPlaylist() string {
 	return *p
 }
 
-// GetInitEntry returns the init entry for the given generation, or nil and false
-// if no init has been pushed for that generation. The returned InitEntry is
-// shared state; callers must not modify its InitData slice.
-func (s *Stream) GetInitEntry(generation int64) (*InitEntry, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	e, ok := s.initEntries[generation]
-	return e, ok
-}
-
-// InitDataLenForGeneration returns the byte length of the init segment for the
-// given generation, or 0 if the generation has no init entry.
-func (s *Stream) InitDataLenForGeneration(generation int64) int {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if e, ok := s.initEntries[generation]; ok {
-		return len(e.InitData)
-	}
-	return 0
-}
-
-// WriteInitDataForGenerationTo writes the init segment bytes for the given
-// generation to w under a read lock. Returns 0 and ErrMissingInitForGeneration
-// if the generation has no init entry.
-func (s *Stream) WriteInitDataForGenerationTo(w io.Writer, generation int64) (int, error) {
+// GetInit returns the init segment bytes for the given generation, or nil and
+// false if no init has been pushed for that generation. The returned slice is
+// shared state; callers must not modify it.
+func (s *Stream) GetInit(generation int64) ([]byte, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	e, ok := s.initEntries[generation]
 	if !ok {
-		return 0, ErrMissingInitForGeneration
+		return nil, false
 	}
-	return w.Write(e.InitData)
+	return e.initData, true
 }
 
 // CurrentGeneration returns the stream's current generation value.
@@ -596,8 +572,8 @@ func (s *Store) Init(id string, meta Metadata, initData []byte, generation int64
 	st := &Stream{
 		clock:    s.clock,
 		metadata: meta,
-		initEntries: map[int64]*InitEntry{
-			generation: {InitData: cloned},
+		initEntries: map[int64]*initEntry{
+			generation: {initData: cloned},
 		},
 		segments:              make([]Slot, 0, segmentCapacity),
 		segmentCap:            segmentCapacity,
@@ -657,7 +633,7 @@ func (s *Stream) AddInitEntry(generation int64, initData []byte) error {
 
 	cloned := make([]byte, len(initData))
 	copy(cloned, initData)
-	s.initEntries[generation] = &InitEntry{InitData: cloned}
+	s.initEntries[generation] = &initEntry{initData: cloned}
 	return nil
 }
 

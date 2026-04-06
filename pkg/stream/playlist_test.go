@@ -650,9 +650,9 @@ func TestAddInitEntry_ClonesData(t *testing.T) {
 	// Mutate the caller's slice.
 	data[0] = 0xFF
 
-	entry, ok := s.GetInitEntry(1)
+	got, ok := s.GetInit(1)
 	require.True(t, ok)
-	assert.Equal(t, byte(0x01), entry.InitData[0], "AddInitEntry should clone input")
+	assert.Equal(t, byte(0x01), got[0], "AddInitEntry should clone input")
 }
 
 // --- Renderer notify tests ---
