@@ -173,12 +173,13 @@ func TestGetInitMP4_EvictedGeneration_Returns404(t *testing.T) {
 	s := store.Get("1")
 	require.NotNil(t, s)
 
-	// Add gen=1 init and push gen=0 segment.
+	// Add gen=1 init and push gen=0 segment at a high index.
 	require.NoError(t, s.AddInitEntry(1, []byte("init1")))
-	commitSegmentGen(t, s, 0, []byte("d"), 5000, 0)
+	commitSegmentGen(t, s, 10, []byte("d"), 5000, 0)
 
-	// Advance to gen=1 at index 0 — drops gen=0 segment, triggers init eviction.
-	commitSegmentGen(t, s, 0, []byte("n"), 5000, 1)
+	// Advance to gen=1 at index 1 — gen=0 segment (idx10) is at/after the
+	// insertion point and gets dropped, triggering init eviction.
+	commitSegmentGen(t, s, 1, []byte("n"), 3000, 1)
 
 	// Gen 0 init should be evicted — HTTP request should return 404.
 	req := httptest.NewRequest(http.MethodGet, "/stream/1/init_0.mp4", nil)
