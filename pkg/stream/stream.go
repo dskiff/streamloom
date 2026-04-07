@@ -139,9 +139,11 @@ type Stream struct {
 	currentGeneration int64  // latest generation seen; segments from older generations are dropped
 	bufPool           *pool.BufferPool
 
-	// backwardBufferSize is the maximum number of past (played) segments to
-	// retain. On each CommitSlot call, segments older than "now" are counted
-	// and the oldest are evicted until the backward count is within this limit.
+	// backwardBufferSize is the maximum number of backward segments to
+	// retain. A segment is "backward" when its Timestamp is before the
+	// current wall-clock time, regardless of whether it has appeared in a
+	// playlist. On each CommitSlot call, backward segments are counted and
+	// the oldest are evicted until the backward count is within this limit.
 	backwardBufferSize int
 
 	// totalSegmentCount is the total number of segments ever added to this stream.
@@ -258,7 +260,9 @@ func (s *Stream) CurrentGeneration() int64 {
 //
 // After CommitSlot's pre-drop ordering and duplicate checks, segments
 // reaching this function are stale future segments that have never appeared
-// in a playlist. If a segment has active readers (extremely unlikely for
+// in a playlist (assuming a monotonic clock; a backward clock adjustment
+// could cause a previously-future segment to appear in a playlist before
+// being dropped here). If a segment has active readers (extremely unlikely for
 // unreferenced future segments), it is retained rather than dropped,
 // matching evictOldLocked's pattern.
 //
