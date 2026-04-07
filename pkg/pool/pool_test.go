@@ -275,3 +275,36 @@ func TestBufferSlotReadFromEmpty(t *testing.T) {
 	assert.Equal(t, int64(0), n)
 	assert.Equal(t, 0, slot.Len())
 }
+
+func TestBufferSlotWriteToEmpty(t *testing.T) {
+	// WriteTo on a freshly acquired slot (Len()==0) should write 0 bytes.
+	p := NewBufferPool(1, 64)
+	slot, ok := p.Get()
+	require.True(t, ok)
+
+	var buf bytes.Buffer
+	n, err := slot.WriteTo(&buf)
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), n)
+	assert.Empty(t, buf.Bytes())
+}
+
+func TestBufferSlotReadFromTwice(t *testing.T) {
+	// A second ReadFrom should overwrite the first read's data.
+	p := NewBufferPool(1, 64)
+	slot, ok := p.Get()
+	require.True(t, ok)
+
+	_, err := slot.ReadFrom(bytes.NewReader([]byte("first")))
+	require.NoError(t, err)
+	assert.Equal(t, 5, slot.Len())
+
+	_, err = slot.ReadFrom(bytes.NewReader([]byte("second-longer")))
+	require.NoError(t, err)
+	assert.Equal(t, len("second-longer"), slot.Len())
+
+	var buf bytes.Buffer
+	_, err = slot.WriteTo(&buf)
+	require.NoError(t, err)
+	assert.Equal(t, []byte("second-longer"), buf.Bytes())
+}
