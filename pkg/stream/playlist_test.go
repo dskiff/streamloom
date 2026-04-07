@@ -13,10 +13,11 @@ import (
 )
 
 // setupStreamForPlaylist creates a Store, initializes a stream with the given
-// target duration, and returns the Store and Stream. The clock is fixed to
-// time zero (so all segment timestamps are in the future and CommitSlot accepts
-// them). Use renderMediaPlaylist with a custom nowMs for filtering.
-func setupStreamForPlaylist(t *testing.T, targetDurationSecs int) (*Store, *Stream) {
+// target duration, and returns the Store, Stream, and mock clock. The clock
+// starts at time zero. Tests that advance the generation should advance the
+// clock past existing segment timestamps first, so old-generation segments
+// are not dropped as stale future segments.
+func setupStreamForPlaylist(t *testing.T, targetDurationSecs int) (*Store, *Stream, *clock.Mock) {
 	t.Helper()
 
 	clk := clock.NewMock(time.UnixMilli(0))
@@ -39,12 +40,12 @@ func setupStreamForPlaylist(t *testing.T, targetDurationSecs int) (*Store, *Stre
 		store.Delete("1")
 	})
 
-	return store, s
+	return store, s, clk
 }
 
 func TestRenderMediaPlaylist_BasicWindow(t *testing.T) {
 	// 5 segments, all eligible at nowMs=20000. Window=12 so all fit.
-	_, s := setupStreamForPlaylist(t, 2)
+	_, s, _ := setupStreamForPlaylist(t, 2)
 
 	for i := range uint32(5) {
 		mustCommitSlot(t, s, i, []byte("data"), int64(i)*2000, 2000)
@@ -71,7 +72,7 @@ func TestRenderMediaPlaylist_BasicWindow(t *testing.T) {
 
 func TestRenderMediaPlaylist_SlidingWindow(t *testing.T) {
 	// 15 segments, window=5. Only the last 5 should appear.
-	_, s := setupStreamForPlaylist(t, 2)
+	_, s, _ := setupStreamForPlaylist(t, 2)
 
 	for i := range uint32(15) {
 		mustCommitSlot(t, s, i, []byte("data"), int64(i)*2000, 2000)
@@ -96,7 +97,7 @@ func TestRenderMediaPlaylist_SlidingWindow(t *testing.T) {
 
 func TestRenderMediaPlaylist_NoEligibleSegments(t *testing.T) {
 	// All segments are in the future relative to nowMs=0.
-	_, s := setupStreamForPlaylist(t, 2)
+	_, s, _ := setupStreamForPlaylist(t, 2)
 
 	mustCommitSlot(t, s, 0, []byte("data"), 5000, 2000)
 
@@ -109,7 +110,7 @@ func TestRenderMediaPlaylist_NoEligibleSegments(t *testing.T) {
 }
 
 func TestRenderMediaPlaylist_EmptyStream(t *testing.T) {
-	_, s := setupStreamForPlaylist(t, 2)
+	_, s, _ := setupStreamForPlaylist(t, 2)
 
 	s.mu.RLock()
 	playlist, nextMs := s.renderMediaPlaylist(1000, 12)
@@ -120,7 +121,7 @@ func TestRenderMediaPlaylist_EmptyStream(t *testing.T) {
 }
 
 func TestRenderMediaPlaylist_SingleSegment(t *testing.T) {
-	_, s := setupStreamForPlaylist(t, 4)
+	_, s, _ := setupStreamForPlaylist(t, 4)
 
 	mustCommitSlot(t, s, 42, []byte("data"), 5000, 4000)
 
@@ -136,7 +137,7 @@ func TestRenderMediaPlaylist_SingleSegment(t *testing.T) {
 }
 
 func TestRenderMediaPlaylist_NonZeroStartingIndex(t *testing.T) {
-	_, s := setupStreamForPlaylist(t, 2)
+	_, s, _ := setupStreamForPlaylist(t, 2)
 
 	// Indices starting at 100.
 	for i := uint32(100); i < 105; i++ {
@@ -151,7 +152,7 @@ func TestRenderMediaPlaylist_NonZeroStartingIndex(t *testing.T) {
 }
 
 func TestRenderMediaPlaylist_DurationFormatting(t *testing.T) {
-	_, s := setupStreamForPlaylist(t, 3)
+	_, s, _ := setupStreamForPlaylist(t, 3)
 
 	// Various durations in ms.
 	mustCommitSlot(t, s, 0, []byte("d"), 0, 2000)    // 2.000
@@ -171,7 +172,7 @@ func TestRenderMediaPlaylist_DurationFormatting(t *testing.T) {
 
 func TestRenderMediaPlaylist_TimestampFormat(t *testing.T) {
 	// Unix ms 1700000000000 = 2023-11-14T22:13:20.000Z
-	_, s := setupStreamForPlaylist(t, 2)
+	_, s, _ := setupStreamForPlaylist(t, 2)
 
 	mustCommitSlot(t, s, 0, []byte("d"), 1700000000000, 2000)
 
@@ -184,7 +185,7 @@ func TestRenderMediaPlaylist_TimestampFormat(t *testing.T) {
 
 func TestRenderMediaPlaylist_WallClockFiltering(t *testing.T) {
 	// Mix of past and future segments relative to nowMs=10000.
-	_, s := setupStreamForPlaylist(t, 2)
+	_, s, _ := setupStreamForPlaylist(t, 2)
 
 	mustCommitSlot(t, s, 0, []byte("d"), 2000, 2000)  // eligible
 	mustCommitSlot(t, s, 1, []byte("d"), 4000, 2000)  // eligible
@@ -208,7 +209,7 @@ func TestRenderMediaPlaylist_WallClockFiltering(t *testing.T) {
 }
 
 func TestRenderMediaPlaylist_NextEligibleMs(t *testing.T) {
-	_, s := setupStreamForPlaylist(t, 2)
+	_, s, _ := setupStreamForPlaylist(t, 2)
 
 	mustCommitSlot(t, s, 0, []byte("d"), 1000, 2000)
 	mustCommitSlot(t, s, 1, []byte("d"), 5000, 2000)
@@ -225,7 +226,7 @@ func TestRenderMediaPlaylist_NextEligibleMs(t *testing.T) {
 // --- Discontinuity tests ---
 
 func TestRenderMediaPlaylist_SingleGeneration_NoDiscontinuity(t *testing.T) {
-	_, s := setupStreamForPlaylist(t, 2)
+	_, s, _ := setupStreamForPlaylist(t, 2)
 
 	for i := range uint32(3) {
 		mustCommitSlot(t, s, i, []byte("d"), int64(i)*2000, 2000)
@@ -245,13 +246,16 @@ func TestRenderMediaPlaylist_SingleGeneration_NoDiscontinuity(t *testing.T) {
 }
 
 func TestRenderMediaPlaylist_TwoGenerations_Discontinuity(t *testing.T) {
-	_, s := setupStreamForPlaylist(t, 2)
+	_, s, clk := setupStreamForPlaylist(t, 2)
 
 	require.NoError(t, s.AddInitEntry(1, []byte("init1")))
 
 	// Gen 0 segments.
 	mustCommitSlot(t, s, 0, []byte("d"), 0, 2000)
 	mustCommitSlot(t, s, 1, []byte("d"), 2000, 2000)
+
+	// Advance clock past gen=0 segments so they survive the future sweep.
+	clk.Set(time.UnixMilli(3000))
 
 	// Gen 1 segments (advances currentGeneration).
 	err := commitSlotGen(t, s, 2, []byte("d"), 4000, 2000, 1)
@@ -278,14 +282,17 @@ func TestRenderMediaPlaylist_TwoGenerations_Discontinuity(t *testing.T) {
 }
 
 func TestRenderMediaPlaylist_ThreeGenerations(t *testing.T) {
-	_, s := setupStreamForPlaylist(t, 2)
+	_, s, clk := setupStreamForPlaylist(t, 2)
 
 	require.NoError(t, s.AddInitEntry(1, []byte("init1")))
 	require.NoError(t, s.AddInitEntry(2, []byte("init2")))
 
 	mustCommitSlot(t, s, 0, []byte("d"), 0, 2000)
+	// Advance clock before each gen advance so old segments are past.
+	clk.Set(time.UnixMilli(1000))
 	err := commitSlotGen(t, s, 1, []byte("d"), 2000, 2000, 1)
 	require.NoError(t, err)
+	clk.Set(time.UnixMilli(3000))
 	err = commitSlotGen(t, s, 2, []byte("d"), 4000, 2000, 2)
 	require.NoError(t, err)
 
@@ -323,6 +330,9 @@ func TestRenderMediaPlaylist_DiscontinuitySequence_AfterEviction(t *testing.T) {
 	mustCommitSlot(t, s, 0, []byte("d"), 1000, 2000)
 	mustCommitSlot(t, s, 1, []byte("d"), 3000, 2000)
 	mustCommitSlot(t, s, 2, []byte("d"), 5000, 2000)
+
+	// Advance clock past gen=0 segments so they survive the future sweep.
+	clk.Set(time.UnixMilli(6000))
 
 	// Push gen=1 segments at 7000, 9000.
 	err = commitSlotGen(t, s, 3, []byte("d"), 7000, 2000, 1)
@@ -373,6 +383,9 @@ func TestRenderMediaPlaylist_DiscontinuitySequence_AllPreWindowEvicted(t *testin
 	// Push 2 gen=0 segments.
 	mustCommitSlot(t, s, 0, []byte("d"), 1000, 2000)
 	mustCommitSlot(t, s, 1, []byte("d"), 3000, 2000)
+
+	// Advance clock past gen=0 so they survive the future sweep.
+	clk.Set(time.UnixMilli(4000))
 
 	// Push 3 gen=1 segments.
 	require.NoError(t, commitSlotGen(t, s, 2, []byte("d"), 5000, 2000, 1))
@@ -436,6 +449,9 @@ func TestRenderMediaPlaylist_DiscontinuitySequence_EvictedBoundaryAtStartZero(t 
 	// Push 1 gen=0 segment.
 	mustCommitSlot(t, s, 0, []byte("d"), 1000, 2000)
 
+	// Advance clock past gen=0 so it survives the future sweep.
+	clk.Set(time.UnixMilli(2000))
+
 	// Push 2 gen=1 segments.
 	require.NoError(t, commitSlotGen(t, s, 1, []byte("d"), 3000, 2000, 1))
 	require.NoError(t, commitSlotGen(t, s, 2, []byte("d"), 5000, 2000, 1))
@@ -457,6 +473,8 @@ func TestRenderMediaPlaylist_DiscontinuitySequence_EvictedBoundaryAtStartZero(t 
 	require.NoError(t, commitSlotGen(t, s, 4, []byte("d"), 9000, 2000, 1))
 
 	require.NoError(t, s.AddInitEntry(2, []byte("init2")))
+	// Advance clock past gen=1 segments so they survive the gen=2 future sweep.
+	clk.Set(time.UnixMilli(10000))
 	require.NoError(t, commitSlotGen(t, s, 5, []byte("d"), 11000, 2000, 2))
 
 	// Now advance and evict so the gen1→gen2 boundary is at start==0.
@@ -480,13 +498,15 @@ func TestRenderMediaPlaylist_DiscontinuitySequence_WindowBoundary(t *testing.T) 
 	// Regression test: when windowing (not eviction) pushes a generation
 	// transition out of the playlist window, the transition at
 	// segments[start-1] → segments[start] must be counted.
-	_, s := setupStreamForPlaylist(t, 2)
+	_, s, clk := setupStreamForPlaylist(t, 2)
 
 	require.NoError(t, s.AddInitEntry(1, []byte("init1")))
 
 	// Push 2 gen=0 segments, then 2 gen=1 segments.
 	mustCommitSlot(t, s, 0, []byte("d"), 0, 2000)
 	mustCommitSlot(t, s, 1, []byte("d"), 2000, 2000)
+	// Advance clock so gen=0 segments survive the future sweep.
+	clk.Set(time.UnixMilli(3000))
 	require.NoError(t, commitSlotGen(t, s, 2, []byte("d"), 4000, 2000, 1))
 	require.NoError(t, commitSlotGen(t, s, 3, []byte("d"), 6000, 2000, 1))
 
@@ -506,14 +526,16 @@ func TestRenderMediaPlaylist_DiscontinuitySequence_WindowBoundary(t *testing.T) 
 
 func TestRenderMediaPlaylist_DiscontinuitySequence_WindowBoundaryMultiple(t *testing.T) {
 	// Multiple transitions scroll out via windowing alone (no eviction).
-	_, s := setupStreamForPlaylist(t, 2)
+	_, s, clk := setupStreamForPlaylist(t, 2)
 
 	require.NoError(t, s.AddInitEntry(1, []byte("init1")))
 	require.NoError(t, s.AddInitEntry(2, []byte("init2")))
 
 	// gen=0, gen=1, gen=2, gen=2 — window=2 shows only the last 2 (gen=2).
 	mustCommitSlot(t, s, 0, []byte("d"), 0, 2000)
+	clk.Set(time.UnixMilli(1000))
 	require.NoError(t, commitSlotGen(t, s, 1, []byte("d"), 2000, 2000, 1))
+	clk.Set(time.UnixMilli(3000))
 	require.NoError(t, commitSlotGen(t, s, 2, []byte("d"), 4000, 2000, 2))
 	require.NoError(t, commitSlotGen(t, s, 3, []byte("d"), 6000, 2000, 2))
 
@@ -531,7 +553,16 @@ func TestRenderMediaPlaylist_SkippedGeneration(t *testing.T) {
 	// gen 0 and gen 2 (gen 1 is skipped). The playlist should show a
 	// discontinuity between gen 0 and gen 2, and MAP should reference
 	// init_2.mp4 (not init_1.mp4).
-	_, s := setupStreamForPlaylist(t, 2)
+	clk := clock.NewMock(time.UnixMilli(0))
+	store := NewStore(clk)
+	meta := Metadata{
+		Bandwidth: 4000000, Codecs: "avc1.64001f",
+		Width: 1920, Height: 1080, FrameRate: 23.976, TargetDurationSecs: 2,
+	}
+	err := store.Init("1", meta, []byte("init"), 0, 50, testSegmentBytes, 20, 5, 12)
+	require.NoError(t, err)
+	t.Cleanup(func() { store.Delete("1") })
+	s := store.Get("1")
 
 	require.NoError(t, s.AddInitEntry(1, []byte("init1")))
 	require.NoError(t, s.AddInitEntry(2, []byte("init2")))
@@ -539,6 +570,10 @@ func TestRenderMediaPlaylist_SkippedGeneration(t *testing.T) {
 	// Gen 0 segments.
 	mustCommitSlot(t, s, 0, []byte("d"), 0, 2000)
 	mustCommitSlot(t, s, 1, []byte("d"), 2000, 2000)
+
+	// Advance clock past gen=0 segments so they are not dropped as future
+	// stale during generation advance.
+	clk.Set(time.UnixMilli(3000))
 
 	// Skip gen 1 entirely — go straight to gen 2.
 	require.NoError(t, commitSlotGen(t, s, 2, []byte("d"), 4000, 2000, 2))
@@ -566,7 +601,7 @@ func TestRenderMediaPlaylist_SkippedGeneration(t *testing.T) {
 
 func TestRenderMediaPlaylist_DiscontinuityOrder(t *testing.T) {
 	// Verify the exact ordering: DISCONTINUITY comes before MAP for new generation.
-	_, s := setupStreamForPlaylist(t, 2)
+	_, s, _ := setupStreamForPlaylist(t, 2)
 
 	require.NoError(t, s.AddInitEntry(1, []byte("init1")))
 

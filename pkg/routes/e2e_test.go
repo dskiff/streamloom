@@ -132,7 +132,11 @@ func TestE2E_DiscontinuityFlow(t *testing.T) {
 	rec = postInitForGeneration(apiRouter, "1", "test-token", "1", []byte("init-gen1"))
 	require.Equal(t, http.StatusCreated, rec.Code)
 
-	// 4. Push gen=1 segment.
+	// 4. Advance clock past gen=0 segments so they survive the future sweep
+	// on generation advance.
+	clk.Set(time.UnixMilli(8000))
+
+	// Push gen=1 segment.
 	rec = postSegmentWithGen(apiRouter, "1", "test-token", "2", "9000", "2000", "1", []byte("seg2"))
 	require.Equal(t, http.StatusCreated, rec.Code)
 
@@ -285,6 +289,9 @@ func TestE2E_DiscontinuitySequenceIncrements(t *testing.T) {
 		_, _ = buf.ReadFrom(bytes.NewReader([]byte("seg")))
 		require.NoError(t, s.CommitSlot(i, buf, int64(1000+i*2000), 2000, 0))
 	}
+
+	// Advance clock past gen=0 segments so they survive the future sweep.
+	clk.Set(time.UnixMilli(6000))
 
 	// Push gen=1 segments at indices 3-5, timestamps 7000,9000,11000.
 	for i := uint32(3); i < 6; i++ {

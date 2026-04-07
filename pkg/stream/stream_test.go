@@ -1421,7 +1421,8 @@ func TestCommitSlot_GenerationAdvance_DropsStaleSegments(t *testing.T) {
 
 	require.NoError(t, s.AddInitEntry(1, []byte("init1")))
 
-	// Push 5 gen=0 segments at even indices to leave gaps for gen=1.
+	// Push 5 gen=0 segments. All have timestamps > now (0), so they are
+	// future segments that have never appeared in a playlist.
 	for i := uint32(0); i < 5; i++ {
 		err := commitSlotGen(t, s, i*2, []byte("data"), int64(5000+i*2000), 2000, 0)
 		require.NoError(t, err)
@@ -1429,25 +1430,17 @@ func TestCommitSlot_GenerationAdvance_DropsStaleSegments(t *testing.T) {
 	segCount, _ := s.SegmentLoad()
 	assert.Equal(t, 5, segCount)
 
-	// Push gen=1 at index=3 (gap between idx2 and idx4). Timestamp must be
-	// between idx2's ts (7000) and idx4's ts (9000) so the ordering check
-	// passes. Stale segments at/after the insertion point get dropped.
+	// Push gen=1. On generation advance, ALL gen=0 future segments are dropped.
 	err := commitSlotGen(t, s, 3, []byte("new"), 8000, 2000, 1)
 	require.NoError(t, err)
 
 	segCount, _ = s.SegmentLoad()
-	assert.Equal(t, 3, segCount) // idx0,idx2 (gen=0) + idx3 (gen=1)
+	assert.Equal(t, 1, segCount) // only idx3 (gen=1)
 
-	// Old indices 4,6,8 should be gone.
-	for _, idx := range []uint32{4, 6, 8} {
+	// All gen=0 indices should be gone (they were future stale segments).
+	for _, idx := range []uint32{0, 2, 4, 6, 8} {
 		_, err = readSegment(s, idx)
 		assert.ErrorIs(t, err, ErrSegmentNotFound, "index %d should be dropped", idx)
-	}
-
-	// Indices 0,2 should still be readable.
-	for _, idx := range []uint32{0, 2} {
-		_, err = readSegment(s, idx)
-		assert.NoError(t, err, "index %d should be readable", idx)
 	}
 }
 
@@ -1480,7 +1473,7 @@ func TestCommitSlot_GenerationDropFreesCapacity(t *testing.T) {
 
 	require.NoError(t, s.AddInitEntry(1, []byte("init1")))
 
-	// Fill to capacity with gen=0 at even indices.
+	// Fill to capacity with gen=0. All timestamps > now (0).
 	for i := uint32(0); i < 5; i++ {
 		err := commitSlotGen(t, s, i*2, []byte("data"), int64(5000+i*2000), 2000, 0)
 		require.NoError(t, err)
@@ -1490,13 +1483,12 @@ func TestCommitSlot_GenerationDropFreesCapacity(t *testing.T) {
 	err = commitSlotGen(t, s, 10, []byte("data"), 15000, 2000, 0)
 	assert.ErrorIs(t, err, ErrBufferFull)
 
-	// A gen=1 insert at index 3 (gap) drops idx4,6,8 → frees 3 slots.
-	// Timestamp must be between idx2's (7000) and idx4's (9000).
+	// Gen=1 advance drops ALL gen=0 future segments, freeing capacity.
 	err = commitSlotGen(t, s, 3, []byte("new"), 8000, 2000, 1)
 	require.NoError(t, err)
 
 	segCount, _ := s.SegmentLoad()
-	assert.Equal(t, 3, segCount) // idx0,idx2 (gen=0) + idx3 (gen=1)
+	assert.Equal(t, 1, segCount) // only idx3 (gen=1)
 }
 
 func TestCommitSlot_GenerationAdvanceThenContinue(t *testing.T) {
@@ -1508,14 +1500,13 @@ func TestCommitSlot_GenerationAdvanceThenContinue(t *testing.T) {
 
 	require.NoError(t, s.AddInitEntry(1, []byte("init1")))
 
-	// Push gen=0 at even indices.
+	// Push gen=0 segments. All have timestamps > now (0).
 	for i := uint32(0); i < 3; i++ {
 		err := commitSlotGen(t, s, i*2, []byte("data"), int64(5000+i*2000), 2000, 0)
 		require.NoError(t, err)
 	}
 
-	// Advance to gen=1 at index 3 (gap between idx2/ts=7000 and idx4/ts=9000).
-	// Drops idx4 (gen=0, stale).
+	// Advance to gen=1 — all gen=0 future segments are dropped.
 	err := commitSlotGen(t, s, 3, []byte("new"), 8000, 2000, 1)
 	require.NoError(t, err)
 
@@ -1526,14 +1517,12 @@ func TestCommitSlot_GenerationAdvanceThenContinue(t *testing.T) {
 	require.NoError(t, err)
 
 	segCount, _ := s.SegmentLoad()
-	assert.Equal(t, 5, segCount) // idx0,idx2 (gen=0) + idx3,idx5,idx7 (gen=1)
+	assert.Equal(t, 3, segCount) // idx3,idx5,idx7 (gen=1 only)
 }
 
-func TestCommitSlot_SameGenDropsStaleOnSubsequentInsert(t *testing.T) {
-	// Scenario: 10 gen=0 segments at even indices, then gen=1 at index 17
-	// (drops idx18), then gen=1 at index 9 (must still drop stale gen=0
-	// segments at indices 10,12,14,16 even though generation did not
-	// advance on this call).
+func TestCommitSlot_GenerationAdvance_DropsAllFutureStale(t *testing.T) {
+	// All gen=0 future segments are dropped on generation advance,
+	// regardless of their position relative to the new segment.
 	clk := clock.NewMock(time.UnixMilli(0))
 	store := NewStore(clk)
 	meta := Metadata{Bandwidth: 1, Codecs: "avc1.64001f", Width: 1, Height: 1, FrameRate: 30, TargetDurationSecs: 2}
@@ -1542,7 +1531,7 @@ func TestCommitSlot_SameGenDropsStaleOnSubsequentInsert(t *testing.T) {
 
 	require.NoError(t, s.AddInitEntry(1, []byte("init1")))
 
-	// Push 10 gen=0 segments at even indices (0,2,4,...,18).
+	// Push 10 gen=0 segments. All have timestamps > now (0).
 	for i := uint32(0); i < 10; i++ {
 		err := commitSlotGen(t, s, i*2, []byte("data"), int64(5000+i*2000), 2000, 0)
 		require.NoError(t, err)
@@ -1550,40 +1539,29 @@ func TestCommitSlot_SameGenDropsStaleOnSubsequentInsert(t *testing.T) {
 	segCount, _ := s.SegmentLoad()
 	require.Equal(t, 10, segCount)
 
-	// Advance to gen=1 at index 17 (gap between idx16/ts=21000 and idx18/ts=23000).
-	// Only idx18 (gen=0) is at/after the insertion point, so it gets dropped.
+	// Advance to gen=1. ALL gen=0 future segments are dropped.
 	err := commitSlotGen(t, s, 17, []byte("new17"), 22000, 2000, 1)
 	require.NoError(t, err)
 	segCount, _ = s.SegmentLoad()
-	assert.Equal(t, 10, segCount) // idx0-16 even (gen=0) + idx17 (gen=1)
+	assert.Equal(t, 1, segCount) // only idx17 (gen=1)
 
-	// Now push gen=1 at index 9 (gap between idx8/ts=13000 and idx10/ts=15000).
-	// Generation is NOT advancing (already 1), but stale gen=0 segments at
-	// indices 10,12,14,16 must still be dropped.
-	err = commitSlotGen(t, s, 9, []byte("new9"), 14000, 2000, 1)
+	// All gen=0 indices should be gone.
+	for i := uint32(0); i < 10; i++ {
+		_, err := readSegment(s, i*2)
+		assert.ErrorIs(t, err, ErrSegmentNotFound, "index %d should be dropped", i*2)
+	}
+
+	// Continue with gen=1 at any index.
+	err = commitSlotGen(t, s, 19, []byte("new19"), 24000, 2000, 1)
 	require.NoError(t, err)
-
 	segCount, _ = s.SegmentLoad()
-	assert.Equal(t, 7, segCount) // idx0,2,4,6,8 (gen=0) + idx9,17 (gen=1)
-
-	// Verify stale indices are gone.
-	for _, idx := range []uint32{10, 12, 14, 16} {
-		_, err := readSegment(s, idx)
-		assert.ErrorIs(t, err, ErrSegmentNotFound, "index %d should be dropped", idx)
-	}
-
-	// Verify kept indices are readable.
-	for _, idx := range []uint32{0, 2, 4, 6, 8, 9, 17} {
-		_, err := readSegment(s, idx)
-		assert.NoError(t, err, "index %d should be readable", idx)
-	}
+	assert.Equal(t, 2, segCount)
 }
 
 func TestCommitSlot_SameIndexPastSegmentRejected(t *testing.T) {
 	// A generation advance that reuses the same index as a playlist-visible
-	// (past) segment must be rejected by the ordering check. Previously,
-	// dropStaleGenerationLocked would erase the segment before the ordering
-	// check could see it.
+	// (past) segment must be rejected by the ordering check. Past segments
+	// (timestamp <= now) are preserved across generation transitions.
 	clk := clock.NewMock(time.UnixMilli(0))
 	store := NewStore(clk)
 	meta := Metadata{Bandwidth: 1, Codecs: "avc1.64001f", Width: 1, Height: 1, FrameRate: 30, TargetDurationSecs: 2}
@@ -1614,8 +1592,9 @@ func TestCommitSlot_SameIndexPastSegmentRejected(t *testing.T) {
 	}
 }
 
-func TestCommitSlot_SameIndexFutureSegmentRejected(t *testing.T) {
-	// Defensively reject same-index reuse even for future stale segments.
+func TestCommitSlot_SameIndexFutureSegmentReplacedOnAdvance(t *testing.T) {
+	// A future stale segment is dropped on generation advance, freeing
+	// the index for reuse by the new generation.
 	clk := clock.NewMock(time.UnixMilli(0))
 	store := NewStore(clk)
 	meta := Metadata{Bandwidth: 1, Codecs: "avc1.64001f", Width: 1, Height: 1, FrameRate: 30, TargetDurationSecs: 2}
@@ -1624,23 +1603,23 @@ func TestCommitSlot_SameIndexFutureSegmentRejected(t *testing.T) {
 
 	require.NoError(t, s.AddInitEntry(1, []byte("init1")))
 
-	// Push gen=0 segment at idx=5.
+	// Push gen=0 segment at idx=5 with a future timestamp.
 	require.NoError(t, commitSlotGen(t, s, 5, []byte("d"), 10000, 2000, 0))
 
-	// Gen=1 at idx=5 with a lower ts (8000). Ordering check passes
-	// (10000 > 8000), but duplicate check catches it.
+	// Gen=1 at idx=5 with a lower ts (8000). The gen=0 future segment
+	// is dropped on generation advance, so the index is available.
 	err := commitSlotGen(t, s, 5, []byte("n"), 8000, 2000, 1)
-	assert.ErrorIs(t, err, ErrDuplicateIndex)
+	require.NoError(t, err)
 
-	// Original segment survives.
+	// New gen=1 data is served.
 	data, err := readSegment(s, 5)
 	assert.NoError(t, err)
-	assert.Equal(t, []byte("d"), data)
+	assert.Equal(t, []byte("n"), data)
 }
 
-func TestCommitSlot_StaleSegmentWithActiveReader_NosPanic(t *testing.T) {
-	// After the fix, dropStaleGenerationLocked retains stale segments with
-	// active readers instead of panicking.
+func TestCommitSlot_StaleSegmentWithActiveReader_NoPanic(t *testing.T) {
+	// dropStaleFutureSegmentsLocked retains stale segments with active
+	// readers instead of panicking on Put with non-zero reader count.
 	clk := clock.NewMock(time.UnixMilli(0))
 	store := NewStore(clk)
 	meta := Metadata{Bandwidth: 1, Codecs: "avc1.64001f", Width: 1, Height: 1, FrameRate: 30, TargetDurationSecs: 2}
@@ -1649,7 +1628,7 @@ func TestCommitSlot_StaleSegmentWithActiveReader_NosPanic(t *testing.T) {
 
 	require.NoError(t, s.AddInitEntry(1, []byte("init1")))
 
-	// Push gen=0 segments at even indices.
+	// Push gen=0 segments. All have timestamps > now (0).
 	for i := uint32(0); i < 3; i++ {
 		require.NoError(t, commitSlotGen(t, s, i*2, []byte("d"), int64(5000+i*2000), 2000, 0))
 	}
@@ -1668,12 +1647,20 @@ func TestCommitSlot_StaleSegmentWithActiveReader_NosPanic(t *testing.T) {
 	}()
 	<-readerStarted
 
-	// Gen=1 at idx3 (gap) — should NOT panic even though idx4 has a reader.
-	// idx4 is stale but retained due to active reader.
+	// Gen=1 advance drops future stale segments. idx4 has a reader and
+	// must be retained — should NOT panic.
 	assert.NotPanics(t, func() {
 		err := commitSlotGen(t, s, 3, []byte("n"), 8000, 2000, 1)
 		require.NoError(t, err)
 	})
+
+	// idx0 and idx2 (no readers) should be dropped; idx4 retained.
+	_, err := readSegment(s, 0)
+	assert.ErrorIs(t, err, ErrSegmentNotFound)
+	_, err = readSegment(s, 2)
+	assert.ErrorIs(t, err, ErrSegmentNotFound)
+	_, err = readSegment(s, 4)
+	assert.NoError(t, err, "idx4 should be retained due to active reader")
 
 	// Release the reader.
 	readerDone <- struct{}{}
@@ -1760,6 +1747,104 @@ func TestCommitSlot_ZeroGenerationStaleAfterAdvance(t *testing.T) {
 	assert.ErrorIs(t, err, ErrStaleGeneration)
 }
 
+func TestCommitSlot_GenerationAdvance_FutureSegmentsDropped_PastPreserved(t *testing.T) {
+	// Core test for the generation transition fix: when gen advances,
+	// old-gen future segments are dropped but old-gen past segments survive.
+	clk := clock.NewMock(time.UnixMilli(0))
+	store := NewStore(clk)
+	meta := Metadata{Bandwidth: 1, Codecs: "avc1.64001f", Width: 1, Height: 1, FrameRate: 30, TargetDurationSecs: 2}
+	mustInit(t, store, "s", meta, []byte("init0"), 20, testSegmentBytes, 10)
+	s := store.Get("s")
+
+	require.NoError(t, s.AddInitEntry(1, []byte("init1")))
+
+	// Push gen=0 segments while clock is at 0 (all future, accepted).
+	for i := uint32(0); i < 6; i++ {
+		require.NoError(t, commitSlotGen(t, s, i, []byte("d"), int64(1000+i*2000), 2000, 0))
+	}
+	segCount, _ := s.SegmentLoad()
+	require.Equal(t, 6, segCount)
+
+	// Advance clock to 5000. Now:
+	//   idx=0 ts=1000 (past), idx=1 ts=3000 (past), idx=2 ts=5000 (at now)
+	//   idx=3 ts=7000 (future), idx=4 ts=9000 (future), idx=5 ts=11000 (future)
+	clk.Set(time.UnixMilli(5000))
+
+	// Gen=1 at ts=6000. Previously this would fail with
+	// ErrTimestampOrderViolation because gen=0 future segments at ts=7000+
+	// blocked insertion. Now the future sweep drops them first.
+	err := commitSlotGen(t, s, 6, []byte("new"), 6000, 2000, 1)
+	require.NoError(t, err, "gen=1 should succeed after stale future segments are dropped")
+
+	// Past gen=0 segments (ts <= 5000) are preserved.
+	for _, idx := range []uint32{0, 1, 2} {
+		_, err := readSegment(s, idx)
+		assert.NoError(t, err, "past gen=0 segment idx=%d should survive", idx)
+	}
+
+	// Future gen=0 segments (ts > 5000) are dropped.
+	for _, idx := range []uint32{3, 4, 5} {
+		_, err := readSegment(s, idx)
+		assert.ErrorIs(t, err, ErrSegmentNotFound, "future gen=0 segment idx=%d should be dropped", idx)
+	}
+
+	// Gen=1 segment is present.
+	data, err := readSegment(s, 6)
+	assert.NoError(t, err)
+	assert.Equal(t, []byte("new"), data)
+
+	// Total: 3 past gen=0 + 1 gen=1 = 4 segments.
+	segCount, _ = s.SegmentLoad()
+	assert.Equal(t, 4, segCount)
+}
+
+func TestCommitSlot_GenerationAdvance_InitEvictedWhenAllSegmentsDropped(t *testing.T) {
+	// When all segments of a generation are future and get dropped on
+	// gen advance, the init entry for that generation should also be evicted.
+	clk := clock.NewMock(time.UnixMilli(0))
+	store := NewStore(clk)
+	meta := Metadata{Bandwidth: 1, Codecs: "avc1.64001f", Width: 1, Height: 1, FrameRate: 30, TargetDurationSecs: 2}
+	mustInit(t, store, "s", meta, []byte("init0"), 10, testSegmentBytes, 5)
+	s := store.Get("s")
+
+	require.NoError(t, s.AddInitEntry(1, []byte("init1")))
+
+	// All gen=0 segments are future (ts > 0).
+	require.NoError(t, commitSlotGen(t, s, 0, []byte("d"), 5000, 2000, 0))
+	require.NoError(t, commitSlotGen(t, s, 1, []byte("d"), 7000, 2000, 0))
+
+	_, ok := s.GetInit(0)
+	require.True(t, ok, "gen 0 init should exist")
+
+	// Gen=1 advance drops all gen=0 future segments. Init evicted too.
+	require.NoError(t, commitSlotGen(t, s, 2, []byte("n"), 9000, 2000, 1))
+
+	_, ok = s.GetInit(0)
+	assert.False(t, ok, "gen 0 init should be evicted (no gen 0 segments remain)")
+
+	_, ok = s.GetInit(1)
+	assert.True(t, ok, "gen 1 init should exist")
+}
+
+func TestCommitSlot_NoGenAdvance_NoFutureSweep(t *testing.T) {
+	// Same-gen commits should NOT trigger the future sweep.
+	clk := clock.NewMock(time.UnixMilli(0))
+	store := NewStore(clk)
+	meta := Metadata{Bandwidth: 1, Codecs: "avc1.64001f", Width: 1, Height: 1, FrameRate: 30, TargetDurationSecs: 2}
+	mustInit(t, store, "s", meta, []byte("init0"), 10, testSegmentBytes, 5)
+	s := store.Get("s")
+
+	// Push gen=0 future segments.
+	require.NoError(t, commitSlotGen(t, s, 0, []byte("d"), 5000, 2000, 0))
+	require.NoError(t, commitSlotGen(t, s, 1, []byte("d"), 7000, 2000, 0))
+
+	// Same-gen push — no sweep, all segments preserved.
+	require.NoError(t, commitSlotGen(t, s, 2, []byte("d"), 9000, 2000, 0))
+
+	segCount, _ := s.SegmentLoad()
+	assert.Equal(t, 3, segCount)
+}
+
 func TestStoreInit_NegativeGeneration(t *testing.T) {
 	store := NewStore(clock.Real{})
 	meta := Metadata{Bandwidth: 1, Codecs: "avc1.64001f", Width: 1, Height: 1, FrameRate: 30, TargetDurationSecs: 2}
@@ -1826,9 +1911,15 @@ func TestEviction_ActiveReaderStopsDiscontinuityTracking(t *testing.T) {
 
 	require.NoError(t, s.AddInitEntry(1, []byte("init1")))
 
-	// Push: index 0 (gen=0), index 1 (gen=0), index 2 (gen=1), index 3 (gen=1)
+	// Push gen=0 segments.
 	mustCommitSlot(t, s, 0, []byte("d"), 1000, 2000)
 	mustCommitSlot(t, s, 1, []byte("d"), 3000, 2000)
+
+	// Advance clock so gen=0 segments are past (not dropped by future sweep).
+	clk.Set(time.UnixMilli(4000))
+
+	// Push gen=1 segments. Gen=0 segments have ts <= 4000, so they survive
+	// the future sweep.
 	require.NoError(t, commitSlotGen(t, s, 2, []byte("d"), 5000, 2000, 1))
 	require.NoError(t, commitSlotGen(t, s, 3, []byte("d"), 7000, 2000, 1))
 
@@ -1843,11 +1934,6 @@ func TestEviction_ActiveReaderStopsDiscontinuityTracking(t *testing.T) {
 
 		// Eviction should have evicted index 0 (gen=0) but stopped at
 		// index 1 because it has an active reader.
-		// evictedDiscontinuities: 0 (only gen=0 segments evicted so far,
-		// no generation change among them).
-		// lastEvictedGeneration: 0 (index 0 was gen=0).
-
-		// Verify index 0 is evicted and index 1 is kept.
 		_, readErr := readSegment(s, 0)
 		assert.ErrorIs(t, readErr, ErrSegmentNotFound, "index 0 should be evicted")
 		_, readErr = readSegment(s, 1)
@@ -1865,7 +1951,6 @@ func TestEviction_ActiveReaderStopsDiscontinuityTracking(t *testing.T) {
 
 	// Now index 1 (gen=0) and index 2 (gen=1) should be evicted.
 	// The gen 0→1 transition should now be counted.
-	// Render and check the DISCONTINUITY-SEQUENCE.
 	s.mu.RLock()
 	playlist, _ := s.renderMediaPlaylist(11000, 12)
 	s.mu.RUnlock()
@@ -1879,8 +1964,8 @@ func TestEviction_ActiveReaderStopsDiscontinuityTracking(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestEvictStaleInitEntries_BasicEviction(t *testing.T) {
-	// Gen 0 init should be evicted after gen 1 segments replace all gen 0
-	// segments via dropStaleGenerationLocked.
+	// Gen 0 init should be evicted after gen 1 advance drops all gen 0
+	// future segments via dropStaleFutureSegmentsLocked.
 	clk := clock.NewMock(time.UnixMilli(0))
 	store := NewStore(clk)
 	meta := Metadata{Bandwidth: 1, Codecs: "avc1.64001f", Width: 1, Height: 1, FrameRate: 30, TargetDurationSecs: 2}
@@ -1929,14 +2014,17 @@ func TestEvictStaleInitEntries_RetainedWhileSegmentsExist(t *testing.T) {
 		require.NoError(t, commitSlotGen(t, s, i, []byte("d"), int64(5000+i*2000), 2000, 0))
 	}
 
-	// Advance to gen=1 at index 3 — gen=0 segments at 0-2 remain (before insertion point).
+	// Advance clock past gen=0 segments so they are "past" (not future).
+	clk.Set(time.UnixMilli(10000))
+
+	// Advance to gen=1 at index 3. Gen=0 segments have timestamp <= now,
+	// so they are preserved (past segments, possibly in a playlist).
 	require.NoError(t, commitSlotGen(t, s, 3, []byte("n"), 11000, 2000, 1))
 
 	_, ok := s.GetInit(0)
 	assert.True(t, ok, "gen 0 init should be retained while gen 0 segments exist in buffer")
 
-	// Advance clock so all gen 0 segments are in the past and push gen=1
-	// segments to trigger time-based eviction of gen 0 segments.
+	// Push more gen=1 segments to trigger time-based eviction of gen 0 segments.
 	clk.Set(time.UnixMilli(20000))
 	for i := uint32(4); i < 8; i++ {
 		require.NoError(t, commitSlotGen(t, s, i, []byte("n"), int64(20000+int64(i)*2000), 2000, 1))

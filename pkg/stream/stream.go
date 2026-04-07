@@ -252,24 +252,26 @@ func (s *Stream) CurrentGeneration() int64 {
 	return s.currentGeneration
 }
 
-// dropStaleGenerationLocked removes segments at or after position fromPos
-// whose generation is older than the stream's current generation. Freed
-// buffers are returned to the pool. The segment slice is compacted in-place.
+// dropStaleFutureSegmentsLocked removes segments from older generations
+// whose timestamp is strictly after nowMs. These segments have never been
+// eligible for inclusion in a playlist (eligibility requires timestamp <= now),
+// so dropping them has no viewer impact and frees buffer capacity for the
+// new generation.
 //
-// After CommitSlot's pre-drop ordering and duplicate checks, segments
-// reaching this function are stale future segments that have never appeared
-// in a playlist. If a segment has active readers (extremely unlikely for
-// unreferenced future segments), it is retained rather than dropped,
-// matching evictOldLocked's pattern.
+// Segments with active readers are retained (matching evictOldLocked's
+// skip-and-retain pattern), though this is extremely unlikely for
+// never-served future segments.
+//
+// No discontinuity counter updates are needed because these segments were
+// never playlist-eligible and their generation transitions were never counted.
 //
 // Must be called with s.mu held.
-func (s *Stream) dropStaleGenerationLocked(fromPos int) {
-	w := fromPos // write cursor
-	for r := fromPos; r < len(s.segments); r++ {
-		if s.segments[r].Generation < s.currentGeneration {
+func (s *Stream) dropStaleFutureSegmentsLocked(nowMs int64) {
+	w := 0 // write cursor
+	for r := 0; r < len(s.segments); r++ {
+		if s.segments[r].Generation < s.currentGeneration && s.segments[r].Timestamp > nowMs {
 			if s.segments[r].Data.Readers() > 0 {
-				// Retain segment until readers finish, matching
-				// evictOldLocked's skip-and-retain pattern.
+				// Retain segment until readers finish.
 				if w != r {
 					s.segments[w] = s.segments[r]
 				}
@@ -392,11 +394,12 @@ func (s *Stream) ReleaseSlot(buf *pool.BufferSlot) {
 // to the stream. On error, the caller retains ownership and must call
 // ReleaseSlot.
 //
-// generation identifies the encoding session. Segments from older generations
-// at or after the insertion point are dropped. A generation of 0 is the
-// default; it participates in generation comparisons the same as any other
-// value (e.g. a generation-1 segment will cause generation-0 segments to be
-// dropped).
+// generation identifies the encoding session. When a generation advance is
+// detected, all segments from older generations whose timestamp is still in
+// the future (never served in a playlist) are dropped, freeing capacity for
+// the new generation. A generation of 0 is the default; it participates in
+// generation comparisons the same as any other value (e.g. a generation-1
+// segment will cause generation-0 future segments to be dropped).
 //
 // Returns ErrStaleGeneration if generation is older than the stream's current,
 // ErrMissingInitForGeneration if no init entry exists for the generation,
@@ -424,7 +427,8 @@ func (s *Stream) CommitSlot(index uint32, buf *pool.BufferSlot, timestamp int64,
 		return ErrTimestampInPast
 	}
 
-	if s.currentGeneration < generation {
+	generationAdvanced := s.currentGeneration < generation
+	if generationAdvanced {
 		s.currentGeneration = generation
 	}
 
@@ -432,16 +436,26 @@ func (s *Stream) CommitSlot(index uint32, buf *pool.BufferSlot, timestamp int64,
 
 	s.evictOldLocked()
 
+	// On generation advance, remove old-generation segments whose timestamp
+	// is still in the future. These segments have never been eligible for a
+	// playlist (eligibility requires timestamp <= now), so dropping them is
+	// invisible to viewers and frees capacity for the new generation.
+	if generationAdvanced {
+		s.dropStaleFutureSegmentsLocked(s.clock.Now().UnixMilli())
+	}
+
+	// Clean up init entries for generations that no longer have any buffered
+	// segments. This runs on every commit because evictOldLocked (above) may
+	// have removed the last segments of an old generation.
+	s.evictStaleInitEntriesLocked()
+
 	// Binary search for insertion point.
 	idx := sort.Search(len(s.segments), func(i int) bool {
 		return s.segments[i].Index >= index
 	})
 
-	// Enforce ordering invariant BEFORE any mutation. The ordering check
-	// must see the pre-drop segment list to catch commits that would
-	// require removing playlist-visible segments. Without this ordering,
-	// dropStaleGenerationLocked would erase the evidence and the post-drop
-	// check would pass on a truncated list.
+	// Enforce ordering invariant: segments sorted by index must also be
+	// sorted by timestamp.
 	if idx > 0 && s.segments[idx-1].Timestamp >= timestamp {
 		return fmt.Errorf("%w: left neighbor index=%d ts=%d >= new ts=%d",
 			ErrTimestampOrderViolation, s.segments[idx-1].Index, s.segments[idx-1].Timestamp, timestamp)
@@ -451,20 +465,9 @@ func (s *Stream) CommitSlot(index uint32, buf *pool.BufferSlot, timestamp int64,
 			ErrTimestampOrderViolation, s.segments[idx].Index, s.segments[idx].Timestamp, timestamp)
 	}
 
-	// Check for duplicate before drop. A stale segment at the same index
-	// with a higher timestamp passes the ordering check above but is still
-	// invalid — same-index reuse across generations is rejected defensively.
 	if idx < len(s.segments) && s.segments[idx].Index == index {
 		return ErrDuplicateIndex
 	}
-
-	// Drop segments at/after the insertion point whose generation is older
-	// than the stream's current generation. After the ordering and duplicate
-	// checks above, this only encounters stale segments at higher indices
-	// with timestamps greater than the new segment's timestamp — i.e. future
-	// stale segments that have never appeared in a playlist.
-	s.dropStaleGenerationLocked(idx)
-	s.evictStaleInitEntriesLocked()
 
 	if len(s.segments) >= s.segmentCap {
 		return ErrBufferFull
