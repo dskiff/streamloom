@@ -258,13 +258,8 @@ func (s *Stream) CurrentGeneration() int64 {
 // whose generation is older than the stream's current generation. Freed
 // buffers are returned to the pool. The segment slice is compacted in-place.
 //
-// After CommitSlot's pre-drop ordering and duplicate checks, segments
-// reaching this function are stale future segments that have never appeared
-// in a playlist (assuming a monotonic clock; a backward clock adjustment
-// could cause a previously-future segment to appear in a playlist before
-// being dropped here). If a segment has active readers (extremely unlikely for
-// unreferenced future segments), it is retained rather than dropped,
-// matching evictOldLocked's pattern.
+// Segments at/after the insertion point are in the future and must not have
+// active readers; a non-zero reader count triggers a panic.
 //
 // Must be called with s.mu held.
 func (s *Stream) dropStaleGenerationLocked(fromPos int) {
@@ -272,13 +267,8 @@ func (s *Stream) dropStaleGenerationLocked(fromPos int) {
 	for r := fromPos; r < len(s.segments); r++ {
 		if s.segments[r].Generation < s.currentGeneration {
 			if s.segments[r].Data.Readers() > 0 {
-				// Retain segment until readers finish, matching
-				// evictOldLocked's skip-and-retain pattern.
-				if w != r {
-					s.segments[w] = s.segments[r]
-				}
-				w++
-				continue
+				panic(fmt.Sprintf("streamloom: stale segment index=%d has %d active readers",
+					s.segments[r].Index, s.segments[r].Data.Readers()))
 			}
 			s.bufPool.AssertCheckedOut(s.segments[r].Data)
 			s.bufPool.Put(s.segments[r].Data)
@@ -441,11 +431,24 @@ func (s *Stream) CommitSlot(index uint32, buf *pool.BufferSlot, timestamp int64,
 		return s.segments[i].Index >= index
 	})
 
-	// Enforce ordering invariant BEFORE any mutation. The ordering check
-	// must see the pre-drop segment list to catch commits that would
-	// require removing playlist-visible segments. Without this ordering,
-	// dropStaleGenerationLocked would erase the evidence and the post-drop
-	// check would pass on a truncated list.
+	// Drop segments at/after the insertion point whose generation is older
+	// than the stream's current generation. This must run on every commit,
+	// not just when the generation advances: a second segment of the same
+	// (newer) generation inserted earlier in the list must still clean up
+	// stale segments between it and the first new-generation segment.
+	s.dropStaleGenerationLocked(idx)
+	s.evictStaleInitEntriesLocked()
+
+	if len(s.segments) >= s.segmentCap {
+		return ErrBufferFull
+	}
+
+	// Check for duplicate.
+	if idx < len(s.segments) && s.segments[idx].Index == index {
+		return ErrDuplicateIndex
+	}
+
+	// Enforce ordering invariant: index order must match timestamp order.
 	if idx > 0 && s.segments[idx-1].Timestamp >= timestamp {
 		return fmt.Errorf("%w: left neighbor index=%d ts=%d >= new ts=%d",
 			ErrTimestampOrderViolation, s.segments[idx-1].Index, s.segments[idx-1].Timestamp, timestamp)
@@ -453,25 +456,6 @@ func (s *Stream) CommitSlot(index uint32, buf *pool.BufferSlot, timestamp int64,
 	if idx < len(s.segments) && s.segments[idx].Timestamp <= timestamp {
 		return fmt.Errorf("%w: right neighbor index=%d ts=%d <= new ts=%d",
 			ErrTimestampOrderViolation, s.segments[idx].Index, s.segments[idx].Timestamp, timestamp)
-	}
-
-	// Check for duplicate before drop. A stale segment at the same index
-	// with a higher timestamp passes the ordering check above but is still
-	// invalid — same-index reuse across generations is rejected defensively.
-	if idx < len(s.segments) && s.segments[idx].Index == index {
-		return ErrDuplicateIndex
-	}
-
-	// Drop segments at/after the insertion point whose generation is older
-	// than the stream's current generation. After the ordering and duplicate
-	// checks above, this only encounters stale segments at higher indices
-	// with timestamps greater than the new segment's timestamp — i.e. future
-	// stale segments that have never appeared in a playlist.
-	s.dropStaleGenerationLocked(idx)
-	s.evictStaleInitEntriesLocked()
-
-	if len(s.segments) >= s.segmentCap {
-		return ErrBufferFull
 	}
 
 	s.segments = slices.Insert(s.segments, idx, Slot{

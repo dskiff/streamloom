@@ -376,10 +376,8 @@ func TestPostSegment_DuplicateIndex(t *testing.T) {
 	rec := postSegment(router, "1", "test-token", "0", "5000", "2000", []byte("data"))
 	require.Equal(t, http.StatusCreated, rec.Code)
 
-	// Same index with a higher timestamp hits the ordering check (ts_existing <= ts_new)
-	// before the duplicate check, returning 422 instead of 409.
 	rec = postSegment(router, "1", "test-token", "0", "7000", "2000", []byte("data"))
-	assert.Equal(t, http.StatusUnprocessableEntity, rec.Code)
+	assert.Equal(t, http.StatusConflict, rec.Code)
 }
 
 func TestPostSegment_TimestampInPast(t *testing.T) {
