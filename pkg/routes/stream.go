@@ -1,6 +1,7 @@
 package routes
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -8,6 +9,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/dskiff/streamloom/pkg/config"
 	mw "github.com/dskiff/streamloom/pkg/middleware"
@@ -86,7 +88,34 @@ func Stream(logger *slog.Logger, env config.Env, store *stream.Store, requestLog
 				return
 			}
 
-			playlist := s.CachedPlaylist()
+			// Blocking Playlist Reload (RFC 8216bis §6.2.5.2):
+			// If _HLS_msn is present, defer the response until the
+			// playlist contains a segment with that MSN or later.
+			// _HLS_part is silently ignored (partial segments unsupported).
+			var playlist string
+			if msnParam := r.URL.Query().Get("_HLS_msn"); msnParam != "" {
+				msn, err := strconv.ParseInt(msnParam, 10, 64)
+				if err != nil || msn < 0 {
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+
+				meta := s.Metadata()
+				blockTimeout := time.Duration(meta.TargetDurationSecs*3) * time.Second
+				ctx, cancel := context.WithTimeout(r.Context(), blockTimeout)
+				defer cancel()
+
+				p, ok := s.AwaitMSN(ctx, msn)
+				if ok {
+					playlist = p
+				} else {
+					// Timeout or cancellation — fall back to current playlist.
+					playlist = s.CachedPlaylist()
+				}
+			} else {
+				playlist = s.CachedPlaylist()
+			}
+
 			if playlist == "" {
 				// All segments were evicted between the HasPlaylist gate
 				// and now.  Tell the player to retry rather than serving

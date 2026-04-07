@@ -487,3 +487,264 @@ func TestPublicRoute_InvalidStreamID(t *testing.T) {
 
 	assert.Equal(t, http.StatusNotFound, rec.Code)
 }
+
+// --- Blocking Playlist Reload (_HLS_msn) tests ---
+
+func TestMediaPlaylist_BlockingReload_InvalidMSN(t *testing.T) {
+	clk := clock.NewMock(time.UnixMilli(0))
+	router, store, _ := testStreamRouter(t, clk)
+	initStream(t, store, "1")
+
+	s := store.Get("1")
+	require.NotNil(t, s)
+
+	// Commit a segment and render a playlist so HasPlaylist unblocks.
+	commitSegment(t, s, 0, []byte("seg0"), 1000)
+	clk.Set(time.UnixMilli(2000))
+	require.Eventually(t, func() bool {
+		return s.CachedPlaylist() != ""
+	}, 2*time.Second, 10*time.Millisecond)
+
+	// Non-integer _HLS_msn → 400.
+	req := httptest.NewRequest(http.MethodGet, "/stream/1/media.m3u8?_HLS_msn=abc", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+func TestMediaPlaylist_BlockingReload_NegativeMSN(t *testing.T) {
+	clk := clock.NewMock(time.UnixMilli(0))
+	router, store, _ := testStreamRouter(t, clk)
+	initStream(t, store, "1")
+
+	s := store.Get("1")
+	require.NotNil(t, s)
+
+	commitSegment(t, s, 0, []byte("seg0"), 1000)
+	clk.Set(time.UnixMilli(2000))
+	require.Eventually(t, func() bool {
+		return s.CachedPlaylist() != ""
+	}, 2*time.Second, 10*time.Millisecond)
+
+	// Negative _HLS_msn → 400.
+	req := httptest.NewRequest(http.MethodGet, "/stream/1/media.m3u8?_HLS_msn=-1", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+func TestMediaPlaylist_BlockingReload_ImmediateWhenAlreadySatisfied(t *testing.T) {
+	clk := clock.NewMock(time.UnixMilli(0))
+	router, store, _ := testStreamRouter(t, clk)
+	initStream(t, store, "1")
+
+	s := store.Get("1")
+	require.NotNil(t, s)
+
+	commitSegment(t, s, 0, []byte("seg0"), 1000)
+	commitSegment(t, s, 1, []byte("seg1"), 3000)
+	commitSegment(t, s, 2, []byte("seg2"), 5000)
+	clk.Set(time.UnixMilli(6000))
+
+	require.Eventually(t, func() bool {
+		return s.LastRenderedMSN() >= 2
+	}, 2*time.Second, 10*time.Millisecond)
+
+	// Request _HLS_msn=1 — already satisfied, should return immediately.
+	req := httptest.NewRequest(http.MethodGet, "/stream/1/media.m3u8?_HLS_msn=1", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+	body := rec.Body.String()
+	assert.Contains(t, body, "segment_1.m4s")
+	assert.Contains(t, body, "segment_2.m4s")
+}
+
+func TestMediaPlaylist_BlockingReload_WaitsForMSN(t *testing.T) {
+	clk := clock.NewMock(time.UnixMilli(0))
+	router, store, _ := testStreamRouter(t, clk)
+	initStream(t, store, "1")
+
+	s := store.Get("1")
+	require.NotNil(t, s)
+
+	// Commit initial segment so HasPlaylist gate opens.
+	commitSegment(t, s, 0, []byte("seg0"), 1000)
+	clk.Set(time.UnixMilli(2000))
+	require.Eventually(t, func() bool {
+		return s.CachedPlaylist() != ""
+	}, 2*time.Second, 10*time.Millisecond)
+
+	// Request _HLS_msn=3 — should block until segment 3 appears.
+	done := make(chan struct{})
+	rec := httptest.NewRecorder()
+	go func() {
+		defer close(done)
+		req := httptest.NewRequest(http.MethodGet, "/stream/1/media.m3u8?_HLS_msn=3", nil)
+		router.ServeHTTP(rec, req)
+	}()
+
+	// Verify it blocks.
+	select {
+	case <-done:
+		t.Fatal("handler returned before segment 3 was committed")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// Commit segments 1-3 and advance clock.
+	commitSegment(t, s, 1, []byte("seg1"), 3000)
+	commitSegment(t, s, 2, []byte("seg2"), 5000)
+	commitSegment(t, s, 3, []byte("seg3"), 7000)
+	clk.Set(time.UnixMilli(8000))
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler did not return after segment 3 appeared")
+	}
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Contains(t, rec.Body.String(), "segment_3.m4s")
+}
+
+func TestMediaPlaylist_BlockingReload_TimeoutFallback(t *testing.T) {
+	clk := clock.NewMock(time.UnixMilli(0))
+	router, store, _ := testStreamRouter(t, clk)
+	initStream(t, store, "1")
+
+	s := store.Get("1")
+	require.NotNil(t, s)
+
+	// Commit a segment so a playlist exists.
+	commitSegment(t, s, 0, []byte("seg0"), 1000)
+	clk.Set(time.UnixMilli(2000))
+	require.Eventually(t, func() bool {
+		return s.CachedPlaylist() != ""
+	}, 2*time.Second, 10*time.Millisecond)
+
+	// Request _HLS_msn=999 with a short context timeout (simulating 3x target).
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	req := httptest.NewRequest(http.MethodGet, "/stream/1/media.m3u8?_HLS_msn=999", nil).WithContext(ctx)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	// Should fall back to current playlist (200 OK) since we have one cached.
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Contains(t, rec.Body.String(), "segment_0.m4s")
+}
+
+func TestMediaPlaylist_BlockingReload_StreamDeletedWhileBlocking(t *testing.T) {
+	clk := clock.NewMock(time.UnixMilli(0))
+	router, store, _ := testStreamRouter(t, clk)
+	initStream(t, store, "1")
+
+	s := store.Get("1")
+	require.NotNil(t, s)
+
+	// Commit a segment so HasPlaylist gate opens.
+	commitSegment(t, s, 0, []byte("seg0"), 1000)
+	clk.Set(time.UnixMilli(2000))
+	require.Eventually(t, func() bool {
+		return s.CachedPlaylist() != ""
+	}, 2*time.Second, 10*time.Millisecond)
+
+	done := make(chan struct{})
+	rec := httptest.NewRecorder()
+	go func() {
+		defer close(done)
+		req := httptest.NewRequest(http.MethodGet, "/stream/1/media.m3u8?_HLS_msn=99", nil)
+		router.ServeHTTP(rec, req)
+	}()
+
+	// Delete stream while handler is blocking.
+	time.Sleep(50 * time.Millisecond)
+	store.Delete("1")
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler did not return after stream deletion")
+	}
+
+	// AwaitMSN returns ("", false) because stream was deleted, but the
+	// fallback to CachedPlaylist() still succeeds because the atomic pointer
+	// retains the last rendered playlist. The client gets a valid (stale)
+	// playlist rather than an error, which is more resilient.
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Contains(t, rec.Body.String(), "segment_0.m4s")
+}
+
+func TestMediaPlaylist_BlockingReload_IgnoresHLSPart(t *testing.T) {
+	clk := clock.NewMock(time.UnixMilli(0))
+	router, store, _ := testStreamRouter(t, clk)
+	initStream(t, store, "1")
+
+	s := store.Get("1")
+	require.NotNil(t, s)
+
+	commitSegment(t, s, 0, []byte("seg0"), 1000)
+	commitSegment(t, s, 1, []byte("seg1"), 3000)
+	commitSegment(t, s, 2, []byte("seg2"), 5000)
+	clk.Set(time.UnixMilli(6000))
+
+	require.Eventually(t, func() bool {
+		return s.LastRenderedMSN() >= 2
+	}, 2*time.Second, 10*time.Millisecond)
+
+	// _HLS_part should be silently ignored; only _HLS_msn matters.
+	req := httptest.NewRequest(http.MethodGet, "/stream/1/media.m3u8?_HLS_msn=1&_HLS_part=0", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Contains(t, rec.Body.String(), "segment_1.m4s")
+}
+
+func TestMediaPlaylist_WithoutMSN_UnchangedBehavior(t *testing.T) {
+	clk := clock.NewMock(time.UnixMilli(0))
+	router, store, _ := testStreamRouter(t, clk)
+	initStream(t, store, "1")
+
+	s := store.Get("1")
+	require.NotNil(t, s)
+
+	commitSegment(t, s, 0, []byte("seg0"), 1000)
+	clk.Set(time.UnixMilli(2000))
+	require.Eventually(t, func() bool {
+		return s.CachedPlaylist() != ""
+	}, 2*time.Second, 10*time.Millisecond)
+
+	// No _HLS_msn — should return immediately with current playlist.
+	req := httptest.NewRequest(http.MethodGet, "/stream/1/media.m3u8", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Contains(t, rec.Body.String(), "segment_0.m4s")
+}
+
+func TestMediaPlaylist_ServerControlTagInResponse(t *testing.T) {
+	clk := clock.NewMock(time.UnixMilli(0))
+	router, store, _ := testStreamRouter(t, clk)
+	initStream(t, store, "1")
+
+	s := store.Get("1")
+	require.NotNil(t, s)
+
+	commitSegment(t, s, 0, []byte("seg0"), 1000)
+	clk.Set(time.UnixMilli(2000))
+	require.Eventually(t, func() bool {
+		return s.CachedPlaylist() != ""
+	}, 2*time.Second, 10*time.Millisecond)
+
+	req := httptest.NewRequest(http.MethodGet, "/stream/1/media.m3u8", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+	// TargetDurationSecs=2, so HOLD-BACK=6.000
+	assert.Contains(t, rec.Body.String(), "#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,HOLD-BACK=6.000")
+}

@@ -51,13 +51,14 @@ func TestRenderMediaPlaylist_BasicWindow(t *testing.T) {
 	}
 
 	s.mu.RLock()
-	playlist, nextMs := s.renderMediaPlaylist(20000, 12)
+	playlist, nextMs, _ := s.renderMediaPlaylist(20000, 12)
 	s.mu.RUnlock()
 
 	assert.Equal(t, int64(0), nextMs, "no future segments")
 
 	assert.True(t, strings.HasPrefix(playlist, "#EXTM3U\n"))
 	assert.Contains(t, playlist, "#EXT-X-VERSION:7")
+	assert.Contains(t, playlist, "#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,HOLD-BACK=6.000")
 	assert.Contains(t, playlist, "#EXT-X-TARGETDURATION:2")
 	assert.Contains(t, playlist, "#EXT-X-MEDIA-SEQUENCE:0")
 	assert.Contains(t, playlist, "#EXT-X-MAP:URI=\"init_0.mp4\"")
@@ -78,7 +79,7 @@ func TestRenderMediaPlaylist_SlidingWindow(t *testing.T) {
 	}
 
 	s.mu.RLock()
-	playlist, _ := s.renderMediaPlaylist(100000, 5)
+	playlist, _, _ := s.renderMediaPlaylist(100000, 5)
 	s.mu.RUnlock()
 
 	// EXT-X-MEDIA-SEQUENCE should be 10 (first segment in window).
@@ -101,7 +102,7 @@ func TestRenderMediaPlaylist_NoEligibleSegments(t *testing.T) {
 	mustCommitSlot(t, s, 0, []byte("data"), 5000, 2000)
 
 	s.mu.RLock()
-	playlist, nextMs := s.renderMediaPlaylist(0, 12)
+	playlist, nextMs, _ := s.renderMediaPlaylist(0, 12)
 	s.mu.RUnlock()
 
 	assert.Equal(t, "", playlist)
@@ -112,11 +113,78 @@ func TestRenderMediaPlaylist_EmptyStream(t *testing.T) {
 	_, s := setupStreamForPlaylist(t, 2)
 
 	s.mu.RLock()
-	playlist, nextMs := s.renderMediaPlaylist(1000, 12)
+	playlist, nextMs, _ := s.renderMediaPlaylist(1000, 12)
 	s.mu.RUnlock()
 
 	assert.Equal(t, "", playlist)
 	assert.Equal(t, int64(0), nextMs)
+}
+
+func TestRenderMediaPlaylist_LastMSN(t *testing.T) {
+	// 5 segments (indices 0-4), all eligible. lastMSN should be 4.
+	_, s := setupStreamForPlaylist(t, 2)
+
+	for i := range uint32(5) {
+		mustCommitSlot(t, s, i, []byte("data"), int64(i)*2000, 2000)
+	}
+
+	s.mu.RLock()
+	_, _, lastMSN := s.renderMediaPlaylist(20000, 12)
+	s.mu.RUnlock()
+
+	assert.Equal(t, int64(4), lastMSN)
+}
+
+func TestRenderMediaPlaylist_LastMSN_SlidingWindow(t *testing.T) {
+	// 15 segments (indices 0-14), window=5. Window is [10..14], lastMSN=14.
+	_, s := setupStreamForPlaylist(t, 2)
+
+	for i := range uint32(15) {
+		mustCommitSlot(t, s, i, []byte("data"), int64(i)*2000, 2000)
+	}
+
+	s.mu.RLock()
+	_, _, lastMSN := s.renderMediaPlaylist(100000, 5)
+	s.mu.RUnlock()
+
+	assert.Equal(t, int64(14), lastMSN)
+}
+
+func TestRenderMediaPlaylist_LastMSN_NoEligible(t *testing.T) {
+	// All segments in the future — lastMSN should be -1.
+	_, s := setupStreamForPlaylist(t, 2)
+
+	mustCommitSlot(t, s, 0, []byte("data"), 5000, 2000)
+
+	s.mu.RLock()
+	_, _, lastMSN := s.renderMediaPlaylist(0, 12)
+	s.mu.RUnlock()
+
+	assert.Equal(t, int64(-1), lastMSN)
+}
+
+func TestRenderMediaPlaylist_LastMSN_Empty(t *testing.T) {
+	// No segments at all — lastMSN should be -1.
+	_, s := setupStreamForPlaylist(t, 2)
+
+	s.mu.RLock()
+	_, _, lastMSN := s.renderMediaPlaylist(1000, 12)
+	s.mu.RUnlock()
+
+	assert.Equal(t, int64(-1), lastMSN)
+}
+
+func TestRenderMediaPlaylist_ServerControlTag_TargetDuration4(t *testing.T) {
+	// With targetDuration=4, HOLD-BACK should be 12.000.
+	_, s := setupStreamForPlaylist(t, 4)
+
+	mustCommitSlot(t, s, 0, []byte("data"), 1000, 4000)
+
+	s.mu.RLock()
+	playlist, _, _ := s.renderMediaPlaylist(5000, 12)
+	s.mu.RUnlock()
+
+	assert.Contains(t, playlist, "#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,HOLD-BACK=12.000")
 }
 
 func TestRenderMediaPlaylist_SingleSegment(t *testing.T) {
@@ -125,7 +193,7 @@ func TestRenderMediaPlaylist_SingleSegment(t *testing.T) {
 	mustCommitSlot(t, s, 42, []byte("data"), 5000, 4000)
 
 	s.mu.RLock()
-	playlist, _ := s.renderMediaPlaylist(10000, 12)
+	playlist, _, _ := s.renderMediaPlaylist(10000, 12)
 	s.mu.RUnlock()
 
 	assert.Contains(t, playlist, "#EXT-X-MEDIA-SEQUENCE:42")
@@ -144,7 +212,7 @@ func TestRenderMediaPlaylist_NonZeroStartingIndex(t *testing.T) {
 	}
 
 	s.mu.RLock()
-	playlist, _ := s.renderMediaPlaylist(50000, 12)
+	playlist, _, _ := s.renderMediaPlaylist(50000, 12)
 	s.mu.RUnlock()
 
 	assert.Contains(t, playlist, "#EXT-X-MEDIA-SEQUENCE:100")
@@ -160,7 +228,7 @@ func TestRenderMediaPlaylist_DurationFormatting(t *testing.T) {
 	mustCommitSlot(t, s, 3, []byte("d"), 4533, 1001) // 1.001
 
 	s.mu.RLock()
-	playlist, _ := s.renderMediaPlaylist(50000, 12)
+	playlist, _, _ := s.renderMediaPlaylist(50000, 12)
 	s.mu.RUnlock()
 
 	assert.Contains(t, playlist, "#EXTINF:2.000,")
@@ -176,7 +244,7 @@ func TestRenderMediaPlaylist_TimestampFormat(t *testing.T) {
 	mustCommitSlot(t, s, 0, []byte("d"), 1700000000000, 2000)
 
 	s.mu.RLock()
-	playlist, _ := s.renderMediaPlaylist(1700000010000, 12)
+	playlist, _, _ := s.renderMediaPlaylist(1700000010000, 12)
 	s.mu.RUnlock()
 
 	assert.Contains(t, playlist, "#EXT-X-PROGRAM-DATE-TIME:2023-11-14T22:13:20.000Z")
@@ -193,7 +261,7 @@ func TestRenderMediaPlaylist_WallClockFiltering(t *testing.T) {
 	mustCommitSlot(t, s, 4, []byte("d"), 14000, 2000) // future
 
 	s.mu.RLock()
-	playlist, nextMs := s.renderMediaPlaylist(10000, 12)
+	playlist, nextMs, _ := s.renderMediaPlaylist(10000, 12)
 	s.mu.RUnlock()
 
 	// Segments 0, 1, 2 should be present (timestamp <= 10000).
@@ -215,7 +283,7 @@ func TestRenderMediaPlaylist_NextEligibleMs(t *testing.T) {
 	mustCommitSlot(t, s, 2, []byte("d"), 9000, 2000)
 
 	s.mu.RLock()
-	_, nextMs := s.renderMediaPlaylist(6000, 12)
+	_, nextMs, _ := s.renderMediaPlaylist(6000, 12)
 	s.mu.RUnlock()
 
 	// Next segment not yet eligible is at 9000.
@@ -232,7 +300,7 @@ func TestRenderMediaPlaylist_SingleGeneration_NoDiscontinuity(t *testing.T) {
 	}
 
 	s.mu.RLock()
-	playlist, _ := s.renderMediaPlaylist(20000, 12)
+	playlist, _, _ := s.renderMediaPlaylist(20000, 12)
 	s.mu.RUnlock()
 
 	// No discontinuity tags within a single generation.
@@ -260,7 +328,7 @@ func TestRenderMediaPlaylist_TwoGenerations_Discontinuity(t *testing.T) {
 	require.NoError(t, err)
 
 	s.mu.RLock()
-	playlist, _ := s.renderMediaPlaylist(20000, 12)
+	playlist, _, _ := s.renderMediaPlaylist(20000, 12)
 	s.mu.RUnlock()
 
 	// Should have exactly one #EXT-X-DISCONTINUITY (between gen 0 and gen 1).
@@ -290,7 +358,7 @@ func TestRenderMediaPlaylist_ThreeGenerations(t *testing.T) {
 	require.NoError(t, err)
 
 	s.mu.RLock()
-	playlist, _ := s.renderMediaPlaylist(20000, 12)
+	playlist, _, _ := s.renderMediaPlaylist(20000, 12)
 	s.mu.RUnlock()
 
 	// Two discontinuities (0→1, 1→2).
@@ -339,7 +407,7 @@ func TestRenderMediaPlaylist_DiscontinuitySequence_AfterEviction(t *testing.T) {
 
 	// Render with window=3, nowMs=11000.
 	s.mu.RLock()
-	playlist, _ := s.renderMediaPlaylist(11000, 3)
+	playlist, _, _ := s.renderMediaPlaylist(11000, 3)
 	s.mu.RUnlock()
 
 	// The eviction should have removed segments 0,1,2 (gen=0) and possibly 3 (gen=1).
@@ -398,7 +466,7 @@ func TestRenderMediaPlaylist_DiscontinuitySequence_AllPreWindowEvicted(t *testin
 	// covered by TestRenderMediaPlaylist_DiscontinuitySequence_EvictedBoundaryAtStartZero.
 
 	s.mu.RLock()
-	playlist, _ := s.renderMediaPlaylist(11000, 3)
+	playlist, _, _ := s.renderMediaPlaylist(11000, 3)
 	s.mu.RUnlock()
 
 	// The gen 0→1 transition was among the evicted segments.
@@ -465,7 +533,7 @@ func TestRenderMediaPlaylist_DiscontinuitySequence_EvictedBoundaryAtStartZero(t 
 
 	// Render: window=2 at nowMs=13000.
 	s.mu.RLock()
-	playlist, _ := s.renderMediaPlaylist(13000, 2)
+	playlist, _, _ := s.renderMediaPlaylist(13000, 2)
 	s.mu.RUnlock()
 
 	// The gen0→1 and gen1→2 transitions should both be in DISCONTINUITY-SEQUENCE.
@@ -493,7 +561,7 @@ func TestRenderMediaPlaylist_DiscontinuitySequence_WindowBoundary(t *testing.T) 
 	// Render with windowSize=2 so only segments 2,3 (gen=1) are in the window.
 	// The gen 0→1 transition at the window boundary must be counted.
 	s.mu.RLock()
-	playlist, _ := s.renderMediaPlaylist(20000, 2)
+	playlist, _, _ := s.renderMediaPlaylist(20000, 2)
 	s.mu.RUnlock()
 
 	assert.Contains(t, playlist, "#EXT-X-DISCONTINUITY-SEQUENCE:1\n",
@@ -518,7 +586,7 @@ func TestRenderMediaPlaylist_DiscontinuitySequence_WindowBoundaryMultiple(t *tes
 	require.NoError(t, commitSlotGen(t, s, 3, []byte("d"), 6000, 2000, 2))
 
 	s.mu.RLock()
-	playlist, _ := s.renderMediaPlaylist(20000, 2)
+	playlist, _, _ := s.renderMediaPlaylist(20000, 2)
 	s.mu.RUnlock()
 
 	// Both 0→1 and 1→2 transitions scrolled out.
@@ -545,7 +613,7 @@ func TestRenderMediaPlaylist_SkippedGeneration(t *testing.T) {
 	require.NoError(t, commitSlotGen(t, s, 3, []byte("d"), 6000, 2000, 2))
 
 	s.mu.RLock()
-	playlist, _ := s.renderMediaPlaylist(20000, 12)
+	playlist, _, _ := s.renderMediaPlaylist(20000, 12)
 	s.mu.RUnlock()
 
 	// One discontinuity (gen 0→2, skipping 1).
@@ -575,7 +643,7 @@ func TestRenderMediaPlaylist_DiscontinuityOrder(t *testing.T) {
 	require.NoError(t, err)
 
 	s.mu.RLock()
-	playlist, _ := s.renderMediaPlaylist(20000, 12)
+	playlist, _, _ := s.renderMediaPlaylist(20000, 12)
 	s.mu.RUnlock()
 
 	// The DISCONTINUITY tag must come before the MAP for gen 1.

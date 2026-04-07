@@ -2,6 +2,7 @@
 package stream
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math"
@@ -180,6 +181,19 @@ type Stream struct {
 	// cachedPlaylist holds the most recently rendered media playlist string.
 	// Written by the renderer goroutine, read by HTTP handlers.
 	cachedPlaylist atomic.Pointer[string]
+
+	// lastRenderedMSN holds the highest Media Sequence Number (segment Index)
+	// in the most recently rendered playlist. -1 means no playlist has been
+	// rendered yet. Written by the renderer, read by HTTP handlers.
+	lastRenderedMSN atomic.Int64
+
+	// playlistBroadcastMu protects playlistBroadcast during swap.
+	playlistBroadcastMu sync.Mutex
+
+	// playlistBroadcast is closed by the renderer each time a new playlist is
+	// stored, then replaced with a fresh channel. HTTP handlers grab a
+	// reference and select on it to wait for the next render cycle.
+	playlistBroadcast chan struct{}
 }
 
 // Metadata returns a copy of the stream's metadata.
@@ -230,6 +244,40 @@ func (s *Stream) CachedPlaylist() string {
 		return ""
 	}
 	return *p
+}
+
+// LastRenderedMSN returns the highest Media Sequence Number (segment Index)
+// in the most recently rendered playlist, or -1 if no playlist has been
+// rendered yet.
+func (s *Stream) LastRenderedMSN() int64 {
+	return s.lastRenderedMSN.Load()
+}
+
+// AwaitMSN blocks until the rendered playlist contains a segment with
+// Media Sequence Number >= msn, or until ctx is cancelled / stream is deleted.
+// Returns (playlist, true) on success, or ("", false) on cancellation/deletion.
+func (s *Stream) AwaitMSN(ctx context.Context, msn int64) (string, bool) {
+	for {
+		if s.lastRenderedMSN.Load() >= msn {
+			p := s.CachedPlaylist()
+			if p != "" {
+				return p, true
+			}
+		}
+
+		s.playlistBroadcastMu.Lock()
+		ch := s.playlistBroadcast
+		s.playlistBroadcastMu.Unlock()
+
+		select {
+		case <-ch:
+			continue
+		case <-ctx.Done():
+			return "", false
+		case <-s.Done():
+			return "", false
+		}
+	}
 }
 
 // GetInit returns the init segment bytes for the given generation, or nil and
@@ -604,7 +652,9 @@ func (s *Store) Init(id string, meta Metadata, initData []byte, generation int64
 		stopped:               make(chan struct{}),
 		hasSegments:           make(chan struct{}),
 		hasPlaylist:           make(chan struct{}),
+		playlistBroadcast:     make(chan struct{}),
 	}
+	st.lastRenderedMSN.Store(-1)
 	s.streams[id] = st
 	s.mu.Unlock()
 

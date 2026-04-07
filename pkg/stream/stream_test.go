@@ -1867,7 +1867,7 @@ func TestEviction_ActiveReaderStopsDiscontinuityTracking(t *testing.T) {
 	// The gen 0→1 transition should now be counted.
 	// Render and check the DISCONTINUITY-SEQUENCE.
 	s.mu.RLock()
-	playlist, _ := s.renderMediaPlaylist(11000, 12)
+	playlist, _, _ := s.renderMediaPlaylist(11000, 12)
 	s.mu.RUnlock()
 
 	assert.Contains(t, playlist, "#EXT-X-DISCONTINUITY-SEQUENCE:1\n",
