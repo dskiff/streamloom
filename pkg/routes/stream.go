@@ -136,16 +136,9 @@ func Stream(logger *slog.Logger, env config.Env, store *stream.Store, requestLog
 			}
 		})
 
-		r.Get("/init_{initID}.mp4", func(w http.ResponseWriter, r *http.Request) {
+		r.Get("/init.mp4", func(w http.ResponseWriter, r *http.Request) {
 			streamID := chi.URLParam(r, "streamID")
-			initIDStr := chi.URLParam(r, "initID")
-			generation, err := strconv.ParseInt(initIDStr, 10, 64)
-			if err != nil || generation < 0 {
-				logger.Warn("invalid init ID", "value", initIDStr, "error", err)
-				w.WriteHeader(http.StatusBadRequest)
-				return
-			}
-			logger.Debug("handling init segment request", "streamID", streamID, "generation", generation)
+			logger.Debug("handling init segment request", "streamID", streamID)
 
 			s, status := getStream(store, streamID)
 			if s == nil {
@@ -157,7 +150,7 @@ func Stream(logger *slog.Logger, env config.Env, store *stream.Store, requestLog
 				return
 			}
 
-			initData, ok := s.GetInit(generation)
+			initData, ok := s.GetInit()
 			if !ok {
 				w.WriteHeader(http.StatusNotFound)
 				return

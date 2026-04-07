@@ -129,19 +129,6 @@ func initHeaders() map[string]string {
 	}
 }
 
-// postInitForGeneration posts init data for a subsequent generation on an
-// existing stream. Only sends X-SL-GENERATION + body (no metadata/capacity headers).
-func postInitForGeneration(router http.Handler, streamID string, token string, generation string, body []byte) *httptest.ResponseRecorder {
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/stream/"+streamID+"/init", bytes.NewReader(body))
-	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
-	}
-	req.Header.Set("X-SL-GENERATION", generation)
-	rec := httptest.NewRecorder()
-	router.ServeHTTP(rec, req)
-	return rec
-}
-
 func postInit(router http.Handler, streamID string, token string, headers map[string]string, body []byte) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/stream/"+streamID+"/init", bytes.NewReader(body))
 	if token != "" {

@@ -123,7 +123,7 @@ func TestInitAndGet(t *testing.T) {
 	assert.Equal(t, meta.Height, got.Height)
 	assert.Equal(t, meta.FrameRate, got.FrameRate)
 
-	got2, ok := stream.GetInit(0)
+	got2, ok := stream.GetInit()
 	require.True(t, ok)
 	assert.Equal(t, initData, got2)
 }
@@ -137,7 +137,7 @@ func TestInitClonesData(t *testing.T) {
 	original[0] = 0xFF
 
 	stream := s.Get("1")
-	got, ok := stream.GetInit(0)
+	got, ok := stream.GetInit()
 	require.True(t, ok)
 	assert.Equal(t, byte(0x01), got[0], "Init did not clone the input; caller mutation leaked into store")
 }
@@ -149,8 +149,8 @@ func TestGetInitIsImmutable(t *testing.T) {
 	stream := s.Get("1")
 
 	// Two reads should produce identical results.
-	got1, ok1 := stream.GetInit(0)
-	got2, ok2 := stream.GetInit(0)
+	got1, ok1 := stream.GetInit()
+	got2, ok2 := stream.GetInit()
 	require.True(t, ok1)
 	require.True(t, ok2)
 	assert.Equal(t, got1, got2, "GetInit returned different results on successive calls")
@@ -165,7 +165,7 @@ func TestReInitOverwrites(t *testing.T) {
 	require.NotNil(t, stream, "expected stream after re-init")
 
 	assert.Equal(t, 2000, stream.Metadata().Bandwidth)
-	got, ok := stream.GetInit(0)
+	got, ok := stream.GetInit()
 	require.True(t, ok)
 	assert.Equal(t, []byte{0x02, 0x03}, got)
 }
@@ -205,7 +205,7 @@ func TestConcurrentAccess(t *testing.T) {
 			stream := s.Get("50")
 			if stream != nil {
 				_ = stream.Metadata()
-				_, _ = stream.GetInit(0)
+				_, _ = stream.GetInit()
 			}
 		}()
 	}
@@ -1393,10 +1393,7 @@ func TestCommitSlot_StaleGeneration(t *testing.T) {
 	mustInit(t, store, "g", meta, []byte("init"), 10, testSegmentBytes, 5)
 	s := store.Get("g")
 
-	require.NoError(t, s.AddInitEntry(3, []byte("init3")))
-	require.NoError(t, s.AddInitEntry(5, []byte("init5")))
-
-	// Push gen=5.
+	// Push gen=5 to advance the current generation.
 	err := commitSlotGen(t, s, 0, []byte("data"), 5000, 2000, 5)
 	require.NoError(t, err)
 	assert.Equal(t, int64(5), s.CurrentGeneration())
@@ -1412,8 +1409,6 @@ func TestCommitSlot_GenerationAdvance_DropsStaleSegments(t *testing.T) {
 	meta := Metadata{Bandwidth: 1, Codecs: "avc1.64001f", Width: 1, Height: 1, FrameRate: 30, TargetDurationSecs: 2}
 	mustInit(t, store, "g", meta, []byte("init"), 10, testSegmentBytes, 5)
 	s := store.Get("g")
-
-	require.NoError(t, s.AddInitEntry(1, []byte("init1")))
 
 	// Push 5 segments at gen=0.
 	for i := uint32(0); i < 5; i++ {
@@ -1470,8 +1465,6 @@ func TestCommitSlot_GenerationDropFreesCapacity(t *testing.T) {
 	t.Cleanup(func() { store.Delete("g") })
 	s := store.Get("g")
 
-	require.NoError(t, s.AddInitEntry(1, []byte("init1")))
-
 	// Fill to capacity with gen=0.
 	for i := uint32(0); i < 5; i++ {
 		err := commitSlotGen(t, s, i, []byte("data"), int64(5000+i*2000), 2000, 0)
@@ -1496,8 +1489,6 @@ func TestCommitSlot_GenerationAdvanceThenContinue(t *testing.T) {
 	meta := Metadata{Bandwidth: 1, Codecs: "avc1.64001f", Width: 1, Height: 1, FrameRate: 30, TargetDurationSecs: 2}
 	mustInit(t, store, "g", meta, []byte("init"), 10, testSegmentBytes, 5)
 	s := store.Get("g")
-
-	require.NoError(t, s.AddInitEntry(1, []byte("init1")))
 
 	// Push gen=0 segments.
 	for i := uint32(0); i < 3; i++ {
@@ -1529,8 +1520,6 @@ func TestCommitSlot_SameGenDropsStaleOnSubsequentInsert(t *testing.T) {
 	meta := Metadata{Bandwidth: 1, Codecs: "avc1.64001f", Width: 1, Height: 1, FrameRate: 30, TargetDurationSecs: 2}
 	mustInit(t, store, "g", meta, []byte("init"), 20, testSegmentBytes, 15)
 	s := store.Get("g")
-
-	require.NoError(t, s.AddInitEntry(1, []byte("init1")))
 
 	// Push 10 gen=0 segments (indices 0-9).
 	for i := uint32(0); i < 10; i++ {
@@ -1597,8 +1586,6 @@ func TestCommitSlot_ZeroGenerationStaleAfterAdvance(t *testing.T) {
 	mustInit(t, store, "g", meta, []byte("init"), 10, testSegmentBytes, 5)
 	s := store.Get("g")
 
-	require.NoError(t, s.AddInitEntry(3, []byte("init3")))
-
 	// Advance to generation 3.
 	err := commitSlotGen(t, s, 0, []byte("data"), 5000, 2000, 3)
 	require.NoError(t, err)
@@ -1637,14 +1624,10 @@ func TestStoreInit_NonZeroGeneration(t *testing.T) {
 
 	assert.Equal(t, int64(5), s.CurrentGeneration())
 
-	// Init data for gen 5 should be retrievable.
-	initBytes, ok := s.GetInit(5)
+	// Init data should be retrievable.
+	initBytes, ok := s.GetInit()
 	require.True(t, ok)
 	assert.Equal(t, []byte("init-gen5"), initBytes)
-
-	// Gen 0 init entry should not exist.
-	_, ok = s.GetInit(0)
-	assert.False(t, ok, "gen 0 should not have an init entry")
 
 	// Segment at gen 4 → stale (< currentGeneration 5).
 	err = commitSlotGen(t, s, 0, []byte("data"), 5000, 2000, 4)
@@ -1657,206 +1640,4 @@ func TestStoreInit_NonZeroGeneration(t *testing.T) {
 	// Segment at gen 5 → succeeds.
 	err = commitSlotGen(t, s, 0, []byte("data"), 5000, 2000, 5)
 	require.NoError(t, err)
-}
-
-func TestEviction_ActiveReaderStopsDiscontinuityTracking(t *testing.T) {
-	// When eviction stops at a segment with an active reader, discontinuity
-	// counting should only reflect segments actually evicted, not the one
-	// blocked by the reader.
-	clk := clock.NewMock(time.UnixMilli(0))
-	store := NewStore(clk)
-	meta := Metadata{Bandwidth: 1, Codecs: "avc1.64001f", Width: 1, Height: 1, FrameRate: 30, TargetDurationSecs: 2}
-	// backwardBufferSize=1, workingSpace=1
-	err := store.Init("s", meta, []byte("init0"), 0, 20, testSegmentBytes, 1, 1, 12)
-	require.NoError(t, err)
-	t.Cleanup(func() { store.Delete("s") })
-	s := store.Get("s")
-	require.NotNil(t, s)
-
-	require.NoError(t, s.AddInitEntry(1, []byte("init1")))
-
-	// Push: index 0 (gen=0), index 1 (gen=0), index 2 (gen=1), index 3 (gen=1)
-	mustCommitSlot(t, s, 0, []byte("d"), 1000, 2000)
-	mustCommitSlot(t, s, 1, []byte("d"), 3000, 2000)
-	require.NoError(t, commitSlotGen(t, s, 2, []byte("d"), 5000, 2000, 1))
-	require.NoError(t, commitSlotGen(t, s, 3, []byte("d"), 7000, 2000, 1))
-
-	// Acquire a reader on index 1 (gen=0). This will block eviction from
-	// proceeding past it.
-	var readerDone bool
-	err = s.RunWithSegmentSlot(1, func(slot *pool.BufferSlot) error {
-		// While the reader holds the reference, advance time and push a
-		// segment to trigger eviction.
-		clk.Set(time.UnixMilli(8000))
-		require.NoError(t, commitSlotGen(t, s, 4, []byte("d"), 9000, 2000, 1))
-
-		// Eviction should have evicted index 0 (gen=0) but stopped at
-		// index 1 because it has an active reader.
-		// evictedDiscontinuities: 0 (only gen=0 segments evicted so far,
-		// no generation change among them).
-		// lastEvictedGeneration: 0 (index 0 was gen=0).
-
-		// Verify index 0 is evicted and index 1 is kept.
-		_, readErr := readSegment(s, 0)
-		assert.ErrorIs(t, readErr, ErrSegmentNotFound, "index 0 should be evicted")
-		_, readErr = readSegment(s, 1)
-		assert.NoError(t, readErr, "index 1 should be kept (active reader)")
-
-		readerDone = true
-		return nil
-	})
-	require.NoError(t, err)
-	require.True(t, readerDone)
-
-	// Now the reader is released. Push another segment to trigger eviction again.
-	clk.Set(time.UnixMilli(10000))
-	require.NoError(t, commitSlotGen(t, s, 5, []byte("d"), 11000, 2000, 1))
-
-	// Now index 1 (gen=0) and index 2 (gen=1) should be evicted.
-	// The gen 0→1 transition should now be counted.
-	// Render and check the DISCONTINUITY-SEQUENCE.
-	s.mu.RLock()
-	playlist, _ := s.renderMediaPlaylist(11000, 12)
-	s.mu.RUnlock()
-
-	assert.Contains(t, playlist, "#EXT-X-DISCONTINUITY-SEQUENCE:1\n",
-		"gen 0→1 transition should be counted after reader released; got:\n%s", playlist)
-}
-
-// ---------------------------------------------------------------------------
-// Init entry eviction
-// ---------------------------------------------------------------------------
-
-func TestEvictStaleInitEntries_BasicEviction(t *testing.T) {
-	// Gen 0 init should be evicted after gen 1 segments replace all gen 0
-	// segments via dropStaleGenerationLocked.
-	clk := clock.NewMock(time.UnixMilli(0))
-	store := NewStore(clk)
-	meta := Metadata{Bandwidth: 1, Codecs: "avc1.64001f", Width: 1, Height: 1, FrameRate: 30, TargetDurationSecs: 2}
-	mustInit(t, store, "s", meta, []byte("init0"), 10, testSegmentBytes, 5)
-	s := store.Get("s")
-
-	require.NoError(t, s.AddInitEntry(1, []byte("init1")))
-
-	// Push gen=0 segments.
-	for i := uint32(0); i < 3; i++ {
-		require.NoError(t, commitSlotGen(t, s, i, []byte("d"), int64(5000+i*2000), 2000, 0))
-	}
-	// Gen 0 init should still be present.
-	_, ok := s.GetInit(0)
-	require.True(t, ok, "gen 0 init should exist while gen 0 segments are buffered")
-
-	// Advance to gen=1 at index 0 — drops all gen=0 segments at/after idx 0.
-	require.NoError(t, commitSlotGen(t, s, 0, []byte("n"), 5000, 2000, 1))
-
-	// Gen 0 init should now be evicted (no gen 0 segments remain).
-	_, ok = s.GetInit(0)
-	assert.False(t, ok, "gen 0 init should be evicted")
-
-	// Gen 1 init remains.
-	_, ok = s.GetInit(1)
-	assert.True(t, ok, "gen 1 init should still exist")
-}
-
-func TestEvictStaleInitEntries_RetainedWhileSegmentsExist(t *testing.T) {
-	// Gen 0 init should be retained as long as gen 0 segments remain in the
-	// backward buffer, and evicted once they are all gone.
-	clk := clock.NewMock(time.UnixMilli(0))
-	store := NewStore(clk)
-	meta := Metadata{Bandwidth: 1, Codecs: "avc1.64001f", Width: 1, Height: 1, FrameRate: 30, TargetDurationSecs: 2}
-	// backwardBufferSize=1 so old segments evict quickly.
-	err := store.Init("s", meta, []byte("init0"), 0, 10, testSegmentBytes, 1, 1, testPlaylistWindowSize)
-	require.NoError(t, err)
-	t.Cleanup(func() { store.Delete("s") })
-	s := store.Get("s")
-
-	require.NoError(t, s.AddInitEntry(1, []byte("init1")))
-
-	// Push gen=0 segments at indices 0-2.
-	for i := uint32(0); i < 3; i++ {
-		require.NoError(t, commitSlotGen(t, s, i, []byte("d"), int64(5000+i*2000), 2000, 0))
-	}
-
-	// Advance to gen=1 at index 3 — gen=0 segments at 0-2 remain (before insertion point).
-	require.NoError(t, commitSlotGen(t, s, 3, []byte("n"), 11000, 2000, 1))
-
-	_, ok := s.GetInit(0)
-	assert.True(t, ok, "gen 0 init should be retained while gen 0 segments exist in buffer")
-
-	// Advance clock so all gen 0 segments are in the past and push gen=1
-	// segments to trigger time-based eviction of gen 0 segments.
-	clk.Set(time.UnixMilli(20000))
-	for i := uint32(4); i < 8; i++ {
-		require.NoError(t, commitSlotGen(t, s, i, []byte("n"), int64(20000+int64(i)*2000), 2000, 1))
-	}
-
-	// Gen 0 segments should have been evicted by time-based eviction.
-	// Gen 0 init should now be gone.
-	_, ok = s.GetInit(0)
-	assert.False(t, ok, "gen 0 init should be evicted after all gen 0 segments are evicted")
-}
-
-func TestEvictStaleInitEntries_CurrentGenerationRetained(t *testing.T) {
-	// The current generation's init must never be evicted, even with zero segments.
-	clk := clock.NewMock(time.UnixMilli(0))
-	store := NewStore(clk)
-	meta := Metadata{Bandwidth: 1, Codecs: "avc1.64001f", Width: 1, Height: 1, FrameRate: 30, TargetDurationSecs: 2}
-	mustInit(t, store, "s", meta, []byte("init0"), 10, testSegmentBytes, 1)
-	s := store.Get("s")
-
-	require.NoError(t, s.AddInitEntry(1, []byte("init1")))
-
-	// Push one gen=0 segment, then advance to gen=1. Gen=0 segment gets dropped.
-	require.NoError(t, commitSlotGen(t, s, 0, []byte("d"), 5000, 2000, 0))
-	require.NoError(t, commitSlotGen(t, s, 0, []byte("n"), 5000, 2000, 1))
-
-	// Advance clock and push to trigger eviction of the gen=1 segment.
-	clk.Set(time.UnixMilli(10000))
-	require.NoError(t, commitSlotGen(t, s, 1, []byte("n2"), 12000, 2000, 1))
-
-	// Gen 1 is current generation — init must be retained even if the first
-	// gen=1 segment was evicted.
-	_, ok := s.GetInit(1)
-	assert.True(t, ok, "current generation init must never be evicted")
-}
-
-func TestEvictStaleInitEntries_MultipleGenerations(t *testing.T) {
-	// Gens 0 and 1 should be evicted when only gen 2 segments exist.
-	clk := clock.NewMock(time.UnixMilli(0))
-	store := NewStore(clk)
-	meta := Metadata{Bandwidth: 1, Codecs: "avc1.64001f", Width: 1, Height: 1, FrameRate: 30, TargetDurationSecs: 2}
-	mustInit(t, store, "s", meta, []byte("init0"), 10, testSegmentBytes, 5)
-	s := store.Get("s")
-
-	require.NoError(t, s.AddInitEntry(1, []byte("init1")))
-	require.NoError(t, s.AddInitEntry(2, []byte("init2")))
-
-	// Push gen=0, then advance to gen=1, then advance to gen=2.
-	require.NoError(t, commitSlotGen(t, s, 0, []byte("d"), 5000, 2000, 0))
-	require.NoError(t, commitSlotGen(t, s, 0, []byte("d"), 5000, 2000, 1))
-	require.NoError(t, commitSlotGen(t, s, 0, []byte("d"), 5000, 2000, 2))
-
-	// Only gen=2 segment remains. Both gen 0 and gen 1 inits should be evicted.
-	_, ok := s.GetInit(0)
-	assert.False(t, ok, "gen 0 init should be evicted")
-	_, ok = s.GetInit(1)
-	assert.False(t, ok, "gen 1 init should be evicted")
-	_, ok = s.GetInit(2)
-	assert.True(t, ok, "gen 2 init should be retained (current)")
-}
-
-func TestEvictStaleInitEntries_SingleGeneration_NoOp(t *testing.T) {
-	// With only one generation, no eviction should occur.
-	clk := clock.NewMock(time.UnixMilli(0))
-	store := NewStore(clk)
-	meta := Metadata{Bandwidth: 1, Codecs: "avc1.64001f", Width: 1, Height: 1, FrameRate: 30, TargetDurationSecs: 2}
-	mustInit(t, store, "s", meta, []byte("init0"), 10, testSegmentBytes, 5)
-	s := store.Get("s")
-
-	for i := uint32(0); i < 5; i++ {
-		require.NoError(t, commitSlotGen(t, s, i, []byte("d"), int64(5000+i*2000), 2000, 0))
-	}
-
-	_, ok := s.GetInit(0)
-	assert.True(t, ok, "single generation init should never be evicted")
 }
