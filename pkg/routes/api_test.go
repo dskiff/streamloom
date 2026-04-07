@@ -249,7 +249,7 @@ func TestPostInit_BufferSizeOverflowsInt64(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
 }
 
-func TestPostInit_ReInitReplacesStream(t *testing.T) {
+func TestPostInit_ExistingStreamReturns409(t *testing.T) {
 	clk := clock.NewMock(time.UnixMilli(0))
 	router, store, _, _ := testAPIRouterWithToken(t, clk)
 
@@ -258,23 +258,9 @@ func TestPostInit_ReInitReplacesStream(t *testing.T) {
 	require.Equal(t, http.StatusCreated, rec.Code)
 	t.Cleanup(func() { store.Delete("1") })
 
-	// Upload a segment so the stream is non-empty.
-	s := store.Get("1")
-	require.NotNil(t, s)
-	commitSegment(t, s, 0, []byte("seg"), 5000)
-	assert.Equal(t, int64(1), s.TotalSegmentCount())
-	segCount, _ := s.SegmentLoad()
-	assert.Equal(t, 1, segCount)
-
-	// Re-init should clear all segments.
+	// Second init on the same stream should be rejected.
 	rec = postInit(router, "1", "test-token", hdrs, []byte("init-data-v2"))
-	assert.Equal(t, http.StatusCreated, rec.Code)
-
-	s = store.Get("1")
-	require.NotNil(t, s)
-	assert.Equal(t, int64(0), s.TotalSegmentCount(), "total segment count should reset after re-init")
-	segCount, _ = s.SegmentLoad()
-	assert.Equal(t, 0, segCount, "buffered segments should be empty after re-init")
+	assert.Equal(t, http.StatusConflict, rec.Code)
 }
 
 // --- POST /api/v1/stream/{streamID}/segment tests ---

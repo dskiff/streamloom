@@ -40,11 +40,6 @@ var ErrTimestampOrderViolation = errors.New("segment timestamp order violation")
 // than the stream's current generation. The caller should drop the segment.
 var ErrStaleGeneration = errors.New("stale generation")
 
-// ErrNegativeGeneration is returned when a generation value is negative.
-// Generations must be non-negative integers; -1 is reserved as an
-// internal sentinel.
-var ErrNegativeGeneration = errors.New("generation must be non-negative")
-
 // ErrEmptyInitData is returned when init data is empty.
 var ErrEmptyInitData = errors.New("init data must not be empty")
 
@@ -458,20 +453,22 @@ var ErrInvalidBackwardBufferSize = errors.New("backwardBufferSize must be >= 1 a
 // overflow when added to segmentCapacity.
 var ErrInvalidWorkingSpace = errors.New("workingSpace must be >= 0 and segmentCapacity + workingSpace must not overflow")
 
-// Init creates or replaces a stream's init state, clearing any existing segments.
+// ErrStreamExists is returned when Init is called for a stream ID that
+// already exists. Callers must Delete the stream first if they wish to
+// re-initialize it.
+var ErrStreamExists = errors.New("stream already exists")
+
+// Init creates a new stream with the given init segment and metadata.
 // The initData slice is cloned so that the caller cannot mutate the stored bytes.
-// generation identifies the encoding generation for this init entry; it must be
-// non-negative (returns ErrNegativeGeneration otherwise). initData must be
-// non-empty (returns ErrEmptyInitData otherwise).
+// initData must be non-empty (returns ErrEmptyInitData otherwise).
+// Returns ErrStreamExists if a stream with the given ID already exists;
+// callers must Delete it first.
 // workingSpace extra slots are added to the BufferPool beyond segmentCapacity to
 // allow concurrent handlers to hold buffers before committing.
 // backwardBufferSize controls how many past segments are retained during eviction;
 // it must be >= 1 and < segmentCapacity.
 // playlistWindowSize is the maximum number of segments in the media playlist.
-func (s *Store) Init(id string, meta Metadata, initData []byte, generation int64, segmentCapacity, segmentBytes, backwardBufferSize, workingSpace, playlistWindowSize int) error {
-	if generation < 0 {
-		return ErrNegativeGeneration
-	}
+func (s *Store) Init(id string, meta Metadata, initData []byte, segmentCapacity, segmentBytes, backwardBufferSize, workingSpace, playlistWindowSize int) error {
 	if len(initData) == 0 {
 		return ErrEmptyInitData
 	}
@@ -495,11 +492,9 @@ func (s *Store) Init(id string, meta Metadata, initData []byte, generation int64
 
 	s.mu.Lock()
 
-	// Stop the previous stream's renderer goroutine if replacing.
-	var prev *Stream
-	if p, ok := s.streams[id]; ok {
-		close(p.done)
-		prev = p
+	if _, ok := s.streams[id]; ok {
+		s.mu.Unlock()
+		return ErrStreamExists
 	}
 
 	st := &Stream{
@@ -508,7 +503,6 @@ func (s *Store) Init(id string, meta Metadata, initData []byte, generation int64
 		initData:           cloned,
 		segments:           make([]Slot, 0, segmentCapacity),
 		segmentCap:         segmentCapacity,
-		currentGeneration:  generation,
 		bufPool:            pool.NewBufferPool(segmentCapacity+workingSpace, segmentBytes),
 		backwardBufferSize: backwardBufferSize,
 		notifyCh:           make(chan struct{}, 1),
@@ -519,11 +513,6 @@ func (s *Store) Init(id string, meta Metadata, initData []byte, generation int64
 	}
 	s.streams[id] = st
 	s.mu.Unlock()
-
-	// Wait for the previous renderer to fully exit before starting the new one.
-	if prev != nil {
-		<-prev.stopped
-	}
 
 	go st.runPlaylistRenderer(playlistWindowSize)
 

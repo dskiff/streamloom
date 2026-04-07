@@ -30,7 +30,7 @@ func setupStreamForPlaylist(t *testing.T, targetDurationSecs int) (*Store, *Stre
 		FrameRate:          23.976,
 		TargetDurationSecs: targetDurationSecs,
 	}
-	err := store.Init("1", meta, []byte("init"), 0, 50, testSegmentBytes, 20, 5, 12)
+	err := store.Init("1", meta, []byte("init"), 50, testSegmentBytes, 20, 5, 12)
 	require.NoError(t, err)
 	s := store.Get("1")
 	require.NotNil(t, s)
@@ -264,7 +264,7 @@ func TestRunPlaylistRenderer_NotifyDuringMinRenderInterval(t *testing.T) {
 		FrameRate:          23.976,
 		TargetDurationSecs: 2,
 	}
-	err := store.Init("1", meta, []byte("init"), 0, 20, testSegmentBytes, 10, 2, 12)
+	err := store.Init("1", meta, []byte("init"), 20, testSegmentBytes, 10, 2, 12)
 	require.NoError(t, err)
 	t.Cleanup(func() { store.Delete("1") })
 
@@ -344,7 +344,7 @@ func TestRunPlaylistRenderer_NotifyRacesWithTimer(t *testing.T) {
 		FrameRate:          23.976,
 		TargetDurationSecs: 2,
 	}
-	err := store.Init("1", meta, []byte("init"), 0, 20, testSegmentBytes, 10, 2, 12)
+	err := store.Init("1", meta, []byte("init"), 20, testSegmentBytes, 10, 2, 12)
 	require.NoError(t, err)
 	t.Cleanup(func() { store.Delete("1") })
 
