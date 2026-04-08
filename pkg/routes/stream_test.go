@@ -98,15 +98,14 @@ func TestGetSegment_OverflowSegmentID(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
 }
 
-// --- GET /stream/{streamID}/init_{generation}.mp4 tests ---
+// --- GET /stream/{streamID}/init.mp4 tests ---
 
 func TestGetInitMP4_Success(t *testing.T) {
 	clk := clock.NewMock(time.UnixMilli(1000))
 	router, store, _ := testStreamRouter(t, clk)
 	initStream(t, store, "1")
 
-	// Init was created at generation 0 by initStream.
-	req := httptest.NewRequest(http.MethodGet, "/stream/1/init_0.mp4", nil)
+	req := httptest.NewRequest(http.MethodGet, "/stream/1/init.mp4", nil)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 
@@ -121,7 +120,7 @@ func TestGetInitMP4_UnconfiguredStream_Returns503(t *testing.T) {
 	router, _, _ := testStreamRouter(t, clock.Real{})
 
 	// Unconfigured streams with valid IDs return 503 to prevent enumeration.
-	req := httptest.NewRequest(http.MethodGet, "/stream/999/init_0.mp4", nil)
+	req := httptest.NewRequest(http.MethodGet, "/stream/999/init.mp4", nil)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 
@@ -133,67 +132,12 @@ func TestGetInitMP4_ConfiguredButUninitialized_Returns503(t *testing.T) {
 	router, _, _ := testStreamRouter(t, clock.Real{})
 
 	// Stream 1 is configured but not initialized.
-	req := httptest.NewRequest(http.MethodGet, "/stream/1/init_0.mp4", nil)
+	req := httptest.NewRequest(http.MethodGet, "/stream/1/init.mp4", nil)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 
 	assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
 	assert.Equal(t, "2", rec.Header().Get("Retry-After"))
-}
-
-func TestGetInitMP4_UnknownGeneration(t *testing.T) {
-	clk := clock.NewMock(time.UnixMilli(1000))
-	router, store, _ := testStreamRouter(t, clk)
-	initStream(t, store, "1")
-
-	// Request for generation 9999 which doesn't exist should return 404.
-	req := httptest.NewRequest(http.MethodGet, "/stream/1/init_9999.mp4", nil)
-	rec := httptest.NewRecorder()
-	router.ServeHTTP(rec, req)
-
-	assert.Equal(t, http.StatusNotFound, rec.Code)
-}
-
-func TestGetInitMP4_InvalidInitID(t *testing.T) {
-	router, store, _ := testStreamRouter(t, clock.Real{})
-	initStream(t, store, "1")
-
-	req := httptest.NewRequest(http.MethodGet, "/stream/1/init_abc.mp4", nil)
-	rec := httptest.NewRecorder()
-	router.ServeHTTP(rec, req)
-
-	assert.Equal(t, http.StatusBadRequest, rec.Code)
-}
-
-func TestGetInitMP4_EvictedGeneration_Returns404(t *testing.T) {
-	clk := clock.NewMock(time.UnixMilli(0))
-	router, store, _ := testStreamRouter(t, clk)
-	initStream(t, store, "1")
-
-	s := store.Get("1")
-	require.NotNil(t, s)
-
-	// Add gen=1 init and push gen=0 segment.
-	require.NoError(t, s.AddInitEntry(1, []byte("init1")))
-	commitSegmentGen(t, s, 0, []byte("d"), 5000, 0)
-
-	// Advance to gen=1 at index 0 — drops gen=0 segment, triggers init eviction.
-	commitSegmentGen(t, s, 0, []byte("n"), 5000, 1)
-
-	// Gen 0 init should be evicted — HTTP request should return 404.
-	req := httptest.NewRequest(http.MethodGet, "/stream/1/init_0.mp4", nil)
-	rec := httptest.NewRecorder()
-	router.ServeHTTP(rec, req)
-
-	assert.Equal(t, http.StatusNotFound, rec.Code)
-
-	// Gen 1 init should still be served.
-	req = httptest.NewRequest(http.MethodGet, "/stream/1/init_1.mp4", nil)
-	rec = httptest.NewRecorder()
-	router.ServeHTTP(rec, req)
-
-	assert.Equal(t, http.StatusOK, rec.Code)
-	assert.Equal(t, []byte("init1"), rec.Body.Bytes())
 }
 
 // --- GET /stream/{streamID}/media.m3u8 tests ---
@@ -257,7 +201,7 @@ func TestMediaPlaylist_WithSegments(t *testing.T) {
 	assert.Contains(t, body, "#EXT-X-VERSION:7")
 	assert.Contains(t, body, "#EXT-X-TARGETDURATION:2")
 	assert.Contains(t, body, "#EXT-X-MEDIA-SEQUENCE:0")
-	assert.Contains(t, body, "#EXT-X-MAP:URI=\"init_0.mp4\"")
+	assert.Contains(t, body, "#EXT-X-MAP:URI=\"init.mp4\"")
 	assert.Contains(t, body, "segment_0.m4s")
 	assert.Contains(t, body, "segment_1.m4s")
 	assert.Contains(t, body, "segment_2.m4s")
@@ -418,7 +362,7 @@ func TestNosniffHeader(t *testing.T) {
 	assert.Equal(t, "nosniff", rec.Header().Get("X-Content-Type-Options"))
 
 	// Verify on init response.
-	initURL := "/stream/1/init_0.mp4" // generation 0
+	initURL := "/stream/1/init.mp4"
 	req = httptest.NewRequest(http.MethodGet, initURL, nil)
 	rec = httptest.NewRecorder()
 	router.ServeHTTP(rec, req)

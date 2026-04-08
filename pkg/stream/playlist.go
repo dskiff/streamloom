@@ -11,43 +11,10 @@ import (
 // Prevents busy-looping when many segments have past timestamps.
 const minRenderInterval = 50 * time.Millisecond
 
-// discontinuitySequence counts the number of generation transitions that have
-// scrolled out before the playlist window. This includes transitions among
-// evicted segments and transitions among buffered segments before the window.
-//
-// Must be called with s.mu.RLock held.
-func (s *Stream) discontinuitySequence(start int) int {
-	discSeq := s.evictedDiscontinuities
-
-	// Check boundary between last evicted segment and first buffered segment.
-	// This applies regardless of whether start is 0: if eviction removed all
-	// pre-window segments, the transition still scrolled out of the window.
-	// lastEvictedGeneration == -1 means no segments have been evicted yet.
-	if s.lastEvictedGeneration >= 0 && len(s.segments) > 0 && s.segments[0].Generation != s.lastEvictedGeneration {
-		discSeq++
-	}
-
-	// Count transitions among buffered pre-window segments and the boundary
-	// between the last pre-window segment and the first window segment.
-	// Using <= start (not < start) ensures the transition at segments[start-1]
-	// → segments[start] is counted when windowing pushes it out.
-	for i := 1; i <= start; i++ {
-		if s.segments[i].Generation != s.segments[i-1].Generation {
-			discSeq++
-		}
-	}
-
-	return discSeq
-}
-
 // renderMediaPlaylist builds the HLS media playlist string from the current
 // in-memory segments. Only segments with Timestamp <= nowMs are eligible.
 // A sliding window of at most windowSize segments is applied to the tail of
 // the eligible set.
-//
-// Generation transitions within the window produce #EXT-X-DISCONTINUITY tags
-// and per-generation #EXT-X-MAP directives. The #EXT-X-DISCONTINUITY-SEQUENCE
-// header counts transitions that have scrolled out before the window.
 //
 // Returns (playlist, nextEligibleMs) where nextEligibleMs is the timestamp
 // of the first segment not yet eligible (0 if no such segment exists).
@@ -74,8 +41,6 @@ func (s *Stream) renderMediaPlaylist(nowMs int64, windowSize int) (string, int64
 	start := max(eligible-windowSize, 0)
 	window := s.segments[start:eligible]
 
-	discSeq := s.discontinuitySequence(start)
-
 	var b strings.Builder
 	var scratch [64]byte
 
@@ -94,22 +59,9 @@ func (s *Stream) renderMediaPlaylist(nowMs int64, windowSize int) (string, int64
 	b.Write(strconv.AppendUint(scratch[:0], uint64(window[0].Index), 10))
 	b.WriteByte('\n')
 
-	b.WriteString("#EXT-X-DISCONTINUITY-SEQUENCE:")
-	b.Write(strconv.AppendInt(scratch[:0], int64(discSeq), 10))
-	b.WriteByte('\n')
+	b.WriteString("#EXT-X-MAP:URI=\"init.mp4\"\n")
 
-	var prevGeneration int64
-	for i, seg := range window {
-		if i == 0 || seg.Generation != prevGeneration {
-			if i > 0 {
-				b.WriteString("#EXT-X-DISCONTINUITY\n")
-			}
-			b.WriteString("#EXT-X-MAP:URI=\"init_")
-			b.Write(strconv.AppendInt(scratch[:0], seg.Generation, 10))
-			b.WriteString(".mp4\"\n")
-		}
-		prevGeneration = seg.Generation
-
+	for _, seg := range window {
 		b.WriteString("#EXT-X-PROGRAM-DATE-TIME:")
 		b.Write(time.UnixMilli(seg.Timestamp).UTC().AppendFormat(scratch[:0], "2006-01-02T15:04:05.000Z"))
 		b.WriteByte('\n')

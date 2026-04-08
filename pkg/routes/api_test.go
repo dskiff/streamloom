@@ -249,7 +249,7 @@ func TestPostInit_BufferSizeOverflowsInt64(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
 }
 
-func TestPostInit_DuplicateGenerationReturns409(t *testing.T) {
+func TestPostInit_ExistingStreamReturns409(t *testing.T) {
 	clk := clock.NewMock(time.UnixMilli(0))
 	router, store, _, _ := testAPIRouterWithToken(t, clk)
 
@@ -258,31 +258,9 @@ func TestPostInit_DuplicateGenerationReturns409(t *testing.T) {
 	require.Equal(t, http.StatusCreated, rec.Code)
 	t.Cleanup(func() { store.Delete("1") })
 
-	// Second init at the same generation (0) should return 409.
-	rec = postInitForGeneration(router, "1", "test-token", "0", []byte("init-data-v2"))
+	// Second init on the same stream should be rejected.
+	rec = postInit(router, "1", "test-token", hdrs, []byte("init-data-v2"))
 	assert.Equal(t, http.StatusConflict, rec.Code)
-}
-
-func TestPostInit_SubsequentGenerationPreservesSegments(t *testing.T) {
-	clk := clock.NewMock(time.UnixMilli(0))
-	router, store, _, _ := testAPIRouterWithToken(t, clk)
-
-	hdrs := initHeaders()
-	rec := postInit(router, "1", "test-token", hdrs, []byte("init-data"))
-	require.Equal(t, http.StatusCreated, rec.Code)
-	t.Cleanup(func() { store.Delete("1") })
-
-	s := store.Get("1")
-	require.NotNil(t, s)
-	commitSegment(t, s, 0, []byte("seg"), 5000)
-
-	// Add init for generation 1 — segments should be preserved.
-	rec = postInitForGeneration(router, "1", "test-token", "1", []byte("init-gen1"))
-	require.Equal(t, http.StatusCreated, rec.Code)
-
-	s = store.Get("1")
-	require.NotNil(t, s)
-	assert.Equal(t, int64(1), s.TotalSegmentCount(), "segments should be preserved after subsequent init")
 }
 
 // --- POST /api/v1/stream/{streamID}/segment tests ---
@@ -463,10 +441,7 @@ func TestPostSegment_GenerationAccepted(t *testing.T) {
 	require.Equal(t, http.StatusCreated, rec.Code)
 	t.Cleanup(func() { store.Delete("1") })
 
-	// Add init entry for generation 1 before pushing a segment at that generation.
-	rec = postInitForGeneration(router, "1", "test-token", "1", []byte("init-gen1"))
-	require.Equal(t, http.StatusCreated, rec.Code)
-
+	// Push a segment at generation 1 directly (no separate init entry needed).
 	rec = postSegmentWithGen(router, "1", "test-token", "0", "5000", "2000", "1", []byte("data"))
 	assert.Equal(t, http.StatusCreated, rec.Code)
 }
@@ -480,13 +455,7 @@ func TestPostSegment_StaleGeneration(t *testing.T) {
 	require.Equal(t, http.StatusCreated, rec.Code)
 	t.Cleanup(func() { store.Delete("1") })
 
-	// Add init entries for generations we'll use.
-	rec = postInitForGeneration(router, "1", "test-token", "2", []byte("init-gen2"))
-	require.Equal(t, http.StatusCreated, rec.Code)
-	rec = postInitForGeneration(router, "1", "test-token", "5", []byte("init-gen5"))
-	require.Equal(t, http.StatusCreated, rec.Code)
-
-	// Push gen=5.
+	// Push gen=5 to advance.
 	rec = postSegmentWithGen(router, "1", "test-token", "0", "5000", "2000", "5", []byte("data"))
 	require.Equal(t, http.StatusCreated, rec.Code)
 
@@ -543,10 +512,6 @@ func TestPostSegment_MissingGenerationStaleAfterAdvance(t *testing.T) {
 	rec := postInit(router, "1", "test-token", hdrs, []byte("init-data"))
 	require.Equal(t, http.StatusCreated, rec.Code)
 	t.Cleanup(func() { store.Delete("1") })
-
-	// Add init entry for generation 2.
-	rec = postInitForGeneration(router, "1", "test-token", "2", []byte("init-gen2"))
-	require.Equal(t, http.StatusCreated, rec.Code)
 
 	// Advance stream to generation 2.
 	rec = postSegmentWithGen(router, "1", "test-token", "0", "5000", "2000", "2", []byte("data"))
