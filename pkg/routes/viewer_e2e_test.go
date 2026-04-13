@@ -119,20 +119,22 @@ func TestE2E_ViewerToken_ExpiredAfterMint(t *testing.T) {
 	rec = postSegment(apiRouter, "1", "test-token", "0", "5000", "2000", []byte("seg"))
 	require.Equal(t, http.StatusCreated, rec.Code)
 
-	// Mint a token that expires one second after "now".
-	exp := clk.Now().Add(time.Second).UnixMilli()
+	// Mint a short-but-valid token (10 minutes, comfortably above the
+	// 5-minute floor even after minute alignment).
+	exp := clk.Now().Add(10 * time.Minute).UnixMilli()
 	body, _ := json.Marshal(map[string]any{"expires_at_ms": exp})
 	rec = postViewerToken(apiRouter, "1", "test-token", body)
 	require.Equal(t, http.StatusCreated, rec.Code)
 
 	var mintResp struct {
-		Token string `json:"token"`
+		Token       string `json:"token"`
+		ExpiresAtMs int64  `json:"expires_at_ms"`
 	}
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &mintResp))
 	vt := mintResp.Token
 
-	// Advance the clock well past expiry.
-	clk.Set(time.UnixMilli(exp + 1000))
+	// Advance the clock well past the encoded expiry.
+	clk.Set(time.UnixMilli(mintResp.ExpiresAtMs + 1000))
 
 	req := httptest.NewRequest(http.MethodGet, "/stream/1/segment_0.m4s?vt="+vt, nil)
 	rec = httptest.NewRecorder()

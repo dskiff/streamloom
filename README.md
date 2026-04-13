@@ -129,16 +129,18 @@ Request body (JSON):
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `expires_at_ms` | int64 | Token expiration as unix milliseconds. Must be strictly greater than the server's current time. |
+| `expires_at_ms` | int64 | Token expiration as unix milliseconds. The server floors this value to the nearest minute boundary before encoding. The aligned value must be at least 5 minutes past the server's current time; requests below that floor are rejected with `400 Bad Request`. |
 
 Response `201 Created`:
 
 ```json
 {
-  "token": "<34-char base64url>",
+  "token": "<28-char base64url>",
   "expires_at_ms": 1700000000000
 }
 ```
+
+The `expires_at_ms` in the response echoes the **aligned** value actually encoded in the token, which may be up to 59,999 ms less than the requested value. Clients should treat this as the authoritative expiry.
 
 The returned token must be passed as `?vt=<token>` on every stream URL (`stream.m3u8`, `media.m3u8`, `init.mp4`, `segment_*.m4s`). Tokens are verified statelessly: the server holds no per-token state. Rotating `SL_STREAM_<id>_VIEWER_TOKEN_KEY` immediately invalidates all outstanding tokens for that stream.
 

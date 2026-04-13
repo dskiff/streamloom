@@ -29,6 +29,18 @@ import (
 // request body. The body is a tiny JSON object; 1 KiB is generous.
 const MaxViewerTokenRequestBytes = 1 << 10
 
+// MinViewerTokenTTLMs is the minimum viewer-token lifetime (measured from
+// mint time to the minute-aligned expiry). Sub-5-minute tokens are rejected
+// to make the encoding's minute precision a non-issue for callers — a
+// reasonable floor for share-link semantics and comfortably larger than a
+// typical client-clock drift budget.
+const MinViewerTokenTTLMs = 5 * 60 * 1000
+
+// viewerTokenMsPerMinute is used to floor an expires_at_ms value to the
+// minute boundary at which tokens are encoded. Kept here to avoid leaking
+// the viewer package's private constant across the serde boundary.
+const viewerTokenMsPerMinute = 60_000
+
 // contextKey is a private type for context keys to avoid collisions.
 type contextKey string
 
@@ -266,14 +278,24 @@ func API(logger *slog.Logger, env config.Env, store *stream.Store, requestLogger
 			}
 
 			nowMs := store.Clock().Now().UnixMilli()
-			if req.ExpiresAtMs <= nowMs {
-				logger.Warn("viewer token expiry must be in the future",
-					"streamID", streamID, "expires_at_ms", req.ExpiresAtMs, "now_ms", nowMs)
+			// Floor the requested expiry to the minute boundary at which
+			// tokens are encoded, then enforce a minimum TTL on the encoded
+			// value. This surfaces the wire format's minute precision as an
+			// explicit contract rather than letting callers receive tokens
+			// that silently expire earlier than they expected.
+			alignedExpMs := (req.ExpiresAtMs / viewerTokenMsPerMinute) * viewerTokenMsPerMinute
+			if alignedExpMs-nowMs < MinViewerTokenTTLMs {
+				logger.Warn("viewer token TTL below minimum",
+					"streamID", streamID,
+					"requested_expires_at_ms", req.ExpiresAtMs,
+					"aligned_expires_at_ms", alignedExpMs,
+					"now_ms", nowMs,
+					"min_ttl_ms", MinViewerTokenTTLMs)
 				w.WriteHeader(http.StatusBadRequest)
 				return
 			}
 
-			token, err := viewer.Mint(key, req.ExpiresAtMs)
+			token, err := viewer.Mint(key, alignedExpMs)
 			if err != nil {
 				logger.Error("failed to mint viewer token", "error", err, "streamID", streamID)
 				w.WriteHeader(http.StatusInternalServerError)
@@ -285,7 +307,7 @@ func API(logger *slog.Logger, env config.Env, store *stream.Store, requestLogger
 				ExpiresAtMs int64  `json:"expires_at_ms"`
 			}{
 				Token:       token,
-				ExpiresAtMs: req.ExpiresAtMs,
+				ExpiresAtMs: alignedExpMs,
 			}
 			w.Header().Set("Content-Type", "application/json")
 			w.Header().Set("Cache-Control", "no-store")

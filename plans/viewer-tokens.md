@@ -21,13 +21,26 @@ introducing a session store.
 ## Wire format
 
 ```
-[1 byte version=1] [8 bytes int64 big-endian exp_ms] [16 bytes truncated HMAC-SHA256]
+[1 byte version=1] [4 bytes uint32 big-endian unix minutes] [16 bytes truncated HMAC-SHA256]
 ```
 
-25 bytes → `base64.RawURLEncoding` → **34-char token**. The MAC is computed
-over `version_byte || exp_ms_bytes` and truncated to the leftmost 16 bytes
-(128-bit, RFC 2104 §5). The env-var value is used directly as the HMAC key.
-Stream ID is NOT bound into the MAC — per-stream keys already isolate streams.
+21 bytes → `base64.RawURLEncoding` → **28-char token**. The MAC is computed
+over `version_byte || exp_minutes_bytes` and truncated to the leftmost 16
+bytes (128-bit, RFC 2104 §5). The env-var value is used directly as the HMAC
+key. Stream ID is NOT bound into the MAC — per-stream keys already isolate
+streams.
+
+Expiration is encoded as unsigned unix minutes (uint32), giving ~8170 years
+of range from the epoch — practical overflow is impossible. Minute precision
+is justified by the domain (viewer share links are minutes to hours long) and
+keeps `?vt=` short wherever it appears in a playlist; the media playlist
+emits one token per init URI and one per segment URI, so the 6-char saving
+multiplies across every segment window.
+
+The ms-granularity public API (`expires_at_ms`) is preserved; the minute unit
+is an encoding detail isolated to `pkg/viewer/`. The handler floors the
+requested `expires_at_ms` to the minute boundary before encoding and echoes
+the aligned value in the response so callers see exactly what was encoded.
 
 ## Changes
 
@@ -53,8 +66,11 @@ Stream ID is NOT bound into the MAC — per-stream keys already isolate streams.
 ### `pkg/routes/api.go`
 - `POST /api/v1/stream/{id}/viewer_token` handler under the push-token-
   protected subrouter. Returns `201 Created` with `{token, expires_at_ms}`,
-  `409 Conflict` if no key is configured, `400` on missing / past expiry /
-  malformed body. Cache-Control: no-store.
+  `409 Conflict` if no key is configured, `400` if the minute-aligned TTL is
+  below the 5-minute minimum (`MinViewerTokenTTLMs`), malformed body, or
+  expiry in the past. Cache-Control: no-store. Floors the requested
+  `expires_at_ms` to a minute boundary and echoes the aligned value so
+  clients see exactly what was encoded in the token.
 
 ### `pkg/routes/stream.go`
 - Wired `ViewerTokenAuth` **before** `RecordWatcher` so 401 responses do not

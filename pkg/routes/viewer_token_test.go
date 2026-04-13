@@ -44,7 +44,13 @@ func TestViewerToken_Success(t *testing.T) {
 		ExpiresAtMs int64  `json:"expires_at_ms"`
 	}
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
-	assert.Equal(t, exp, resp.ExpiresAtMs)
+	// Server echoes the minute-aligned expiry actually encoded in the token.
+	// 1_700_000_000_000 is 20s past a minute boundary, so +1h rounds down 20s.
+	const msPerMin = int64(60_000)
+	assert.Equal(t, (exp/msPerMin)*msPerMin, resp.ExpiresAtMs,
+		"echoed expiry must be floored to minute boundary")
+	assert.LessOrEqual(t, resp.ExpiresAtMs, exp,
+		"echoed expiry must never exceed the requested value")
 
 	// The minted token must verify against the same key.
 	err := viewer.Verify(testViewerKey, clk.Now(), resp.Token)
@@ -100,6 +106,48 @@ func TestViewerToken_ExpiryEqualsNow(t *testing.T) {
 	body, _ := json.Marshal(map[string]any{"expires_at_ms": clk.Now().UnixMilli()})
 	rec := postViewerToken(router, "1", "test-token", body)
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+// TestViewerToken_TTLBelowMinimum covers values just under the 5-minute floor.
+// The handler must reject anything whose minute-aligned TTL is less than the
+// minimum, including cases where the requested raw TTL is above 5 minutes but
+// rounding brings it below.
+func TestViewerToken_TTLBelowMinimum(t *testing.T) {
+	// Minute-aligned now so the expectations are easy to reason about.
+	clk := clock.NewMock(time.UnixMilli(60_000 * 28_333_333))
+	router, _, _, _ := testAPIRouterWithViewerKey(t, clk)
+
+	cases := []time.Duration{
+		0,
+		1 * time.Second,
+		1 * time.Minute,
+		4*time.Minute + 59*time.Second,
+		// Rounds down to exactly 4 minutes (below the floor).
+		5*time.Minute - 1*time.Millisecond,
+	}
+	for _, d := range cases {
+		body, _ := json.Marshal(map[string]any{"expires_at_ms": clk.Now().Add(d).UnixMilli()})
+		rec := postViewerToken(router, "1", "test-token", body)
+		assert.Equal(t, http.StatusBadRequest, rec.Code, "expected 400 for TTL=%s", d)
+	}
+}
+
+// TestViewerToken_TTLExactlyMinimum asserts that a request whose minute-
+// aligned TTL equals the 5-minute floor is accepted.
+func TestViewerToken_TTLExactlyMinimum(t *testing.T) {
+	clk := clock.NewMock(time.UnixMilli(60_000 * 28_333_333))
+	router, _, _, _ := testAPIRouterWithViewerKey(t, clk)
+
+	exp := clk.Now().Add(5 * time.Minute).UnixMilli()
+	body, _ := json.Marshal(map[string]any{"expires_at_ms": exp})
+	rec := postViewerToken(router, "1", "test-token", body)
+	require.Equal(t, http.StatusCreated, rec.Code)
+
+	var resp struct {
+		ExpiresAtMs int64 `json:"expires_at_ms"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	assert.Equal(t, exp, resp.ExpiresAtMs, "minute-aligned input should echo unchanged")
 }
 
 func TestViewerToken_EmptyBody(t *testing.T) {
