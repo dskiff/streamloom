@@ -60,7 +60,9 @@ func TestRenderMediaPlaylist_BasicWindow(t *testing.T) {
 	assert.Contains(t, playlist, "#EXT-X-VERSION:7")
 	assert.Contains(t, playlist, "#EXT-X-TARGETDURATION:2")
 	assert.Contains(t, playlist, "#EXT-X-MEDIA-SEQUENCE:0")
-	assert.Contains(t, playlist, "#EXT-X-MAP:URI=\"init.mp4\"")
+	// Rendered playlists carry a per-viewer-token placeholder (stripped at
+	// serve time via ResolveViewerToken). Assert on the placeholdered form.
+	assert.Contains(t, playlist, "#EXT-X-MAP:URI=\"init.mp4"+vtPlaceholder+"\"")
 
 	// All 5 segments should be present.
 	for i := range 5 {
@@ -237,7 +239,9 @@ func TestRenderMediaPlaylist_SingleGeneration_NoDiscontinuity(t *testing.T) {
 	assert.NotContains(t, playlist, "#EXT-X-DISCONTINUITY")
 	// Should have exactly one EXT-X-MAP.
 	assert.Equal(t, 1, strings.Count(playlist, "#EXT-X-MAP:URI="))
-	assert.Contains(t, playlist, "#EXT-X-MAP:URI=\"init.mp4\"")
+	// Rendered playlists carry a per-viewer-token placeholder (stripped at
+	// serve time via ResolveViewerToken). Assert on the placeholdered form.
+	assert.Contains(t, playlist, "#EXT-X-MAP:URI=\"init.mp4"+vtPlaceholder+"\"")
 	// No DISCONTINUITY-SEQUENCE header.
 	assert.NotContains(t, playlist, "#EXT-X-DISCONTINUITY-SEQUENCE")
 }

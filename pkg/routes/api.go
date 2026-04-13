@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -18,10 +19,15 @@ import (
 	mw "github.com/dskiff/streamloom/pkg/middleware"
 	"github.com/dskiff/streamloom/pkg/pool"
 	"github.com/dskiff/streamloom/pkg/stream"
+	"github.com/dskiff/streamloom/pkg/viewer"
 	"github.com/dskiff/streamloom/pkg/watcher"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 )
+
+// MaxViewerTokenRequestBytes is the hard upper bound on a viewer-token mint
+// request body. The body is a tiny JSON object; 1 KiB is generous.
+const MaxViewerTokenRequestBytes = 1 << 10
 
 // contextKey is a private type for context keys to avoid collisions.
 type contextKey string
@@ -231,6 +237,62 @@ func API(logger *slog.Logger, env config.Env, store *stream.Store, requestLogger
 			tracker.DeleteStream(streamID)
 			logger.Info("stream deleted", "streamID", streamID)
 			w.WriteHeader(http.StatusNoContent)
+		})
+
+		r.Post("/viewer_token", func(w http.ResponseWriter, r *http.Request) {
+			streamID := r.Context().Value(streamIDKey).(string)
+			logger.Debug("handling viewer token mint request", "streamID", streamID)
+
+			key, ok := env.GetViewerTokenKey(streamID)
+			if !ok {
+				// No viewer-token key configured for this stream; the feature
+				// is opt-in per stream. Signal that the caller's request
+				// conflicts with the current server configuration.
+				logger.Warn("viewer token mint for unconfigured stream", "streamID", streamID)
+				w.WriteHeader(http.StatusConflict)
+				return
+			}
+
+			r.Body = http.MaxBytesReader(w, r.Body, MaxViewerTokenRequestBytes)
+			var req struct {
+				ExpiresAtMs int64 `json:"expires_at_ms"`
+			}
+			dec := json.NewDecoder(r.Body)
+			dec.DisallowUnknownFields()
+			if err := dec.Decode(&req); err != nil {
+				logger.Warn("invalid viewer token request body", "error", err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+
+			nowMs := store.Clock().Now().UnixMilli()
+			if req.ExpiresAtMs <= nowMs {
+				logger.Warn("viewer token expiry must be in the future",
+					"streamID", streamID, "expires_at_ms", req.ExpiresAtMs, "now_ms", nowMs)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+
+			token, err := viewer.Mint(key, req.ExpiresAtMs)
+			if err != nil {
+				logger.Error("failed to mint viewer token", "error", err, "streamID", streamID)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+
+			resp := struct {
+				Token       string `json:"token"`
+				ExpiresAtMs int64  `json:"expires_at_ms"`
+			}{
+				Token:       token,
+				ExpiresAtMs: req.ExpiresAtMs,
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Cache-Control", "no-store")
+			w.WriteHeader(http.StatusCreated)
+			if err := json.NewEncoder(w).Encode(resp); err != nil {
+				logger.Error("failed to write viewer token response", "error", err)
+			}
 		})
 
 		r.Post("/init", func(w http.ResponseWriter, r *http.Request) {

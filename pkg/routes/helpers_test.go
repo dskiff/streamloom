@@ -50,6 +50,73 @@ func testAPIRouterWithToken(t *testing.T, clk clock.Clock) (http.Handler, *strea
 	return router, store, env, tracker
 }
 
+// testViewerKey is the fixed signing key used across viewer-token tests.
+var testViewerKey = []byte("0123456789abcdef0123456789abcdef")
+
+// testAPIRouterWithViewerKey creates an API router with both a push token
+// and a viewer-token signing key configured for stream 1.
+func testAPIRouterWithViewerKey(t *testing.T, clk clock.Clock) (http.Handler, *stream.Store, config.Env, *watcher.Tracker) {
+	t.Helper()
+	store := stream.NewStore(clk)
+	tracker := watcher.NewTracker(clk)
+	l := slog.Default()
+	env := config.Env{
+		STREAM_MAX_BUFFER_BYTES: config.DefaultStreamMaxBufferBytes,
+		BUFFER_WORKING_SPACE:    config.DefaultBufferWorkingSpace,
+		STREAM_TOKENS: map[string]config.TokenDigest{
+			"1": sha256.Sum256([]byte("Bearer test-token")),
+		},
+		STREAM_VIEWER_TOKEN_KEYS: map[string][]byte{
+			"1": testViewerKey,
+		},
+	}
+	router := API(l, env, store, nil, tracker)
+	return router, store, env, tracker
+}
+
+// testStreamRouterWithViewerKey creates a stream router with a viewer-token
+// signing key configured for stream 1.
+func testStreamRouterWithViewerKey(t *testing.T, clk clock.Clock) (http.Handler, *stream.Store, *watcher.Tracker) {
+	t.Helper()
+	store := stream.NewStore(clk)
+	tracker := watcher.NewTracker(clk)
+	l := slog.Default()
+	env := config.Env{
+		STREAM_MAX_BUFFER_BYTES: config.DefaultStreamMaxBufferBytes,
+		BUFFER_WORKING_SPACE:    config.DefaultBufferWorkingSpace,
+		STREAM_TOKENS: map[string]config.TokenDigest{
+			"1": sha256.Sum256([]byte("Bearer test-token")),
+		},
+		STREAM_VIEWER_TOKEN_KEYS: map[string][]byte{
+			"1": testViewerKey,
+		},
+	}
+	router := Stream(l, env, store, nil, tracker)
+	return router, store, tracker
+}
+
+// testBothRoutersWithViewerKey creates stream and API routers sharing a store,
+// with a viewer-token signing key configured for stream 1.
+func testBothRoutersWithViewerKey(t *testing.T, clk clock.Clock) (streamRouter http.Handler, apiRouter http.Handler, store *stream.Store, tracker *watcher.Tracker) {
+	t.Helper()
+	store = stream.NewStore(clk)
+	tracker = watcher.NewTracker(clk)
+	l := slog.Default()
+	env := config.Env{
+		STREAM_MAX_BUFFER_BYTES: config.DefaultStreamMaxBufferBytes,
+		BUFFER_WORKING_SPACE:    config.DefaultBufferWorkingSpace,
+		STREAM_TOKENS: map[string]config.TokenDigest{
+			"1": sha256.Sum256([]byte("Bearer test-token")),
+		},
+		STREAM_VIEWER_TOKEN_KEYS: map[string][]byte{
+			"1": testViewerKey,
+		},
+	}
+	streamRouter = Stream(l, env, store, nil, tracker)
+	apiRouter = API(l, env, store, nil, tracker)
+	return streamRouter, apiRouter, store, tracker
+}
+
 // testBothRoutersWithToken creates both stream and API routers sharing a store.
 // Used for E2E tests that push via API and read via stream server.
 func testBothRoutersWithToken(t *testing.T, clk clock.Clock) (streamRouter http.Handler, apiRouter http.Handler, store *stream.Store, tracker *watcher.Tracker) {

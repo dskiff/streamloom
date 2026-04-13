@@ -78,6 +78,7 @@ in front of streamloom (e.g. nginx, caddy, or the WAF of your choice). TLS termi
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `SL_STREAM_<id>_TOKEN` | Yes (at least one) | Per-stream bearer token for authenticating push API requests. `<id>` is an alphanumeric stream ID (max 512 characters). |
+| `SL_STREAM_<id>_VIEWER_TOKEN_KEY` | No | Per-stream signing key (minimum 32 chars) that enables per-viewer token auth on stream playback. When set, stream routes require `?vt=<token>` and viewers mint short-lived tokens via `POST /api/v1/stream/{id}/viewer_token`. When unset, playback is fully public (default). Rotating this value immediately invalidates all outstanding viewer tokens for that stream. |
 | `SL_STREAM_PORT` | No | Port for the public HLS stream server (default: 8080) |
 | `SL_API_PORT` | No | Port for the API server (default: 8081) |
 | `SL_BIND_ADDR` | No | IP address to bind both servers to. Defaults to `127.0.0.1` in dev, `0.0.0.0` (all interfaces) in production. Override to restrict binding in non-container deployments. |
@@ -119,3 +120,39 @@ Upload a video segment. Requires the following headers:
 | `X-SL-DURATION` | Integer (milliseconds, >0) | Segment duration in milliseconds |
 
 The request body should contain the raw segment data.
+
+### `POST /api/v1/stream/{streamID}/viewer_token`
+
+Mint a short-lived, stateless viewer token for stream playback. Requires the push bearer token (`Authorization: Bearer <SL_STREAM_<id>_TOKEN>`). Requires that `SL_STREAM_<id>_VIEWER_TOKEN_KEY` is configured for the stream; otherwise the endpoint returns `409 Conflict`.
+
+Request body (JSON):
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `expires_at_ms` | int64 | Token expiration as unix milliseconds. Must be strictly greater than the server's current time. |
+
+Response `201 Created`:
+
+```json
+{
+  "token": "<34-char base64url>",
+  "expires_at_ms": 1700000000000
+}
+```
+
+The returned token must be passed as `?vt=<token>` on every stream URL (`stream.m3u8`, `media.m3u8`, `init.mp4`, `segment_*.m4s`). Tokens are verified statelessly: the server holds no per-token state. Rotating `SL_STREAM_<id>_VIEWER_TOKEN_KEY` immediately invalidates all outstanding tokens for that stream.
+
+Example:
+
+```bash
+# Mint a token valid for one hour
+curl -X POST http://localhost:8081/api/v1/stream/1/viewer_token \
+  -H "Authorization: Bearer my_very_long_secret_token_here_1234" \
+  -H "Content-Type: application/json" \
+  -d '{"expires_at_ms": '"$(( $(date +%s%3N) + 3600000 ))"'}'
+
+# Play with the minted token (replace <vt> with the returned token)
+http://localhost:8080/stream/1/stream.m3u8?vt=<vt>
+```
+
+When `SL_STREAM_<id>_VIEWER_TOKEN_KEY` is configured, the server automatically rewrites playlist URIs so that `?vt=<token>` propagates from `stream.m3u8` to `media.m3u8` and from `media.m3u8` to every init / segment URI. HLS players do not carry parent query strings across relative URIs, so this rewrite is required for standard-compliant playback.

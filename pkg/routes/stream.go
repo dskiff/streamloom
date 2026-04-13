@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 
@@ -58,6 +59,9 @@ func Stream(logger *slog.Logger, env config.Env, store *stream.Store, requestLog
 	})
 
 	router.Route("/stream/{streamID}", func(r chi.Router) {
+		// ViewerTokenAuth runs BEFORE RecordWatcher so that 401 responses
+		// do not inflate the active-viewer count.
+		r.Use(mw.ViewerTokenAuth(store.Clock(), env.STREAM_VIEWER_TOKEN_KEYS, logger))
 		r.Use(mw.RecordWatcher(tracker))
 
 		r.Get("/media.m3u8", func(w http.ResponseWriter, r *http.Request) {
@@ -94,6 +98,9 @@ func Stream(logger *slog.Logger, env config.Env, store *stream.Store, requestLog
 				writeStreamUnavailable(w)
 				return
 			}
+			// Substitute the per-viewer query placeholder. When the request
+			// did not carry a vt (public stream), placeholders are stripped.
+			playlist = stream.ResolveViewerToken(playlist, r.URL.Query().Get("vt"))
 			w.Header().Set("Content-Type", config.M3U8_MIME_TYPE)
 			w.Header().Set("Cache-Control", "no-cache")
 			w.Header().Set("Content-Length", strconv.Itoa(len(playlist)))
@@ -118,6 +125,14 @@ func Stream(logger *slog.Logger, env config.Env, store *stream.Store, requestLog
 
 			meta := s.Metadata()
 
+			// Propagate ?vt= from the incoming request into the media
+			// playlist URI. HLS players do not carry a parent query string
+			// over to relative URIs, so each emitted URI needs its own copy.
+			mediaURI := "media.m3u8"
+			if vt := r.URL.Query().Get("vt"); vt != "" {
+				mediaURI += "?vt=" + url.QueryEscape(vt)
+			}
+
 			builder := strings.Builder{}
 			builder.WriteString("#EXTM3U\n")
 			builder.WriteString("#EXT-X-VERSION:7\n")
@@ -125,7 +140,8 @@ func Stream(logger *slog.Logger, env config.Env, store *stream.Store, requestLog
 			builder.WriteString(
 				fmt.Sprintf("#EXT-X-STREAM-INF:BANDWIDTH=%d,RESOLUTION=%dx%d,CODECS=\"%s\",FRAME-RATE=%.3f\n", meta.Bandwidth, meta.Width, meta.Height, meta.Codecs, meta.FrameRate),
 			)
-			builder.WriteString("media.m3u8\n")
+			builder.WriteString(mediaURI)
+			builder.WriteByte('\n')
 
 			w.Header().Set("Content-Type", config.M3U8_MIME_TYPE)
 			w.Header().Set("Cache-Control", "no-cache")

@@ -79,6 +79,11 @@ type Env struct {
 	// STREAM_TOKENS maps stream IDs to SHA-256 digests of the expected
 	// "Bearer <token>" header value for constant-time comparison.
 	STREAM_TOKENS map[string]TokenDigest
+
+	// STREAM_VIEWER_TOKEN_KEYS maps stream IDs to the raw signing key bytes
+	// used to mint and verify viewer tokens. A stream with no entry here has
+	// viewer-token auth disabled and is served publicly (current behavior).
+	STREAM_VIEWER_TOKEN_KEYS map[string][]byte
 }
 
 // GetStreamToken returns the SHA-256 digest of the expected "Bearer <token>" header
@@ -88,10 +93,23 @@ func (e *Env) GetStreamToken(streamID string) (TokenDigest, bool) {
 	return tok, ok
 }
 
+// GetViewerTokenKey returns the viewer-token signing key for a stream ID.
+// Returns nil and false if the stream has no configured viewer key, which
+// indicates that viewer-token auth is disabled for that stream.
+func (e *Env) GetViewerTokenKey(streamID string) ([]byte, bool) {
+	k, ok := e.STREAM_VIEWER_TOKEN_KEYS[streamID]
+	return k, ok
+}
+
 // GetEnv reads configuration from environment variables.
 // Stream tokens (SL_STREAM_<id>_TOKEN) are unset from the environment after reading.
 func GetEnv() (Env, error) {
 	streamTokens, err := parseStreamTokens()
+	if err != nil {
+		return Env{}, err
+	}
+
+	viewerKeys, err := parseStreamViewerTokenKeys()
 	if err != nil {
 		return Env{}, err
 	}
@@ -136,7 +154,8 @@ func GetEnv() (Env, error) {
 		BUFFER_WORKING_SPACE:    workingSpace,
 		TRUSTED_PROXIES:         trustedProxies,
 
-		STREAM_TOKENS: streamTokens,
+		STREAM_TOKENS:            streamTokens,
+		STREAM_VIEWER_TOKEN_KEYS: viewerKeys,
 	}, nil
 }
 
@@ -217,6 +236,9 @@ func parseBindAddr() (string, error) {
 const streamTokenPrefix = "SL_STREAM_"
 const streamTokenSuffix = "_TOKEN"
 
+const viewerTokenKeyPrefix = "SL_STREAM_"
+const viewerTokenKeySuffix = "_VIEWER_TOKEN_KEY" // #nosec G101 -- env-var name suffix, not a credential value.
+
 // parseStreamTokens scans the environment for SL_STREAM_<id>_TOKEN variables,
 // validates that <id> is a valid stream ID and the token is non-empty, stores a
 // SHA-256 digest of the expected bearer header, and unsets the env var.
@@ -230,6 +252,13 @@ func parseStreamTokens() (map[string]TokenDigest, error) {
 		}
 
 		if !strings.HasPrefix(key, streamTokenPrefix) || !strings.HasSuffix(key, streamTokenSuffix) {
+			continue
+		}
+		// Avoid misclassifying SL_STREAM_<id>_VIEWER_TOKEN_KEY (which shares
+		// the SL_STREAM_ prefix but has a different suffix) if its suffix is
+		// ever changed to a value ending in _TOKEN in the future. Harmless
+		// today but cheap to guard.
+		if strings.HasSuffix(key, viewerTokenKeySuffix) {
 			continue
 		}
 
@@ -262,6 +291,55 @@ func parseStreamTokens() (map[string]TokenDigest, error) {
 	}
 
 	return tokens, nil
+}
+
+// parseStreamViewerTokenKeys scans the environment for
+// SL_STREAM_<id>_VIEWER_TOKEN_KEY variables, validates that <id> is a valid
+// stream ID and the key is long enough, stores the raw key bytes, and unsets
+// the env var. These keys are used to sign and verify stateless viewer tokens
+// for HLS playback.
+func parseStreamViewerTokenKeys() (map[string][]byte, error) {
+	keys := make(map[string][]byte)
+
+	for _, kv := range os.Environ() {
+		key, value, ok := strings.Cut(kv, "=")
+		if !ok {
+			continue
+		}
+
+		if !strings.HasPrefix(key, viewerTokenKeyPrefix) || !strings.HasSuffix(key, viewerTokenKeySuffix) {
+			continue
+		}
+
+		// Guard against prefix/suffix overlap producing an invalid slice.
+		if len(key) < len(viewerTokenKeyPrefix)+len(viewerTokenKeySuffix) {
+			continue
+		}
+
+		streamIDStr := key[len(viewerTokenKeyPrefix) : len(key)-len(viewerTokenKeySuffix)]
+		if streamIDStr == "" {
+			return nil, fmt.Errorf("empty stream ID in env var %s", key)
+		}
+
+		if err := ValidateStreamID(streamIDStr); err != nil {
+			return nil, fmt.Errorf("invalid stream ID %q in env var %s: %w", streamIDStr, key, err)
+		}
+
+		if value == "" {
+			return nil, fmt.Errorf("empty viewer token key for env var %s", key)
+		}
+		if len(value) < MinTokenLength {
+			return nil, fmt.Errorf("viewer token key for env var %s is too short (%d chars); minimum is %d", key, len(value), MinTokenLength)
+		}
+
+		// Copy the bytes so we're not aliasing the os.Environ storage.
+		keys[streamIDStr] = []byte(value)
+
+		// Clear the env var after reading.
+		os.Unsetenv(key)
+	}
+
+	return keys, nil
 }
 
 // parsePort reads the named environment variable and returns the port number.

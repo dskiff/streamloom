@@ -78,6 +78,9 @@ func main() {
 	for id := range env.STREAM_TOKENS {
 		logger.Info("stream token configured", "streamID", id)
 	}
+	for id := range env.STREAM_VIEWER_TOKEN_KEYS {
+		logger.Info("viewer token key configured", "streamID", id)
+	}
 
 	clk := clock.Real{}
 	store := stream.NewStore(clk)
