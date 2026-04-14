@@ -60,25 +60,28 @@ func Stream(logger *slog.Logger, env config.Env, store *stream.Store, requestLog
 	})
 
 	router.Route("/stream/{streamID}", func(r chi.Router) {
-		// Playlist routes accept only TypeViewer tokens. Playlist-scoped
-		// (TypeSegment) tokens are deliberately refused here so a holder of
-		// a baked segment token cannot refetch the media playlist to rotate
-		// into a fresh token and defeat the TTL.
+		// Playlist routes accept only TypePlaylist tokens. Segment-class
+		// tokens are deliberately refused here (they fail MAC under the
+		// playlist-derived key) so a holder of a baked segment token
+		// cannot refetch the media playlist to rotate into a fresh token
+		// and defeat the TTL.
 		//
 		// ViewerTokenAuth runs BEFORE RecordWatcher so that 401 responses
 		// do not inflate the active-viewer count.
 		r.Group(func(r chi.Router) {
-			r.Use(mw.ViewerTokenAuth(store.Clock(), env.STREAM_VIEWER_TOKEN_KEYS, logger, viewer.TypeViewer))
+			r.Use(mw.ViewerTokenAuth(store.Clock(), env.STREAM_VIEWER_TOKEN_KEYS, logger, viewer.TypePlaylist))
 			r.Use(mw.RecordWatcher(tracker))
 
 			r.Get("/media.m3u8", mediaPlaylistHandler(logger, store))
 			r.Get("/stream.m3u8", masterPlaylistHandler(logger, store))
 		})
 
-		// Init and segment routes accept both TypeViewer (direct operator
-		// grant) and TypeSegment (short-lived, baked into playlist URIs).
+		// Init and segment routes accept both TypeSegment (short-lived,
+		// baked into playlist URIs — the overwhelmingly common case) and
+		// TypePlaylist (direct operator grant). TypeSegment is listed
+		// first so the hot path verifies with a single HMAC.
 		r.Group(func(r chi.Router) {
-			r.Use(mw.ViewerTokenAuth(store.Clock(), env.STREAM_VIEWER_TOKEN_KEYS, logger, viewer.TypeViewer, viewer.TypeSegment))
+			r.Use(mw.ViewerTokenAuth(store.Clock(), env.STREAM_VIEWER_TOKEN_KEYS, logger, viewer.TypeSegment, viewer.TypePlaylist))
 			r.Use(mw.RecordWatcher(tracker))
 
 			r.Get("/init.mp4", initHandler(logger, store))

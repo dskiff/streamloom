@@ -8,6 +8,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+
+	"github.com/dskiff/streamloom/pkg/viewer"
 )
 
 // MaxStreamIDLength is the upper bound on stream ID length.
@@ -80,10 +82,28 @@ type Env struct {
 	// "Bearer <token>" header value for constant-time comparison.
 	STREAM_TOKENS map[string]TokenDigest
 
-	// STREAM_VIEWER_TOKEN_KEYS maps stream IDs to the raw signing key bytes
-	// used to mint and verify viewer tokens. A stream with no entry here has
-	// viewer-token auth disabled and is served publicly (current behavior).
-	STREAM_VIEWER_TOKEN_KEYS map[string][]byte
+	// STREAM_VIEWER_TOKEN_KEYS maps stream IDs to the pre-derived signing
+	// keys used to mint and verify viewer tokens for that stream. A stream
+	// with no entry here has viewer-token auth disabled and is served
+	// publicly (current behavior).
+	//
+	// Both the playlist-class and segment-class keys are derived from the
+	// raw env-var secret at parse time via viewer.DeriveKey; the raw
+	// secret itself is never stored on Env. See parseStreamViewerTokenKeys.
+	STREAM_VIEWER_TOKEN_KEYS map[string]ViewerKeys
+}
+
+// ViewerKeys bundles the per-stream derived viewer-token signing keys.
+// Each field is the HMAC-SHA256 output of viewer.DeriveKey under a
+// distinct Type. Keeping both keys pre-derived means the middleware hot
+// path does no KDF work per request.
+type ViewerKeys struct {
+	// Playlist is the derived key for TypePlaylist tokens (operator-grant,
+	// long-lived, accepted on all stream routes).
+	Playlist []byte
+	// Segment is the derived key for TypeSegment tokens (renderer-baked,
+	// short-lived, accepted only on init/segment routes).
+	Segment []byte
 }
 
 // GetStreamToken returns the SHA-256 digest of the expected "Bearer <token>" header
@@ -93,10 +113,11 @@ func (e *Env) GetStreamToken(streamID string) (TokenDigest, bool) {
 	return tok, ok
 }
 
-// GetViewerTokenKey returns the viewer-token signing key for a stream ID.
-// Returns nil and false if the stream has no configured viewer key, which
-// indicates that viewer-token auth is disabled for that stream.
-func (e *Env) GetViewerTokenKey(streamID string) ([]byte, bool) {
+// GetViewerKeys returns the pre-derived viewer-token signing keys for a
+// stream ID. Returns the zero value and false if the stream has no
+// configured viewer key, which indicates that viewer-token auth is
+// disabled for that stream.
+func (e *Env) GetViewerKeys(streamID string) (ViewerKeys, bool) {
 	k, ok := e.STREAM_VIEWER_TOKEN_KEYS[streamID]
 	return k, ok
 }
@@ -294,12 +315,16 @@ func parseStreamTokens() (map[string]TokenDigest, error) {
 }
 
 // parseStreamViewerTokenKeys scans the environment for
-// SL_STREAM_<id>_VIEWER_TOKEN_KEY variables, validates that <id> is a valid
-// stream ID and the key is long enough, stores the raw key bytes, and unsets
-// the env var. These keys are used to sign and verify stateless viewer tokens
-// for HLS playback.
-func parseStreamViewerTokenKeys() (map[string][]byte, error) {
-	keys := make(map[string][]byte)
+// SL_STREAM_<id>_VIEWER_TOKEN_KEY variables, validates that <id> is a
+// valid stream ID and the raw key is long enough, DERIVES both the
+// playlist-class and segment-class signing keys via viewer.DeriveKey, and
+// stores only the derived keys. The raw env secret is cleared from memory
+// as soon as derivation is done and the env var is unset. These derived
+// keys are used to sign and verify stateless viewer tokens for HLS
+// playback; binding the streamID and type into the KDF means a token
+// minted for one (stream, type) pair cannot verify under any other.
+func parseStreamViewerTokenKeys() (map[string]ViewerKeys, error) {
+	keys := make(map[string]ViewerKeys)
 
 	for _, kv := range os.Environ() {
 		key, value, ok := strings.Cut(kv, "=")
@@ -332,8 +357,22 @@ func parseStreamViewerTokenKeys() (map[string][]byte, error) {
 			return nil, fmt.Errorf("viewer token key for env var %s is too short (%d chars); minimum is %d", key, len(value), MinTokenLength)
 		}
 
-		// Copy the bytes so we're not aliasing the os.Environ storage.
-		keys[streamIDStr] = []byte(value)
+		// Derive both class keys immediately so the raw secret never
+		// leaves this function. DeriveKey copies its input into an
+		// HMAC state, so no aliasing concern with os.Environ storage.
+		rawKey := []byte(value)
+		playlistKey, err := viewer.DeriveKey(rawKey, streamIDStr, viewer.TypePlaylist)
+		if err != nil {
+			return nil, fmt.Errorf("deriving playlist key for env var %s: %w", key, err)
+		}
+		segmentKey, err := viewer.DeriveKey(rawKey, streamIDStr, viewer.TypeSegment)
+		if err != nil {
+			return nil, fmt.Errorf("deriving segment key for env var %s: %w", key, err)
+		}
+		keys[streamIDStr] = ViewerKeys{
+			Playlist: playlistKey,
+			Segment:  segmentKey,
+		}
 
 		// Clear the env var after reading.
 		os.Unsetenv(key)

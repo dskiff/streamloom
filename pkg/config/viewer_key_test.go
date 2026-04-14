@@ -1,10 +1,12 @@
 package config
 
 import (
+	"bytes"
 	"os"
 	"strings"
 	"testing"
 
+	"github.com/dskiff/streamloom/pkg/viewer"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -22,6 +24,17 @@ func clearViewerKeyEnv(t *testing.T) {
 	}
 }
 
+// expectedViewerKeys returns the (playlist, segment) keys that should be
+// produced by parseStreamViewerTokenKeys for (streamID, rawSecret).
+func expectedViewerKeys(t *testing.T, rawSecret, streamID string) ViewerKeys {
+	t.Helper()
+	pk, err := viewer.DeriveKey([]byte(rawSecret), streamID, viewer.TypePlaylist)
+	require.NoError(t, err)
+	sk, err := viewer.DeriveKey([]byte(rawSecret), streamID, viewer.TypeSegment)
+	require.NoError(t, err)
+	return ViewerKeys{Playlist: pk, Segment: sk}
+}
+
 func TestParseStreamViewerTokenKeysSingle(t *testing.T) {
 	clearViewerKeyEnv(t)
 	key := strings.Repeat("a", MinTokenLength)
@@ -30,7 +43,7 @@ func TestParseStreamViewerTokenKeysSingle(t *testing.T) {
 	keys, err := parseStreamViewerTokenKeys()
 	require.NoError(t, err)
 	require.Len(t, keys, 1)
-	assert.Equal(t, []byte(key), keys["1"])
+	assert.Equal(t, expectedViewerKeys(t, key, "1"), keys["1"])
 }
 
 func TestParseStreamViewerTokenKeysMultiple(t *testing.T) {
@@ -43,8 +56,8 @@ func TestParseStreamViewerTokenKeysMultiple(t *testing.T) {
 	keys, err := parseStreamViewerTokenKeys()
 	require.NoError(t, err)
 	require.Len(t, keys, 2)
-	assert.Equal(t, []byte(k1), keys["1"])
-	assert.Equal(t, []byte(k2), keys["42"])
+	assert.Equal(t, expectedViewerKeys(t, k1, "1"), keys["1"])
+	assert.Equal(t, expectedViewerKeys(t, k2, "42"), keys["42"])
 }
 
 func TestParseStreamViewerTokenKeysAlphanumericIDAccepted(t *testing.T) {
@@ -55,7 +68,7 @@ func TestParseStreamViewerTokenKeysAlphanumericIDAccepted(t *testing.T) {
 	keys, err := parseStreamViewerTokenKeys()
 	require.NoError(t, err)
 	require.Len(t, keys, 1)
-	assert.Equal(t, []byte(key), keys["MyStream1"])
+	assert.Equal(t, expectedViewerKeys(t, key, "MyStream1"), keys["MyStream1"])
 }
 
 func TestParseStreamViewerTokenKeysEmptyRejected(t *testing.T) {
@@ -132,20 +145,60 @@ func TestParseStreamViewerTokenKeysIgnoresPushTokenVars(t *testing.T) {
 	assert.Empty(t, keys)
 }
 
-func TestGetViewerTokenKeyFound(t *testing.T) {
-	want := []byte("supersecret")
+// TestParseStreamViewerTokenKeysDerivesDistinctClassKeys asserts that the
+// parser populates both Playlist and Segment fields with distinct bytes,
+// and that neither equals the raw env secret — the hardening property
+// that motivates pre-deriving at parse time.
+func TestParseStreamViewerTokenKeysDerivesDistinctClassKeys(t *testing.T) {
+	clearViewerKeyEnv(t)
+	raw := strings.Repeat("a", MinTokenLength)
+	t.Setenv("SL_STREAM_1_VIEWER_TOKEN_KEY", raw)
+
+	keys, err := parseStreamViewerTokenKeys()
+	require.NoError(t, err)
+	vk := keys["1"]
+	require.NotEmpty(t, vk.Playlist)
+	require.NotEmpty(t, vk.Segment)
+	assert.False(t, bytes.Equal(vk.Playlist, vk.Segment),
+		"playlist and segment keys must be distinct")
+	assert.False(t, bytes.Equal(vk.Playlist, []byte(raw)),
+		"derived key must not equal raw env secret")
+	assert.False(t, bytes.Equal(vk.Segment, []byte(raw)),
+		"derived key must not equal raw env secret")
+}
+
+// TestParseStreamViewerTokenKeysCrossStreamIsolation asserts that two
+// streams sharing the same raw env secret still derive distinct keys —
+// the KDF-backed cross-stream binding that the refactor adds.
+func TestParseStreamViewerTokenKeysCrossStreamIsolation(t *testing.T) {
+	clearViewerKeyEnv(t)
+	raw := strings.Repeat("a", MinTokenLength)
+	t.Setenv("SL_STREAM_1_VIEWER_TOKEN_KEY", raw)
+	t.Setenv("SL_STREAM_2_VIEWER_TOKEN_KEY", raw)
+
+	keys, err := parseStreamViewerTokenKeys()
+	require.NoError(t, err)
+	require.Len(t, keys, 2)
+	assert.False(t, bytes.Equal(keys["1"].Playlist, keys["2"].Playlist),
+		"streams with identical raw secret must have distinct playlist keys")
+	assert.False(t, bytes.Equal(keys["1"].Segment, keys["2"].Segment),
+		"streams with identical raw secret must have distinct segment keys")
+}
+
+func TestGetViewerKeysFound(t *testing.T) {
+	want := ViewerKeys{Playlist: []byte("p"), Segment: []byte("s")}
 	env := Env{
-		STREAM_VIEWER_TOKEN_KEYS: map[string][]byte{"1": want},
+		STREAM_VIEWER_TOKEN_KEYS: map[string]ViewerKeys{"1": want},
 	}
-	got, ok := env.GetViewerTokenKey("1")
+	got, ok := env.GetViewerKeys("1")
 	require.True(t, ok)
 	assert.Equal(t, want, got)
 }
 
-func TestGetViewerTokenKeyNotFound(t *testing.T) {
+func TestGetViewerKeysNotFound(t *testing.T) {
 	env := Env{
-		STREAM_VIEWER_TOKEN_KEYS: map[string][]byte{},
+		STREAM_VIEWER_TOKEN_KEYS: map[string]ViewerKeys{},
 	}
-	_, ok := env.GetViewerTokenKey("99")
+	_, ok := env.GetViewerKeys("99")
 	assert.False(t, ok)
 }

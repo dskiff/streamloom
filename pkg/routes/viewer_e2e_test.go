@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/dskiff/streamloom/pkg/clock"
+	"github.com/dskiff/streamloom/pkg/config"
 	"github.com/dskiff/streamloom/pkg/viewer"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -91,20 +92,24 @@ func TestE2E_ViewerToken_FullFlow(t *testing.T) {
 	assert.Contains(t, mediaBody, "segment_0.m4s?vt=")
 
 	// All embedded tokens on this playlist must be identical (single mint
-	// per render) and must verify against the viewer-token key. The
-	// renderer bakes TypeSegment tokens so they cannot be replayed on
-	// playlist routes to rotate into a fresh token.
+	// per render) and must verify against the segment-derived key (the
+	// renderer bakes segment-class tokens). They must NOT verify against
+	// the playlist-derived key — that mismatch is what scopes them off
+	// playlist routes.
 	playlistVT := matches[0][1]
 	for _, m := range matches {
 		assert.Equal(t, playlistVT, m[1],
 			"all URIs in a single playlist must share the same playlist-scoped token")
 	}
-	typ, verr := viewer.Verify(testViewerKey, clk.Now(), playlistVT)
-	assert.NoError(t, verr, "baked playlist token must verify against the stream's viewer key")
-	assert.Equal(t, viewer.TypeSegment, typ,
-		"baked playlist token must be TypeSegment (playlist-scoped)")
+	keys := testViewerKeys(t, "1")
+	assert.NoError(t, viewer.Verify(keys.Segment, clk.Now(), playlistVT),
+		"baked playlist token must verify under the stream's segment-derived key")
+	assert.ErrorIs(t,
+		viewer.Verify(keys.Playlist, clk.Now(), playlistVT),
+		viewer.ErrBadMAC,
+		"baked playlist token must NOT verify under the playlist-derived key (that's how scoping works)")
 
-	// The baked TypeSegment token must be REFUSED on playlist routes.
+	// The baked segment-class token must be REFUSED on playlist routes.
 	// This is the central defense against the infinite-rotation attack:
 	// a scraper who pulls media.m3u8 once and harvests the baked token
 	// must not be able to refetch media.m3u8 with it.
@@ -113,7 +118,7 @@ func TestE2E_ViewerToken_FullFlow(t *testing.T) {
 		rec = httptest.NewRecorder()
 		streamRouter.ServeHTTP(rec, req)
 		assert.Equal(t, http.StatusUnauthorized, rec.Code,
-			"baked TypeSegment token must be refused on %s", p)
+			"baked segment-class token must be refused on %s", p)
 	}
 
 	// 7. GET init.mp4 with the playlist-scoped vt → 200.
@@ -190,12 +195,18 @@ func TestE2E_ViewerToken_KeyRotationInvalidatesOutstanding(t *testing.T) {
 	streamRouter.ServeHTTP(rec, req)
 	require.Equal(t, http.StatusOK, rec.Code)
 
-	// Rotate the key by swapping the bytes in the shared map.
-	newKey := make([]byte, len(testViewerKey))
-	for i := range newKey {
-		newKey[i] = byte('z')
+	// Rotate the key by replacing stream 1's derived-key entry with one
+	// produced from a completely different env secret — this mirrors an
+	// operator-driven restart under a new SL_STREAM_1_VIEWER_TOKEN_KEY.
+	newRawSecret := strings.Repeat("z", 32)
+	newPlaylist, err := viewer.DeriveKey([]byte(newRawSecret), "1", viewer.TypePlaylist)
+	require.NoError(t, err)
+	newSegment, err := viewer.DeriveKey([]byte(newRawSecret), "1", viewer.TypeSegment)
+	require.NoError(t, err)
+	env.STREAM_VIEWER_TOKEN_KEYS["1"] = config.ViewerKeys{
+		Playlist: newPlaylist,
+		Segment:  newSegment,
 	}
-	env.STREAM_VIEWER_TOKEN_KEYS["1"] = newKey
 
 	// Old token must now fail to verify under the new key. Every stream
 	// route is covered to guard against per-route-group key staleness.
