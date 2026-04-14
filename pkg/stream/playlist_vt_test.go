@@ -13,7 +13,8 @@ import (
 )
 
 // setupStreamWithMintToken initializes a stream whose renderer uses the given
-// mint function. Returns the Stream and a *Store (for cleanup registration).
+// mint function and returns the Stream. Cleanup of the underlying Store is
+// registered via t.Cleanup so the renderer goroutine is stopped at test end.
 func setupStreamWithMintToken(t *testing.T, mintFn func() string) *Stream {
 	t.Helper()
 	clk := clock.NewMock(time.UnixMilli(0))

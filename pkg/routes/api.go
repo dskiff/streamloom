@@ -309,6 +309,15 @@ func API(logger *slog.Logger, env config.Env, store *stream.Store, requestLogger
 				w.WriteHeader(http.StatusBadRequest)
 				return
 			}
+			// Reject trailing data after the JSON object. Decode consumes a
+			// single value and ignores anything after it; without this
+			// check, an input like `{"expires_at_ms": N}{"extra":1}` would
+			// silently succeed.
+			if dec.More() {
+				logger.Warn("trailing data in viewer token request body", "streamID", streamID)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
 
 			nowMs := store.Clock().Now().UnixMilli()
 			// Floor the requested expiry to the minute boundary at which

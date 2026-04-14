@@ -3,6 +3,7 @@ package routes
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -169,4 +170,31 @@ func TestViewerToken_UnknownField(t *testing.T) {
 
 	rec := postViewerToken(router, "1", "test-token", []byte(`{"expires_at_ms": 9999999999999, "attacker_field": 1}`))
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+// TestViewerToken_TrailingData asserts the handler rejects a body containing
+// trailing JSON after the primary object. json.Decoder.Decode consumes a
+// single value and silently ignores anything after it; without an explicit
+// check an attacker could smuggle extra JSON past the decoder.
+func TestViewerToken_TrailingData(t *testing.T) {
+	clk := clock.NewMock(time.UnixMilli(1_700_000_000_000))
+	router, _, _, _ := testAPIRouterWithViewerKey(t, clk)
+
+	exp := clk.Now().Add(time.Hour).UnixMilli()
+	body := []byte(fmt.Sprintf(`{"expires_at_ms": %d}{"extra":1}`, exp))
+	rec := postViewerToken(router, "1", "test-token", body)
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+// TestViewerToken_TrailingWhitespace asserts that trailing whitespace (which
+// is harmless and common from naive encoders) does NOT cause a 400. Only
+// meaningful trailing JSON is rejected.
+func TestViewerToken_TrailingWhitespace(t *testing.T) {
+	clk := clock.NewMock(time.UnixMilli(1_700_000_000_000))
+	router, _, _, _ := testAPIRouterWithViewerKey(t, clk)
+
+	exp := clk.Now().Add(time.Hour).UnixMilli()
+	body := []byte(fmt.Sprintf("{\"expires_at_ms\": %d}\n\t  \n", exp))
+	rec := postViewerToken(router, "1", "test-token", body)
+	assert.Equal(t, http.StatusCreated, rec.Code)
 }
