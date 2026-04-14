@@ -117,6 +117,36 @@ func testBothRoutersWithViewerKey(t *testing.T, clk clock.Clock) (streamRouter h
 	return streamRouter, apiRouter, store, tracker
 }
 
+// testBothRoutersWithMutableViewerKey is like testBothRoutersWithViewerKey
+// but also returns the shared Env so tests can mutate
+// STREAM_VIEWER_TOKEN_KEYS to simulate operator-driven key rotation. Both
+// routers are built from the same Env value, and because the underlying map
+// is a reference type, post-construction mutations are visible to both.
+func testBothRoutersWithMutableViewerKey(t *testing.T, clk clock.Clock) (streamRouter http.Handler, apiRouter http.Handler, store *stream.Store, env config.Env) {
+	t.Helper()
+	store = stream.NewStore(clk)
+	tracker := watcher.NewTracker(clk)
+	l := slog.Default()
+	// Copy the baseline testViewerKey into the map so tests that mutate
+	// the entry don't leak across into other tests sharing the package
+	// global.
+	keyCopy := make([]byte, len(testViewerKey))
+	copy(keyCopy, testViewerKey)
+	env = config.Env{
+		STREAM_MAX_BUFFER_BYTES: config.DefaultStreamMaxBufferBytes,
+		BUFFER_WORKING_SPACE:    config.DefaultBufferWorkingSpace,
+		STREAM_TOKENS: map[string]config.TokenDigest{
+			"1": sha256.Sum256([]byte("Bearer test-token")),
+		},
+		STREAM_VIEWER_TOKEN_KEYS: map[string][]byte{
+			"1": keyCopy,
+		},
+	}
+	streamRouter = Stream(l, env, store, nil, tracker)
+	apiRouter = API(l, env, store, nil, tracker)
+	return streamRouter, apiRouter, store, env
+}
+
 // testBothRoutersWithToken creates both stream and API routers sharing a store.
 // Used for E2E tests that push via API and read via stream server.
 func testBothRoutersWithToken(t *testing.T, clk clock.Clock) (streamRouter http.Handler, apiRouter http.Handler, store *stream.Store, tracker *watcher.Tracker) {

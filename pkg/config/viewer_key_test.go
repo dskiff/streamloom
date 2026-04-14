@@ -78,7 +78,11 @@ func TestParseStreamViewerTokenKeysShortRejected(t *testing.T) {
 func TestParseStreamViewerTokenKeysUnsetsEnvVars(t *testing.T) {
 	clearViewerKeyEnv(t)
 	key := strings.Repeat("z", MinTokenLength)
-	os.Setenv("SL_STREAM_5_VIEWER_TOKEN_KEY", key)
+	// t.Setenv registers a cleanup to restore the previous value (which is
+	// "unset" here after clearViewerKeyEnv), so even if the parser fails to
+	// unset the variable the test-level cleanup will still leave the env
+	// clean for sibling tests.
+	t.Setenv("SL_STREAM_5_VIEWER_TOKEN_KEY", key)
 
 	_, err := parseStreamViewerTokenKeys()
 	require.NoError(t, err)

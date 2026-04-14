@@ -152,6 +152,85 @@ func TestE2E_ViewerToken_FullFlow(t *testing.T) {
 	}
 }
 
+// TestE2E_ViewerToken_KeyRotationInvalidatesOutstanding asserts that
+// rotating a stream's viewer-token key (as an operator would via an env
+// change + restart, simulated here by mutating the shared map) immediately
+// invalidates every token minted under the previous key. This locks in the
+// operational "rotate to revoke" contract documented in the README.
+func TestE2E_ViewerToken_KeyRotationInvalidatesOutstanding(t *testing.T) {
+	clk := clock.NewMock(time.UnixMilli(0))
+	// Build routers from a shared env so mutations to the viewer-key map
+	// propagate to both routers — mirroring a live restart where the new
+	// process picks up the rotated key.
+	streamRouter, apiRouter, store, env := testBothRoutersWithMutableViewerKey(t, clk)
+
+	hdrs := initHeaders()
+	rec := postInit(apiRouter, "1", "test-token", hdrs, []byte("init-data"))
+	require.Equal(t, http.StatusCreated, rec.Code)
+	t.Cleanup(func() { store.Delete("1") })
+
+	clk.Set(time.UnixMilli(10000))
+	rec = postSegment(apiRouter, "1", "test-token", "0", "5000", "2000", []byte("seg"))
+	require.Equal(t, http.StatusCreated, rec.Code)
+
+	// Mint a token under the original key.
+	exp := clk.Now().Add(time.Hour).UnixMilli()
+	body, _ := json.Marshal(map[string]any{"expires_at_ms": exp})
+	rec = postViewerToken(apiRouter, "1", "test-token", body)
+	require.Equal(t, http.StatusCreated, rec.Code)
+	var mintResp struct {
+		Token string `json:"token"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &mintResp))
+	oldTok := mintResp.Token
+
+	// Sanity check: token is accepted pre-rotation.
+	req := httptest.NewRequest(http.MethodGet, "/stream/1/segment_0.m4s?vt="+oldTok, nil)
+	rec = httptest.NewRecorder()
+	streamRouter.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	// Rotate the key by swapping the bytes in the shared map.
+	newKey := make([]byte, len(testViewerKey))
+	for i := range newKey {
+		newKey[i] = byte('z')
+	}
+	env.STREAM_VIEWER_TOKEN_KEYS["1"] = newKey
+
+	// Old token must now fail to verify under the new key. Every stream
+	// route is covered to guard against per-route-group key staleness.
+	for _, p := range []string{
+		"/stream/1/stream.m3u8",
+		"/stream/1/media.m3u8",
+		"/stream/1/init.mp4",
+		"/stream/1/segment_0.m4s",
+	} {
+		req = httptest.NewRequest(http.MethodGet, p+"?vt="+oldTok, nil)
+		rec = httptest.NewRecorder()
+		streamRouter.ServeHTTP(rec, req)
+		assert.Equal(t, http.StatusUnauthorized, rec.Code,
+			"post-rotation, old token must be refused on %s", p)
+	}
+
+	// A token minted under the new key works immediately. Uses the same
+	// clock so the 5-minute TTL floor is satisfied; a short-TTL happy-path
+	// mint is the simplest way to prove the new key is live across both
+	// routers.
+	newExp := clk.Now().Add(time.Hour).UnixMilli()
+	newBody, _ := json.Marshal(map[string]any{"expires_at_ms": newExp})
+	rec = postViewerToken(apiRouter, "1", "test-token", newBody)
+	require.Equal(t, http.StatusCreated, rec.Code)
+	var newResp struct {
+		Token string `json:"token"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &newResp))
+
+	req = httptest.NewRequest(http.MethodGet, "/stream/1/segment_0.m4s?vt="+newResp.Token, nil)
+	rec = httptest.NewRecorder()
+	streamRouter.ServeHTTP(rec, req)
+	assert.Equal(t, http.StatusOK, rec.Code, "token minted under rotated key must work")
+}
+
 // TestE2E_ViewerToken_ExpiredAfterMint ensures a token that was valid at mint
 // time is rejected once the mock clock advances past its expiry.
 func TestE2E_ViewerToken_ExpiredAfterMint(t *testing.T) {

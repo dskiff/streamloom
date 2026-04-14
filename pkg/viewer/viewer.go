@@ -5,10 +5,11 @@
 //	[1 byte version][1 byte type][4 bytes uint32 big-endian unix minutes][16 bytes truncated HMAC-SHA256]
 //
 // The MAC covers the version byte, the type byte, and the expiration bytes,
-// keyed by a per-stream secret. Tokens are encoded with base64.RawURLEncoding,
-// yielding a fixed 30-character string. Tokens are not bound to a stream ID;
-// isolation across streams is provided by using a distinct signing key per
-// stream.
+// keyed by a per-stream secret. Tokens are encoded with
+// base64.RawURLEncoding in Strict mode, yielding a fixed 30-character string
+// with a single canonical encoding per 22-byte payload. Tokens are not bound
+// to a stream ID; isolation across streams is provided by using a distinct
+// signing key per stream.
 //
 // The type byte distinguishes capability classes of token so the HTTP layer
 // can refuse tokens minted for one purpose (e.g. segment/init fetches) on a
@@ -17,11 +18,18 @@
 // rotate their token indefinitely, defeating the TTL.
 //
 // The expiration is encoded with 1-minute precision: the ms-granularity value
-// passed to Mint is truncated to the preceding minute boundary. Callers that
-// need to know the exact encoded expiry should floor their input to a minute
-// beforehand (Mint does this internally regardless). The range of a uint32
-// minute counter reaches beyond year 10000, so practical overflow is
+// passed to Mint is truncated (toward zero) to the minute boundary. Callers
+// that need to know the exact encoded expiry should truncate their input to a
+// minute beforehand (Mint does this internally regardless). The range of a
+// uint32 minute counter reaches beyond year 10000, so practical overflow is
 // impossible.
+//
+// Forward-compatibility note: because the MAC covers the version byte,
+// introducing a new wire-format version requires either a parallel-verify
+// period (accept both old and new) or a key rotation at the cut-over. A
+// token with an unknown version but a valid MAC is rejected by Verify before
+// any version-specific parsing runs, so downgrade-style attacks are not
+// possible.
 package viewer
 
 import (
@@ -73,6 +81,15 @@ const EncodedTokenLen = 30
 // package-private because the minute unit does not leak beyond serde.
 const msPerMinute = 60_000
 
+// tokenEncoding is the base64 encoding used for tokens: URL-safe alphabet, no
+// padding, and strict decoding. Strict mode rejects non-canonical encodings
+// whose unused trailing bits (the 4 low bits of the 30th character) are
+// non-zero. Without strict mode, a single 22-byte payload would have 16
+// valid base64url encodings — a canonicalization gap with no practical
+// security impact but a source of confusion for logging, caching, or
+// deduplication layers that treat the string form as the identifier.
+var tokenEncoding = base64.RawURLEncoding.Strict()
+
 // Sentinel errors returned by Verify. HTTP handlers should collapse all of
 // these to a single 401 response; the distinction exists only for logging.
 var (
@@ -84,11 +101,11 @@ var (
 )
 
 // Mint produces a token of the given type for the given expiration (unix ms).
-// The expiry is internally floored to the preceding minute boundary before
-// encoding; see the package comment for rationale. The key must be non-empty;
-// callers are expected to enforce a minimum length upstream.
+// The expiry is internally truncated (toward zero) to the minute boundary
+// before encoding; see the package comment for rationale. The key must be
+// non-empty; callers are expected to enforce a minimum length upstream.
 //
-// Returns ErrMalformed if the minute-aligned expiration is negative or does
+// Returns ErrMalformed if expiresAtMs is negative or its minute value does
 // not fit in a uint32 (overflow after year ~10140).
 func Mint(key []byte, expiresAtMs int64, typ Type) (string, error) {
 	if len(key) == 0 {
@@ -110,7 +127,7 @@ func Mint(key []byte, expiresAtMs int64, typ Type) (string, error) {
 	mac := computeMAC(key, buf[:headerLen])
 	copy(buf[headerLen:], mac)
 
-	return base64.RawURLEncoding.EncodeToString(buf[:]), nil
+	return tokenEncoding.EncodeToString(buf[:]), nil
 }
 
 // Verify decodes token and checks its MAC and expiration against now. On
@@ -129,7 +146,10 @@ func Verify(key []byte, now time.Time, token string) (Type, error) {
 	var payload [TokenBytes]byte
 	malformed := false
 
-	raw, err := base64.RawURLEncoding.DecodeString(token)
+	// Strict decoding: rejects non-canonical encodings (e.g. unused trailing
+	// bits set) so a given payload has exactly one valid string form. Prevents
+	// silent multiple representations of the same token.
+	raw, err := tokenEncoding.DecodeString(token)
 	if err != nil || len(raw) != TokenBytes {
 		// Compare the zeroed payload against itself-keyed MAC to keep
 		// timing uniform. The equality check below will still fail via

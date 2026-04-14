@@ -309,6 +309,16 @@ func API(logger *slog.Logger, env config.Env, store *stream.Store, requestLogger
 			dec := json.NewDecoder(r.Body)
 			dec.DisallowUnknownFields()
 			if err := dec.Decode(&req); err != nil {
+				// Distinguish body-size overflow (413) from parse errors
+				// (400) so misbehaving clients get an accurate signal and
+				// the status matches the other authenticated endpoints.
+				var maxBytesErr *http.MaxBytesError
+				if errors.As(err, &maxBytesErr) {
+					logger.Warn("viewer token request body too large",
+						"streamID", streamID, "limit", MaxViewerTokenRequestBytes)
+					w.WriteHeader(http.StatusRequestEntityTooLarge)
+					return
+				}
 				logger.Warn("invalid viewer token request body", "error", err)
 				w.WriteHeader(http.StatusBadRequest)
 				return
@@ -324,11 +334,16 @@ func API(logger *slog.Logger, env config.Env, store *stream.Store, requestLogger
 			}
 
 			nowMs := store.Clock().Now().UnixMilli()
-			// Floor the requested expiry to the minute boundary at which
+			// Truncate the requested expiry to the minute boundary at which
 			// tokens are encoded, then enforce a minimum TTL on the encoded
 			// value. This surfaces the wire format's minute precision as an
 			// explicit contract rather than letting callers receive tokens
 			// that silently expire earlier than they expected.
+			//
+			// Go integer division truncates toward zero (not floor toward
+			// negative infinity), so negative inputs align toward zero
+			// rather than away from it. The TTL check below rejects any
+			// such value, so truncation semantics never surface to callers.
 			alignedExpMs := (req.ExpiresAtMs / viewerTokenMsPerMinute) * viewerTokenMsPerMinute
 			if alignedExpMs-nowMs < MinViewerTokenTTLMs {
 				logger.Warn("viewer token TTL below minimum",

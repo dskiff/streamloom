@@ -235,6 +235,67 @@ func TestVerifyMalformedBase64(t *testing.T) {
 	assert.ErrorIs(t, err, ErrMalformed)
 }
 
+// TestVerifyRejectsNonCanonicalEncoding asserts that Strict base64 decoding
+// refuses encodings whose unused trailing bits are non-zero. A 22-byte
+// payload encodes to 30 base64url chars: 29 full 6-bit groups plus one char
+// that carries only 2 used bits. The remaining 4 bits must be zero in a
+// canonical encoding; this test mutates them and asserts rejection.
+//
+// Without strict decoding, each valid payload would have 16 distinct string
+// representations — a hygiene gap that would silently break any layer
+// keying off the token string.
+func TestVerifyRejectsNonCanonicalEncoding(t *testing.T) {
+	key := testKey()
+	now := time.UnixMilli(1_700_000_000_000)
+	tok, err := Mint(key, now.Add(time.Hour).UnixMilli(), TypeViewer)
+	require.NoError(t, err)
+	require.Len(t, tok, EncodedTokenLen)
+
+	// Index of the base64url alphabet for a char.
+	alphaIdx := func(c byte) int {
+		switch {
+		case c >= 'A' && c <= 'Z':
+			return int(c - 'A')
+		case c >= 'a' && c <= 'z':
+			return int(c-'a') + 26
+		case c >= '0' && c <= '9':
+			return int(c-'0') + 52
+		case c == '-':
+			return 62
+		case c == '_':
+			return 63
+		}
+		t.Fatalf("unexpected base64url char %q", c)
+		return -1
+	}
+	alphaChar := func(i int) byte {
+		const alpha = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+		return alpha[i]
+	}
+
+	last := tok[EncodedTokenLen-1]
+	origIdx := alphaIdx(last)
+	// Preserve the top 2 bits (used), flip any combination of the bottom 4
+	// bits (unused in a canonical encoding). Every such variant decodes to
+	// the same 22 bytes under non-strict decoding.
+	variants := 0
+	for flip := 1; flip < 16; flip++ {
+		idx := (origIdx & 0x30) | ((origIdx ^ flip) & 0x0F)
+		if idx == origIdx {
+			continue
+		}
+		bad := tok[:EncodedTokenLen-1] + string(alphaChar(idx))
+		if bad == tok {
+			continue
+		}
+		_, verr := Verify(key, now, bad)
+		assert.ErrorIsf(t, verr, ErrMalformed,
+			"non-canonical encoding (flip=%d) must be rejected as malformed", flip)
+		variants++
+	}
+	require.Greater(t, variants, 0, "expected at least one non-canonical variant to test")
+}
+
 func TestVerifyMalformedWrongLength(t *testing.T) {
 	short := base64.RawURLEncoding.EncodeToString(make([]byte, TokenBytes-1))
 	_, err := Verify(testKey(), time.UnixMilli(1_700_000_000_000), short)

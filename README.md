@@ -151,6 +151,8 @@ The returned token must be passed as `?vt=<token>` on every stream URL (`stream.
 
 The asymmetric scoping is deliberate: without it, a client holding a baked `TypeSegment` token could refetch `media.m3u8` to harvest a freshly-minted token and repeat the cycle indefinitely, making the 10-minute TTL meaningless. By refusing `TypeSegment` on playlist routes, only the viewer's original `TypeViewer` token can refresh the playlist, and that token's lifetime is the hard upper bound on how long scraped URLs remain useful. The token type is covered by the MAC, so a `TypeSegment` token cannot be re-typed to `TypeViewer` without the signing key.
 
+**Stale-playlist edge case.** The cached media playlist is re-rendered (and its baked `TypeSegment` token refreshed) on every segment commit. If a stream stops producing segments for longer than the 10-minute playlist-token TTL, the cached playlist will still serve with `200 OK` but its embedded `?vt=` tokens will be expired — so `init.mp4` and `segment_*.m4s` fetches derived from it will receive `401 Unauthorized` until the next segment commit triggers a fresh render. For live streams this is a non-issue (each commit refreshes the token well within the TTL); for streams that legitimately pause production for >10 minutes, viewers will need to refetch `media.m3u8` using their own `TypeViewer` token to pick up a new render. Viewers using their own long-lived `TypeViewer` token directly on init/segment URIs are unaffected.
+
 Example:
 
 ```bash

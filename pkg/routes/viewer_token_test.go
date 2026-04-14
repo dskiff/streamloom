@@ -7,6 +7,7 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -218,4 +219,18 @@ func TestViewerToken_ExpiryOverflowsUint32Minutes(t *testing.T) {
 	body, _ := json.Marshal(map[string]any{"expires_at_ms": exp})
 	rec := postViewerToken(router, "1", "test-token", body)
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+// TestViewerToken_BodyTooLarge asserts that a request body exceeding the
+// MaxViewerTokenRequestBytes cap is rejected with 413 rather than 400.
+// Parallels the 413 behavior of /init and /segment.
+func TestViewerToken_BodyTooLarge(t *testing.T) {
+	router, _, _, _ := testAPIRouterWithViewerKey(t, clock.Real{})
+
+	// A payload well over the 1 KiB cap: valid-looking JSON padded with a
+	// huge unused string. MaxBytesReader trips before Decode can finish.
+	padding := strings.Repeat("A", MaxViewerTokenRequestBytes+1)
+	body := []byte(`{"expires_at_ms": 9999999999999, "_pad": "` + padding + `"}`)
+	rec := postViewerToken(router, "1", "test-token", body)
+	assert.Equal(t, http.StatusRequestEntityTooLarge, rec.Code)
 }
