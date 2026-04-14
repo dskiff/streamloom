@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/dskiff/streamloom/pkg/clock"
 	"github.com/dskiff/streamloom/pkg/config"
 	mw "github.com/dskiff/streamloom/pkg/middleware"
 	"github.com/dskiff/streamloom/pkg/pool"
@@ -36,10 +37,42 @@ const MaxViewerTokenRequestBytes = 1 << 10
 // typical client-clock drift budget.
 const MinViewerTokenTTLMs = 5 * 60 * 1000
 
+// PlaylistTokenTTL is the lifetime of the internal viewer token that the
+// media-playlist renderer bakes into init/segment URIs. Because the renderer
+// mints a fresh token on every re-render, this bounds how long a URL scraped
+// from a live playlist can be replayed by an unauthorized party. It also
+// caps how stale a cached playlist's embedded URIs can become; a live stream
+// re-renders on each segment commit and therefore refreshes the token well
+// within this window. Comfortably above MinViewerTokenTTLMs so the token
+// always passes the public mint-endpoint floor.
+const PlaylistTokenTTL = 10 * time.Minute
+
 // viewerTokenMsPerMinute is used to floor an expires_at_ms value to the
 // minute boundary at which tokens are encoded. Kept here to avoid leaking
 // the viewer package's private constant across the serde boundary.
 const viewerTokenMsPerMinute = 60_000
+
+// makePlaylistTokenMinter returns a closure that mints a playlist-scoped
+// viewer token valid for PlaylistTokenTTL from the current clock time. The
+// closure captures the per-stream signing key, the store clock, the logger,
+// and the streamID for diagnostics. It returns "" on failure so the renderer
+// falls back to emitting plain URIs for that render only (the middleware
+// still enforces vt on the resulting requests, so those plain URIs will 401
+// — this is the correct fail-closed behavior for a configured stream).
+func makePlaylistTokenMinter(key []byte, clk clock.Clock, logger *slog.Logger, streamID string) func() string {
+	return func() string {
+		expMs := clk.Now().Add(PlaylistTokenTTL).UnixMilli()
+		tok, err := viewer.Mint(key, expMs)
+		if err != nil {
+			logger.Error("failed to mint playlist viewer token",
+				"streamID", streamID,
+				"error", err,
+			)
+			return ""
+		}
+		return tok
+	}
+}
 
 // contextKey is a private type for context keys to avoid collisions.
 type contextKey string
@@ -397,7 +430,19 @@ func API(logger *slog.Logger, env config.Env, store *stream.Store, requestLogger
 				return
 			}
 
-			if err := store.Init(streamID, meta, initData, segmentCap, meta.SegmentByteCount, backwardBufferSize, env.BUFFER_WORKING_SPACE, config.DefaultMediaWindowSize); err != nil {
+			// When a viewer-token key is configured for this stream, wire a
+			// mint callback the renderer will use once per playlist render to
+			// bake a short-lived token into every emitted URI. Streams without
+			// a configured key receive no option and the renderer emits plain
+			// URIs (preserves public-playback parity with pre-viewer-token
+			// behavior).
+			var initOpts []stream.InitOption
+			if viewerKey, ok := env.GetViewerTokenKey(streamID); ok {
+				mintFn := makePlaylistTokenMinter(viewerKey, store.Clock(), logger, streamID)
+				initOpts = append(initOpts, stream.WithMintToken(mintFn))
+			}
+
+			if err := store.Init(streamID, meta, initData, segmentCap, meta.SegmentByteCount, backwardBufferSize, env.BUFFER_WORKING_SPACE, config.DefaultMediaWindowSize, initOpts...); err != nil {
 				if errors.Is(err, stream.ErrStreamExists) {
 					logger.Warn("stream already exists", "streamID", streamID)
 					w.WriteHeader(http.StatusConflict)

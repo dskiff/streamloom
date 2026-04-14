@@ -76,16 +76,40 @@ the aligned value in the response so callers see exactly what was encoded.
 - Wired `ViewerTokenAuth` **before** `RecordWatcher` so 401 responses do not
   inflate watcher counts.
 - Master playlist (`stream.m3u8`): appends `?vt=<escaped>` to the emitted
-  `media.m3u8` URI when the incoming request carried `vt`.
-- Media playlist (`media.m3u8`): calls `stream.ResolveViewerToken` to
-  substitute the per-viewer query placeholder at serve time.
+  `media.m3u8` URI when the incoming request carried `vt`. Master playlists
+  are not cached and use the viewer's own long-lived token because viewers
+  refresh `media.m3u8` repeatedly (not `stream.m3u8`), so baking a short-
+  lived token here would break playback as soon as that token expired.
+- Media playlist (`media.m3u8`): serves the renderer's cached body verbatim.
+  The renderer has already baked a playlist-scoped short-lived token into
+  every emitted URI, so no per-request substitution (and no per-viewer
+  per-fetch allocation) is required.
 
 ### `pkg/stream/playlist.go`
-- Introduced `vtPlaceholder = "{VT}"`. The playlist renderer emits this
-  placeholder after every URI (EXT-X-MAP init URI and each segment URI). The
-  HTTP handler substitutes the placeholder at serve time via
-  `ResolveViewerToken(playlist, vt)`. When `vt` is empty, placeholders are
-  stripped. This keeps the cached playlist per-stream rather than per-viewer.
+- The media-playlist renderer calls a per-stream `mintToken() string`
+  callback once per render and bakes the returned token into every emitted
+  URI as `?vt=<token>`. When the callback is nil (stream without a viewer
+  key) or returns `""`, URIs are emitted plain. This replaces the earlier
+  `{VT}` placeholder + serve-time substitution scheme — the playlist is
+  now a fully-formed artifact that can be served verbatim. The cached
+  playlist remains per-stream (not per-viewer): every viewer that fetches
+  `media.m3u8` in the same render window sees the same short-lived token
+  embedded in its URIs.
+
+### `pkg/stream/stream.go`
+- Added a `mintToken func() string` field to `Stream` and an `InitOption` /
+  `WithMintToken(fn)` functional-options pattern on `Store.Init`. The
+  option is applied before the renderer goroutine is launched, so the
+  renderer observes a fully-configured Stream without additional locking.
+  Streams without a viewer key are initialized with no options and run
+  identically to the pre-viewer-token path.
+
+### `pkg/routes/api.go` (playlist-token plumbing)
+- Added `PlaylistTokenTTL = 10 * time.Minute`. The `/init` handler builds a
+  `makePlaylistTokenMinter` closure when the stream has a configured viewer
+  key, capturing the key, store clock, and logger. The closure is passed
+  to `store.Init` via `stream.WithMintToken(...)`. Streams without a key
+  receive no option, preserving fully-public playback.
 
 ### `main.go`
 - Logs `viewer token key configured` for each configured stream at startup.
@@ -111,8 +135,11 @@ the aligned value in the response so callers see exactly what was encoded.
 - `pkg/routes/viewer_stream_test.go` — per-route integration including the
   critical `TestStream_UnauthorizedRequest_DoesNotRecordWatcher` which locks
   in the middleware ordering.
-- `pkg/stream/playlist_vt_test.go` — `ResolveViewerToken` unit tests plus
-  a test asserting the placeholder is emitted at every URI location.
+- `pkg/stream/playlist_vt_test.go` — asserts the renderer's mint callback
+  fires exactly once per render, its token is baked into EXT-X-MAP and
+  every segment URI, distinct renders embed distinct tokens, an empty
+  return from the callback produces plain URIs (fail-closed via the
+  middleware), and streams with no mint callback emit no `?vt=`.
 - `pkg/routes/viewer_e2e_test.go` — full flow: mint → master → media → init
   → segment with `vt` threaded through, and a post-expiry rejection test.
 
@@ -130,3 +157,11 @@ the aligned value in the response so callers see exactly what was encoded.
    coexist; unknown version → 401.
 6. **Secret hygiene** — keys are `os.Unsetenv`'d after parsing (mirrors push
    tokens), never logged, never included in responses.
+7. **Playlist URL scraping** — the playlist embeds a short-lived
+   (`PlaylistTokenTTL = 10m`) token rather than the viewer's long-lived
+   one, bounding the replay window of URLs scraped from a playlist body
+   while keeping the cached playlist per-stream (not per-viewer). If a
+   stream stops producing segments for longer than this TTL, the cached
+   playlist's embedded token will expire; subsequent segment fetches 401
+   until the next render refreshes the token. For live streams this is a
+   non-issue because each segment commit triggers a re-render.

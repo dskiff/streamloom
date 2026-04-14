@@ -98,9 +98,10 @@ func Stream(logger *slog.Logger, env config.Env, store *stream.Store, requestLog
 				writeStreamUnavailable(w)
 				return
 			}
-			// Substitute the per-viewer query placeholder. When the request
-			// did not carry a vt (public stream), placeholders are stripped.
-			playlist = stream.ResolveViewerToken(playlist, r.URL.Query().Get("vt"))
+			// The playlist is served verbatim. The renderer has already
+			// baked a short-lived, playlist-scoped viewer token into every
+			// emitted URI (or left URIs unadorned when no key is configured
+			// for the stream), so no per-request substitution is needed.
 			w.Header().Set("Content-Type", config.M3U8_MIME_TYPE)
 			w.Header().Set("Cache-Control", "no-cache")
 			w.Header().Set("Content-Length", strconv.Itoa(len(playlist)))

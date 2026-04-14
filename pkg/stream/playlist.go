@@ -1,7 +1,6 @@
 package stream
 
 import (
-	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -12,34 +11,16 @@ import (
 // Prevents busy-looping when many segments have past timestamps.
 const minRenderInterval = 50 * time.Millisecond
 
-// vtPlaceholder is emitted in rendered playlists at every location where a
-// per-viewer query string must be injected. HTTP handlers substitute it at
-// serve time via ResolveViewerToken. The placeholder is chosen so that it is
-// impossible to produce accidentally from any valid segment index, init URI,
-// or base64url-encoded viewer token (those alphabets exclude '{' and '}').
-const vtPlaceholder = "{VT}"
-
-// ResolveViewerToken substitutes the per-viewer query placeholder in a
-// rendered playlist. When vt is empty, all placeholders are removed. When vt
-// is non-empty, each placeholder is replaced with "?vt=<escaped vt>".
-//
-// Callers are expected to pass the viewer token verbatim from the request
-// query; it is URL-escaped here defensively. The base64url alphabet is
-// already URL-safe, so url.QueryEscape is a no-op for well-formed tokens.
-func ResolveViewerToken(playlist, vt string) string {
-	if playlist == "" {
-		return ""
-	}
-	if vt == "" {
-		return strings.ReplaceAll(playlist, vtPlaceholder, "")
-	}
-	return strings.ReplaceAll(playlist, vtPlaceholder, "?vt="+url.QueryEscape(vt))
-}
-
 // renderMediaPlaylist builds the HLS media playlist string from the current
 // in-memory segments. Only segments with Timestamp <= nowMs are eligible.
 // A sliding window of at most windowSize segments is applied to the tail of
 // the eligible set.
+//
+// When s.mintToken is set, it is invoked once per render and the returned
+// token is baked into every emitted URI as "?vt=<token>". When it is nil
+// (or returns ""), URIs are emitted without a query string. The base64url
+// alphabet produced by viewer.Mint is already URL-safe, so no escaping is
+// required at render time.
 //
 // Returns (playlist, nextEligibleMs) where nextEligibleMs is the timestamp
 // of the first segment not yet eligible (0 if no such segment exists).
@@ -66,11 +47,21 @@ func (s *Stream) renderMediaPlaylist(nowMs int64, windowSize int) (string, int64
 	start := max(eligible-windowSize, 0)
 	window := s.segments[start:eligible]
 
+	// Mint the playlist-scoped viewer token once per render. The renderer
+	// bakes it into every URI so viewers use a single short-lived token
+	// for all init/segment fetches linked from this playlist.
+	var vtQuery string
+	if s.mintToken != nil {
+		if tok := s.mintToken(); tok != "" {
+			vtQuery = "?vt=" + tok
+		}
+	}
+
 	var b strings.Builder
 	var scratch [64]byte
 
 	// Estimate capacity: ~150 bytes per segment entry + ~200 bytes header.
-	b.Grow(200 + len(window)*150)
+	b.Grow(200 + len(window)*(150+len(vtQuery)))
 
 	b.WriteString("#EXTM3U\n")
 	b.WriteString("#EXT-X-VERSION:7\n")
@@ -85,7 +76,7 @@ func (s *Stream) renderMediaPlaylist(nowMs int64, windowSize int) (string, int64
 	b.WriteByte('\n')
 
 	b.WriteString("#EXT-X-MAP:URI=\"init.mp4")
-	b.WriteString(vtPlaceholder)
+	b.WriteString(vtQuery)
 	b.WriteString("\"\n")
 
 	for _, seg := range window {
@@ -101,7 +92,7 @@ func (s *Stream) renderMediaPlaylist(nowMs int64, windowSize int) (string, int64
 		b.WriteString("segment_")
 		b.Write(strconv.AppendUint(scratch[:0], uint64(seg.Index), 10))
 		b.WriteString(".m4s")
-		b.WriteString(vtPlaceholder)
+		b.WriteString(vtQuery)
 		b.WriteByte('\n')
 	}
 

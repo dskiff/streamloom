@@ -4,14 +4,21 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/dskiff/streamloom/pkg/clock"
+	"github.com/dskiff/streamloom/pkg/viewer"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// vtQueryRe extracts a ?vt=<token> query parameter value from a playlist
+// body. Viewer tokens are base64url so the char class matches exactly what
+// viewer.Mint emits.
+var vtQueryRe = regexp.MustCompile(`\?vt=([A-Za-z0-9_-]+)`)
 
 // TestE2E_ViewerToken_FullFlow exercises the complete viewer-token flow:
 // mint via API → GET master playlist → GET media playlist → GET init.mp4 →
@@ -57,37 +64,62 @@ func TestE2E_ViewerToken_FullFlow(t *testing.T) {
 		return p != "" && strings.Contains(p, "segment_0.m4s")
 	}, 2*time.Second, 10*time.Millisecond)
 
-	// 5. GET master playlist with vt → media.m3u8 URI must carry ?vt=<token>.
+	// 5. GET master playlist with vt → media.m3u8 URI must carry the
+	//    viewer's own long-lived vt (master is not cached/rewritten; the
+	//    viewer fetches media.m3u8 using the same token they used here).
 	req := httptest.NewRequest(http.MethodGet, "/stream/1/stream.m3u8?vt="+vt, nil)
 	rec = httptest.NewRecorder()
 	streamRouter.ServeHTTP(rec, req)
 	require.Equal(t, http.StatusOK, rec.Code)
 	assert.Contains(t, rec.Body.String(), "media.m3u8?vt="+vt)
 
-	// 6. GET media playlist with vt → every emitted URI must carry ?vt=<token>.
+	// 6. GET media playlist with the viewer's vt → every emitted URI must
+	//    carry a ?vt=<token>. The token is the playlist-scoped short-lived
+	//    token baked by the renderer (NOT the viewer's long-lived vt); it
+	//    must still verify against the same per-stream key.
 	req = httptest.NewRequest(http.MethodGet, "/stream/1/media.m3u8?vt="+vt, nil)
 	rec = httptest.NewRecorder()
 	streamRouter.ServeHTTP(rec, req)
 	require.Equal(t, http.StatusOK, rec.Code)
 	mediaBody := rec.Body.String()
-	assert.Contains(t, mediaBody, `#EXT-X-MAP:URI="init.mp4?vt=`+vt+`"`)
-	assert.Contains(t, mediaBody, "segment_0.m4s?vt="+vt)
-	// No stray placeholders should leak through to the client.
+	// Any stale placeholder system would leak literal "{VT}"; assert absence.
 	assert.NotContains(t, mediaBody, "{VT}")
 
-	// 7. GET init.mp4 with vt → 200.
-	req = httptest.NewRequest(http.MethodGet, "/stream/1/init.mp4?vt="+vt, nil)
+	matches := vtQueryRe.FindAllStringSubmatch(mediaBody, -1)
+	require.NotEmpty(t, matches, "media playlist must embed ?vt= on URIs")
+	assert.Contains(t, mediaBody, `#EXT-X-MAP:URI="init.mp4?vt=`)
+	assert.Contains(t, mediaBody, "segment_0.m4s?vt=")
+
+	// All embedded tokens on this playlist must be identical (single mint
+	// per render) and must verify against the viewer-token key.
+	playlistVT := matches[0][1]
+	for _, m := range matches {
+		assert.Equal(t, playlistVT, m[1],
+			"all URIs in a single playlist must share the same playlist-scoped token")
+	}
+	assert.NoError(t, viewer.Verify(testViewerKey, clk.Now(), playlistVT),
+		"baked playlist token must verify against the stream's viewer key")
+
+	// 7. GET init.mp4 with the playlist-scoped vt → 200.
+	req = httptest.NewRequest(http.MethodGet, "/stream/1/init.mp4?vt="+playlistVT, nil)
 	rec = httptest.NewRecorder()
 	streamRouter.ServeHTTP(rec, req)
 	require.Equal(t, http.StatusOK, rec.Code)
 	assert.Equal(t, []byte("init-data"), rec.Body.Bytes())
 
-	// 8. GET segment with vt → 200.
-	req = httptest.NewRequest(http.MethodGet, "/stream/1/segment_0.m4s?vt="+vt, nil)
+	// 8. GET segment with the playlist-scoped vt → 200.
+	req = httptest.NewRequest(http.MethodGet, "/stream/1/segment_0.m4s?vt="+playlistVT, nil)
 	rec = httptest.NewRecorder()
 	streamRouter.ServeHTTP(rec, req)
 	require.Equal(t, http.StatusOK, rec.Code)
 	assert.Equal(t, segData, rec.Body.Bytes())
+
+	// The viewer's original long-lived vt must also still work on any
+	// stream route — tokens are not route-scoped.
+	req = httptest.NewRequest(http.MethodGet, "/stream/1/segment_0.m4s?vt="+vt, nil)
+	rec = httptest.NewRecorder()
+	streamRouter.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
 
 	// 9. Requests WITHOUT vt on the same resources must be rejected.
 	paths := []string{

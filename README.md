@@ -144,6 +144,13 @@ The `expires_at_ms` in the response echoes the **aligned** value actually encode
 
 The returned token must be passed as `?vt=<token>` on every stream URL (`stream.m3u8`, `media.m3u8`, `init.mp4`, `segment_*.m4s`). Tokens are verified statelessly: the server holds no per-token state. Rotating `SL_STREAM_<id>_VIEWER_TOKEN_KEY` immediately invalidates all outstanding tokens for that stream.
 
+**Two-token model.** To keep the cached media playlist per-stream (not per-viewer) and to bound the replay window of URLs scraped from a playlist body, streamloom uses two kinds of viewer tokens keyed by the same `SL_STREAM_<id>_VIEWER_TOKEN_KEY`:
+
+- The **viewer token** (minted via `POST /viewer_token`) is what you hand to a viewer. Its lifetime is caller-specified (minimum 5 minutes). The viewer uses it on `stream.m3u8` and `media.m3u8`.
+- A **short-lived playlist token** is minted by the server once per media-playlist render (TTL ~10 minutes) and baked directly into every `init.mp4` / `segment_*.m4s` URI inside `media.m3u8`. HLS players simply follow those URIs; no client-side logic is required.
+
+Both token kinds verify against the same per-stream key. Either one is accepted on any stream route, so a viewer can keep using their original token end-to-end — the playlist-scoped token is an internal optimization that narrows the time window during which a segment URL copied out of a playlist body remains useful.
+
 Example:
 
 ```bash
@@ -157,4 +164,4 @@ curl -X POST http://localhost:8081/api/v1/stream/1/viewer_token \
 http://localhost:8080/stream/1/stream.m3u8?vt=<vt>
 ```
 
-When `SL_STREAM_<id>_VIEWER_TOKEN_KEY` is configured, the server automatically rewrites playlist URIs so that `?vt=<token>` propagates from `stream.m3u8` to `media.m3u8` and from `media.m3u8` to every init / segment URI. HLS players do not carry parent query strings across relative URIs, so this rewrite is required for standard-compliant playback.
+When `SL_STREAM_<id>_VIEWER_TOKEN_KEY` is configured, the server automatically rewrites playlist URIs so that `?vt=<token>` propagates from `stream.m3u8` (using the viewer's own token) to `media.m3u8` and from `media.m3u8` (using the server-minted short-lived playlist token) to every init / segment URI. HLS players do not carry parent query strings across relative URIs, so this rewrite is required for standard-compliant playback.
