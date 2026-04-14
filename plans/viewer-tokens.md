@@ -21,35 +21,56 @@ introducing a session store.
 ## Wire format
 
 ```
-[1 byte version=1] [1 byte type] [4 bytes uint32 big-endian unix minutes] [16 bytes truncated HMAC-SHA256]
+[1 byte version=1] [4 bytes uint32 big-endian unix minutes] [16 bytes truncated HMAC-SHA256]
 ```
 
-22 bytes → `base64.RawURLEncoding` → **30-char token**. The MAC is computed
-over `version_byte || type_byte || exp_minutes_bytes` and truncated to the
-leftmost 16 bytes (128-bit, RFC 2104 §5). The env-var value is used directly
-as the HMAC key. Stream ID is NOT bound into the MAC — per-stream keys
-already isolate streams.
+21 bytes → `base64.RawURLEncoding` → **28-char token**. The MAC is computed
+over `version_byte || exp_minutes_bytes` and truncated to the leftmost 16
+bytes (128-bit, RFC 2104 §5). The signing key is a **derived** key, not the
+raw env-var value — see "Key derivation and route scoping" below.
 
-### Type byte and route scoping
+### Key derivation and route scoping
 
-The `type` byte identifies a token's capability class so the HTTP layer can
-refuse tokens minted for one purpose on a route serving another. Two classes
-exist:
+A token's capability class (formerly encoded as a payload `type` byte) is
+now bound into the **signing key** via a KDF:
 
-- `TypeViewer` (1) — minted via the push-authenticated
-  `POST /viewer_token` endpoint. Represents direct operator intent to grant a
-  named viewer access. Accepted on **all** stream routes (playlists, init,
-  segments).
+```
+derivedKey = HMAC-SHA256(envSecret, "streamloom/viewer-token/v1" || 0x00 || streamID || 0x00 || typeString)
+```
+
+where `typeString` is `"playlist"` or `"segment"`. Zero-byte separators
+prevent concatenation ambiguity at the streamID/typeString boundary. Two
+capability classes exist:
+
+- `TypePlaylist` (1) — minted via the push-authenticated
+  `POST /viewer_token` endpoint. Represents direct operator intent to grant
+  a named viewer access. Accepted on **all** stream routes (playlists,
+  init, segments). (Named "playlist" because playlist routes are the
+  exclusive class that accept only this type; init/segment routes also
+  accept it as an operator-grant fallback.)
 - `TypeSegment` (2) — minted internally by the media-playlist renderer and
   baked into init/segment URIs. Accepted **only** on init/segment routes —
   never on playlists.
 
+Each route class passes the set of candidate `Type`s to the middleware;
+the middleware iterates them in order and verifies the token against each
+class's derived key. The first match authorizes the request. Init/segment
+routes list `TypeSegment` first so the overwhelmingly common case
+(playlist-baked segment tokens) completes with a single HMAC.
+
 Scoping `TypeSegment` out of playlist routes defends against an infinite
-token-rotation attack: without it, a holder of a baked playlist token could
-refetch `media.m3u8` to receive a freshly-minted short-lived token, rotating
-indefinitely and defeating the TTL. Because the MAC covers the type byte, a
-cryptographically valid token cannot be "upgraded" from `TypeSegment` to
-`TypeViewer` by flipping the payload byte — the MAC check fails first.
+token-rotation attack: without it, a holder of a baked playlist token
+could refetch `media.m3u8` to receive a freshly-minted short-lived token,
+rotating indefinitely and defeating the TTL. Because the class is bound
+into the signing key itself, a cryptographically valid token minted with
+the segment-derived key cannot be "upgraded" to playlist capability by
+any byte flip — it fails MAC under the playlist-derived key, which is the
+only key playlist routes try.
+
+The same KDF structure enforces cross-stream binding: two streams sharing
+the same raw env secret (an operator misconfiguration) still derive
+distinct signing keys because the streamID is mixed into the KDF input.
+This is defense-in-depth above the existing per-stream env-var isolation.
 
 Expiration is encoded as unsigned unix minutes (uint32), giving ~8170 years
 of range from the epoch — practical overflow is impossible. Minute precision
@@ -66,30 +87,38 @@ the aligned value in the response so callers see exactly what was encoded.
 ## Changes
 
 ### New: `pkg/viewer/`
-- `Mint(key, expiresAtMs, typ)` and `Verify(key, now, token) (Type, error)`
-  with explicit error sentinels (`ErrMalformed`, `ErrBadMAC`, `ErrExpired`,
-  `ErrUnsupportedVersion`, `ErrEmptyKey`). `Verify` always runs the MAC
-  computation, even on malformed input, to keep timing uniform. Verify
-  returns the decoded `Type` on success so the HTTP layer can enforce
-  per-route capability scoping.
+- `DeriveKey(envKey, streamID, typ) ([]byte, error)` derives the per-
+  (stream, type) HMAC signing key from the raw env secret using
+  HMAC-SHA256 as a PRF with a domain-separated context string.
+- `Mint(key, expiresAtMs)` and `Verify(key, now, token) error` with
+  explicit error sentinels (`ErrMalformed`, `ErrBadMAC`, `ErrExpired`,
+  `ErrUnsupportedVersion`, `ErrEmptyKey`, `ErrUnknownType`). `Verify`
+  always runs the MAC computation, even on malformed input, to keep
+  timing uniform. A successful Verify implies the token was minted under
+  the same derived key — i.e. for the same (stream, type) pair.
 
 ### `pkg/config/env.go`
-- Added `STREAM_VIEWER_TOKEN_KEYS map[string][]byte` on `Env`.
-- Added `GetViewerTokenKey(streamID)` method.
-- Added `parseStreamViewerTokenKeys()` mirroring `parseStreamTokens()`;
-  validates stream ID, enforces min key length, `os.Unsetenv` after read.
+- Added `ViewerKeys` struct bundling the per-stream derived `Playlist`
+  and `Segment` signing keys.
+- Added `STREAM_VIEWER_TOKEN_KEYS map[string]ViewerKeys` on `Env`.
+- Added `GetViewerKeys(streamID)` method.
+- `parseStreamViewerTokenKeys()` derives both class keys from the raw env
+  secret at parse time, stores only the derived keys, then clears the
+  raw secret and `os.Unsetenv`s the variable. The raw secret never
+  leaves the parse function — a hardening win on top of env-var hygiene.
 - Defensive skip in `parseStreamTokens` to avoid misclassifying
   `SL_STREAM_<id>_VIEWER_TOKEN_KEY` as a push token.
 
-### `pkg/middleware/viewertoken.go` (new)
-- `ViewerTokenAuth(clock, keys, logger, allowedTypes...)` middleware: opt-in
-  per stream. When a key is configured, `vt` query is verified; any failure
-  → 401. When no key is configured, requests pass through untouched. The
-  variadic `allowedTypes` set restricts which token `Type` classes may be
-  accepted on the routes this middleware guards; a cryptographically valid
-  token whose type is not in the set is collapsed to a 401 just like any
-  other failure. A zero-length allow list is a configuration error and
-  panics at wiring time rather than silently rejecting every request.
+### `pkg/middleware/viewertoken.go`
+- `ViewerTokenAuth(clock, keys, logger, allowedTypes...)` middleware:
+  opt-in per stream. When derived keys are configured, the `vt` query is
+  verified under each class's derived key in the order specified by
+  `allowedTypes`; the first verify that succeeds authorizes the request.
+  When no keys are configured, requests pass through untouched. Callers
+  order `allowedTypes` from most-expected to least-expected so the common
+  case is a single HMAC. A zero-length allow list (or an unknown `Type`)
+  is a configuration error and panics at wiring time rather than silently
+  rejecting every request.
 
 ### `pkg/routes/api.go`
 - `POST /api/v1/stream/{id}/viewer_token` handler under the push-token-
@@ -105,19 +134,22 @@ the aligned value in the response so callers see exactly what was encoded.
   inflate watcher counts.
 - The `/stream/{streamID}` routes are split into two `chi.Group`s with
   distinct allowed-type sets:
-  - **Playlist group** (`media.m3u8`, `stream.m3u8`) — accepts only
-    `TypeViewer`. Refusing `TypeSegment` here is the central defense
-    against infinite token rotation.
-  - **Init/segment group** (`init.mp4`, `segment_*.m4s`) — accepts both
-    `TypeViewer` and `TypeSegment`.
+  - **Playlist group** (`media.m3u8`, `stream.m3u8`) — passes only
+    `TypePlaylist`, so the middleware verifies solely under the
+    playlist-derived key. Segment-class tokens fail MAC here, the
+    central defense against infinite token rotation.
+  - **Init/segment group** (`init.mp4`, `segment_*.m4s`) — passes
+    `TypeSegment` first (hot path: playlist-baked tokens) then
+    `TypePlaylist` (operator-grant fallback), so playlist-baked tokens
+    authorize with a single HMAC and operator tokens still work.
 - Master playlist (`stream.m3u8`): appends `?vt=<escaped>` to the emitted
   `media.m3u8` URI when the incoming request carried `vt`. Master playlists
-  are not cached and use the viewer's own long-lived (`TypeViewer`) token
-  because viewers refresh `media.m3u8` repeatedly (not `stream.m3u8`), so
-  baking a short-lived token here would break playback as soon as that
-  token expired.
-- Media playlist (`media.m3u8`): serves the renderer's cached body verbatim.
-  The renderer has already baked a playlist-scoped short-lived
+  are not cached and use the viewer's own long-lived (`TypePlaylist`)
+  token because viewers refresh `media.m3u8` repeatedly (not
+  `stream.m3u8`), so baking a short-lived token here would break playback
+  as soon as that token expired.
+- Media playlist (`media.m3u8`): serves the renderer's cached body
+  verbatim. The renderer has already baked a playlist-scoped short-lived
   (`TypeSegment`) token into every emitted URI, so no per-request
   substitution (and no per-viewer per-fetch allocation) is required.
 
@@ -141,15 +173,16 @@ the aligned value in the response so callers see exactly what was encoded.
   identically to the pre-viewer-token path.
 
 ### `pkg/routes/api.go` (playlist-token plumbing)
-- Added `PlaylistTokenTTL = 10 * time.Minute`. The `/init` handler builds a
-  `makePlaylistTokenMinter` closure when the stream has a configured viewer
-  key, capturing the key, store clock, and logger. The closure mints a
-  `TypeSegment` token on every call so the stream middleware refuses it on
-  playlist routes. The closure is passed to `store.Init` via
-  `stream.WithMintToken(...)`. Streams without a key receive no option,
+- Added `PlaylistTokenTTL = 10 * time.Minute`. The `/init` handler builds
+  a `makePlaylistTokenMinter` closure when the stream has configured
+  viewer keys, capturing the **segment-derived** key, store clock, and
+  logger. The closure mints a segment-class token on every call so the
+  playlist middleware refuses it (the playlist route only tries the
+  playlist-derived key). The closure is passed to `store.Init` via
+  `stream.WithMintToken(...)`. Streams without keys receive no option,
   preserving fully-public playback. The operator-facing
-  `POST /viewer_token` endpoint mints `TypeViewer` instead, which is
-  accepted on every stream route.
+  `POST /viewer_token` endpoint uses the **playlist-derived** key
+  instead, producing tokens accepted on every stream route.
 
 ### `main.go`
 - Logs `viewer token key configured` for each configured stream at startup.
@@ -208,7 +241,18 @@ the aligned value in the response so callers see exactly what was encoded.
 8. **Token rotation via playlist refetch** — without route scoping, a
    client holding any valid token could refetch `media.m3u8` to harvest a
    freshly-minted token and repeat indefinitely, making the 10-minute TTL
-   ineffective. Mitigation: the renderer bakes `TypeSegment` tokens, and
-   the playlist route group rejects anything other than `TypeViewer`. The
-   type byte is part of the MAC input, so a `TypeSegment` token cannot be
-   re-typed to `TypeViewer` without the signing key.
+   ineffective. Mitigation: the renderer bakes segment-class tokens
+   (signed under the segment-derived key), and the playlist route group
+   tries only the playlist-derived key. The class is bound into the
+   signing key by the KDF, so a segment-class token cannot be re-typed to
+   a playlist-class token without the raw env secret — not just without
+   the payload type byte.
+
+9. **Wire-format change vs old binaries** — the v1 wire format changed
+   from 22 bytes (with payload type byte) to 21 bytes (without). Tokens
+   minted by an older binary decode to 22 bytes and fail the length check
+   in Verify. streamloom is fully in-memory so a restart already wipes
+   all streams and tokens; no parallel-verify period is needed. This
+   does mean a rolling deployment that terminates mid-update will serve
+   401s for tokens crossing the version boundary — same operational
+   envelope as any other state-resetting change.

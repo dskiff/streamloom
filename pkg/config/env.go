@@ -8,6 +8,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+
+	"github.com/dskiff/streamloom/pkg/viewer"
 )
 
 // MaxStreamIDLength is the upper bound on stream ID length.
@@ -80,10 +82,28 @@ type Env struct {
 	// "Bearer <token>" header value for constant-time comparison.
 	STREAM_TOKENS map[string]TokenDigest
 
-	// STREAM_VIEWER_TOKEN_KEYS maps stream IDs to the raw signing key bytes
-	// used to mint and verify viewer tokens. A stream with no entry here has
-	// viewer-token auth disabled and is served publicly (current behavior).
-	STREAM_VIEWER_TOKEN_KEYS map[string][]byte
+	// STREAM_VIEWER_TOKEN_KEYS maps stream IDs to the pre-derived signing
+	// keys used to mint and verify viewer tokens for that stream. A stream
+	// with no entry here has viewer-token auth disabled and is served
+	// publicly (current behavior).
+	//
+	// Both the playlist-class and segment-class keys are derived from the
+	// raw env-var secret at parse time via viewer.DeriveKey; the raw
+	// secret itself is never stored on Env. See parseStreamViewerTokenKeys.
+	STREAM_VIEWER_TOKEN_KEYS map[string]ViewerKeys
+}
+
+// ViewerKeys bundles the per-stream derived viewer-token signing keys.
+// Each field is the HMAC-SHA256 output of viewer.DeriveKey under a
+// distinct Type. Keeping both keys pre-derived means the middleware hot
+// path does no KDF work per request.
+type ViewerKeys struct {
+	// Playlist is the derived key for TypePlaylist tokens (operator-grant,
+	// long-lived, accepted on all stream routes).
+	Playlist []byte
+	// Segment is the derived key for TypeSegment tokens (renderer-baked,
+	// short-lived, accepted only on init/segment routes).
+	Segment []byte
 }
 
 // GetStreamToken returns the SHA-256 digest of the expected "Bearer <token>" header
@@ -93,10 +113,11 @@ func (e *Env) GetStreamToken(streamID string) (TokenDigest, bool) {
 	return tok, ok
 }
 
-// GetViewerTokenKey returns the viewer-token signing key for a stream ID.
-// Returns nil and false if the stream has no configured viewer key, which
-// indicates that viewer-token auth is disabled for that stream.
-func (e *Env) GetViewerTokenKey(streamID string) ([]byte, bool) {
+// GetViewerKeys returns the pre-derived viewer-token signing keys for a
+// stream ID. Returns the zero value and false if the stream has no
+// configured viewer key, which indicates that viewer-token auth is
+// disabled for that stream.
+func (e *Env) GetViewerKeys(streamID string) (ViewerKeys, bool) {
 	k, ok := e.STREAM_VIEWER_TOKEN_KEYS[streamID]
 	return k, ok
 }
@@ -294,12 +315,27 @@ func parseStreamTokens() (map[string]TokenDigest, error) {
 }
 
 // parseStreamViewerTokenKeys scans the environment for
-// SL_STREAM_<id>_VIEWER_TOKEN_KEY variables, validates that <id> is a valid
-// stream ID and the key is long enough, stores the raw key bytes, and unsets
-// the env var. These keys are used to sign and verify stateless viewer tokens
-// for HLS playback.
-func parseStreamViewerTokenKeys() (map[string][]byte, error) {
-	keys := make(map[string][]byte)
+// SL_STREAM_<id>_VIEWER_TOKEN_KEY variables, validates that <id> is a
+// valid stream ID and the raw key is long enough, DERIVES both the
+// playlist-class and segment-class signing keys via viewer.DeriveKey, and
+// stores only the derived keys. These derived keys are used to sign and
+// verify stateless viewer tokens for HLS playback; binding the streamID
+// and type into the KDF means a token minted for one (stream, type) pair
+// cannot verify under any other.
+//
+// Secret-hygiene caveats (best-effort, given Go's memory model):
+//   - The env-var value is unset via os.Unsetenv so /proc/self/environ
+//     and child-process inheritance no longer expose it.
+//   - The byte-slice copy this function allocates for DeriveKey input
+//     is explicitly zeroed before it becomes GC-eligible, closing the
+//     one copy we control.
+//   - The string form of the secret returned by os.Environ is immutable
+//     in Go and cannot be zeroed in place; it simply becomes unreachable
+//     when this function returns and is freed by the garbage collector
+//     on some later cycle. A core dump captured between parse and the
+//     next GC may therefore still contain the raw secret.
+func parseStreamViewerTokenKeys() (map[string]ViewerKeys, error) {
+	keys := make(map[string]ViewerKeys)
 
 	for _, kv := range os.Environ() {
 		key, value, ok := strings.Cut(kv, "=")
@@ -332,8 +368,27 @@ func parseStreamViewerTokenKeys() (map[string][]byte, error) {
 			return nil, fmt.Errorf("viewer token key for env var %s is too short (%d chars); minimum is %d", key, len(value), MinTokenLength)
 		}
 
-		// Copy the bytes so we're not aliasing the os.Environ storage.
-		keys[streamIDStr] = []byte(value)
+		// Derive both class keys and zero the byte-slice copy of the
+		// secret before it becomes GC-eligible. DeriveKey has already
+		// fed the bytes into HMAC and does not retain a reference to
+		// rawKey, so zeroing here is safe. Note that the immutable
+		// string form in `value` remains in memory until GC (see the
+		// doc comment's secret-hygiene caveats).
+		rawKey := []byte(value)
+		playlistKey, err := viewer.DeriveKey(rawKey, streamIDStr, viewer.TypePlaylist)
+		if err != nil {
+			zero(rawKey)
+			return nil, fmt.Errorf("deriving playlist key for env var %s: %w", key, err)
+		}
+		segmentKey, err := viewer.DeriveKey(rawKey, streamIDStr, viewer.TypeSegment)
+		zero(rawKey)
+		if err != nil {
+			return nil, fmt.Errorf("deriving segment key for env var %s: %w", key, err)
+		}
+		keys[streamIDStr] = ViewerKeys{
+			Playlist: playlistKey,
+			Segment:  segmentKey,
+		}
 
 		// Clear the env var after reading.
 		os.Unsetenv(key)
@@ -357,6 +412,18 @@ func parsePort(envVar string, defaultPort int) (int, error) {
 		return 0, fmt.Errorf("%s must be between 1 and 65535, got %d", envVar, v)
 	}
 	return v, nil
+}
+
+// zero overwrites every byte of b with 0x00. Used to scrub locally-
+// allocated secret buffers before they become GC-eligible. Go does not
+// guarantee the write isn't elided, but in practice the compiler does
+// not remove writes to a slice whose backing array escapes the function
+// (as rawKey's does through DeriveKey's HMAC state during the call) —
+// so this is meaningful defense in depth, not cryptographic assurance.
+func zero(b []byte) {
+	for i := range b {
+		b[i] = 0
+	}
 }
 
 func trueish(s string) bool {

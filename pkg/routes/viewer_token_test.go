@@ -55,11 +55,19 @@ func TestViewerToken_Success(t *testing.T) {
 	assert.LessOrEqual(t, resp.ExpiresAtMs, exp,
 		"echoed expiry must never exceed the requested value")
 
-	// The minted token must verify against the same key and be typed as
-	// TypeViewer (the operator-grant class accepted on all stream routes).
-	typ, err := viewer.Verify(testViewerKey, clk.Now(), resp.Token)
+	// The minted token must verify under the playlist-derived signing
+	// key — the operator-grant class accepted on all stream routes. It
+	// must NOT verify under the segment-derived key (KDF-backed
+	// cross-type isolation).
+	keys := testViewerKeys(t, "1")
+	err := viewer.Verify(keys.Playlist, clk.Now(), resp.Token)
 	assert.NoError(t, err)
-	assert.Equal(t, viewer.TypeViewer, typ)
+	err = viewer.Verify(keys.Segment, clk.Now(), resp.Token)
+	assert.ErrorIs(t, err, viewer.ErrBadMAC,
+		"operator-grant token must not verify under the segment-derived key")
+
+	// The minted token is the shorter 28-char form (21 bytes payload).
+	assert.Len(t, resp.Token, viewer.EncodedTokenLen)
 }
 
 func TestViewerToken_NoKeyConfigured(t *testing.T) {

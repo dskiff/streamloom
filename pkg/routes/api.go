@@ -52,21 +52,24 @@ const PlaylistTokenTTL = 10 * time.Minute
 // the viewer package's private constant across the serde boundary.
 const viewerTokenMsPerMinute = 60_000
 
-// makePlaylistTokenMinter returns a closure that mints a playlist-scoped
-// viewer token valid for PlaylistTokenTTL from the current clock time. The
-// closure captures the per-stream signing key, the store clock, the logger,
-// and the streamID for diagnostics. It returns "" on failure so the renderer
-// falls back to emitting plain URIs for that render only (the middleware
-// still enforces vt on the resulting requests, so those plain URIs will 401
-// — this is the correct fail-closed behavior for a configured stream).
-func makePlaylistTokenMinter(key []byte, clk clock.Clock, logger *slog.Logger, streamID string) func() string {
+// makePlaylistTokenMinter returns a closure that mints a playlist-baked
+// segment-class viewer token valid for PlaylistTokenTTL from the current
+// clock time. The closure captures the per-stream segment-derived signing
+// key, the store clock, the logger, and the streamID for diagnostics. It
+// returns "" on failure so the renderer falls back to emitting plain URIs
+// for that render only (the middleware still enforces vt on the resulting
+// requests, so those plain URIs will 401 — this is the correct
+// fail-closed behavior for a configured stream).
+//
+// The segment-derived key binds these tokens to the segment capability
+// class via the KDF, so a refetch of the media playlist carrying one of
+// these tokens fails MAC under the playlist-derived key (tried alone on
+// playlist routes) and is rejected. This preserves the infinite-rotation
+// defense without spending a payload byte on a type marker.
+func makePlaylistTokenMinter(segmentKey []byte, clk clock.Clock, logger *slog.Logger, streamID string) func() string {
 	return func() string {
 		expMs := clk.Now().Add(PlaylistTokenTTL).UnixMilli()
-		// Playlist-baked tokens are minted as TypeSegment so the stream
-		// middleware will refuse them on playlist routes. Without this
-		// scoping a holder could refetch the media playlist to rotate
-		// into a freshly-baked token indefinitely, defeating the TTL.
-		tok, err := viewer.Mint(key, expMs, viewer.TypeSegment)
+		tok, err := viewer.Mint(segmentKey, expMs)
 		if err != nil {
 			logger.Error("failed to mint playlist viewer token",
 				"streamID", streamID,
@@ -292,7 +295,7 @@ func API(logger *slog.Logger, env config.Env, store *stream.Store, requestLogger
 			streamID := r.Context().Value(streamIDKey).(string)
 			logger.Debug("handling viewer token mint request", "streamID", streamID)
 
-			key, ok := env.GetViewerTokenKey(streamID)
+			keys, ok := env.GetViewerKeys(streamID)
 			if !ok {
 				// No viewer-token key configured for this stream; the feature
 				// is opt-in per stream. Signal that the caller's request
@@ -356,9 +359,11 @@ func API(logger *slog.Logger, env config.Env, store *stream.Store, requestLogger
 				return
 			}
 
-			// The operator-facing endpoint mints TypeViewer tokens; these
-			// are accepted on every stream route, including playlists.
-			token, err := viewer.Mint(key, alignedExpMs, viewer.TypeViewer)
+			// The operator-facing endpoint mints TypePlaylist tokens (signed
+			// under the playlist-derived key); these are accepted on every
+			// stream route, including playlists. Segment/init routes also
+			// accept them as an operator-grant fallback.
+			token, err := viewer.Mint(keys.Playlist, alignedExpMs)
 			if err != nil {
 				// ErrMalformed here is client-triggerable (e.g. an
 				// expires_at_ms so large its minute value overflows
@@ -474,13 +479,13 @@ func API(logger *slog.Logger, env config.Env, store *stream.Store, requestLogger
 
 			// When a viewer-token key is configured for this stream, wire a
 			// mint callback the renderer will use once per playlist render to
-			// bake a short-lived token into every emitted URI. Streams without
-			// a configured key receive no option and the renderer emits plain
-			// URIs (preserves public-playback parity with pre-viewer-token
-			// behavior).
+			// bake a short-lived segment-class token into every emitted URI.
+			// Streams without a configured key receive no option and the
+			// renderer emits plain URIs (preserves public-playback parity
+			// with pre-viewer-token behavior).
 			var initOpts []stream.InitOption
-			if viewerKey, ok := env.GetViewerTokenKey(streamID); ok {
-				mintFn := makePlaylistTokenMinter(viewerKey, store.Clock(), logger, streamID)
+			if viewerKeys, ok := env.GetViewerKeys(streamID); ok {
+				mintFn := makePlaylistTokenMinter(viewerKeys.Segment, store.Clock(), logger, streamID)
 				initOpts = append(initOpts, stream.WithMintToken(mintFn))
 			}
 

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/dskiff/streamloom/pkg/clock"
+	"github.com/dskiff/streamloom/pkg/config"
 	"github.com/dskiff/streamloom/pkg/viewer"
 	"github.com/go-chi/chi/v5"
 	"github.com/stretchr/testify/assert"
@@ -20,15 +21,31 @@ var okHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 })
 
-// newTestRouter mounts ViewerTokenAuth on a single route; tests that do not
-// exercise type scoping can accept any token class.
-func newTestRouter(clk clock.Clock, keys map[string][]byte) http.Handler {
-	return newTestRouterWithTypes(clk, keys, viewer.TypeViewer, viewer.TypeSegment)
+// testEnvSecret is a fixed env-var-style secret used to derive both class
+// keys in the middleware tests.
+const testEnvSecret = "0123456789abcdef0123456789abcdef"
+
+// newKeysMap builds a ViewerKeys entry for streamID "1" under the shared
+// testEnvSecret. Tests that want a mismatched-key scenario derive their
+// own ViewerKeys from a different secret.
+func newKeysMap(t *testing.T, streamID string) map[string]config.ViewerKeys {
+	t.Helper()
+	pk, err := viewer.DeriveKey([]byte(testEnvSecret), streamID, viewer.TypePlaylist)
+	require.NoError(t, err)
+	sk, err := viewer.DeriveKey([]byte(testEnvSecret), streamID, viewer.TypeSegment)
+	require.NoError(t, err)
+	return map[string]config.ViewerKeys{streamID: {Playlist: pk, Segment: sk}}
+}
+
+// newTestRouter mounts ViewerTokenAuth on a single route accepting both
+// class keys (init/segment-style scoping).
+func newTestRouter(clk clock.Clock, keys map[string]config.ViewerKeys) http.Handler {
+	return newTestRouterWithTypes(clk, keys, viewer.TypeSegment, viewer.TypePlaylist)
 }
 
 // newTestRouterWithTypes mounts ViewerTokenAuth with an explicit allowed-type
 // set so tests can assert per-route scoping behavior.
-func newTestRouterWithTypes(clk clock.Clock, keys map[string][]byte, allowed ...viewer.Type) http.Handler {
+func newTestRouterWithTypes(clk clock.Clock, keys map[string]config.ViewerKeys, allowed ...viewer.Type) http.Handler {
 	r := chi.NewRouter()
 	r.Route("/stream/{streamID}", func(sr chi.Router) {
 		sr.Use(ViewerTokenAuth(clk, keys, slog.Default(), allowed...))
@@ -38,7 +55,7 @@ func newTestRouterWithTypes(clk clock.Clock, keys map[string][]byte, allowed ...
 }
 
 func TestViewerTokenAuth_NoKeyConfigured_PassesThrough(t *testing.T) {
-	r := newTestRouter(clock.Real{}, map[string][]byte{})
+	r := newTestRouter(clock.Real{}, map[string]config.ViewerKeys{})
 	req := httptest.NewRequest(http.MethodGet, "/stream/1/thing", nil)
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
@@ -46,7 +63,7 @@ func TestViewerTokenAuth_NoKeyConfigured_PassesThrough(t *testing.T) {
 }
 
 func TestViewerTokenAuth_InvalidStreamID_NotFound(t *testing.T) {
-	r := newTestRouter(clock.Real{}, map[string][]byte{"1": []byte("key")})
+	r := newTestRouter(clock.Real{}, newKeysMap(t, "1"))
 	req := httptest.NewRequest(http.MethodGet, "/stream/a.b/thing", nil)
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
@@ -55,11 +72,11 @@ func TestViewerTokenAuth_InvalidStreamID_NotFound(t *testing.T) {
 
 func TestViewerTokenAuth_ValidToken_PassesThrough(t *testing.T) {
 	clk := clock.NewMock(time.UnixMilli(1_700_000_000_000))
-	key := []byte("0123456789abcdef0123456789abcdef")
-	tok, err := viewer.Mint(key, clk.Now().Add(time.Hour).UnixMilli(), viewer.TypeViewer)
+	keys := newKeysMap(t, "1")
+	tok, err := viewer.Mint(keys["1"].Playlist, clk.Now().Add(time.Hour).UnixMilli())
 	require.NoError(t, err)
 
-	r := newTestRouter(clk, map[string][]byte{"1": key})
+	r := newTestRouter(clk, keys)
 	req := httptest.NewRequest(http.MethodGet, "/stream/1/thing?vt="+tok, nil)
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
@@ -68,9 +85,8 @@ func TestViewerTokenAuth_ValidToken_PassesThrough(t *testing.T) {
 
 func TestViewerTokenAuth_MissingToken_401(t *testing.T) {
 	clk := clock.NewMock(time.UnixMilli(1_700_000_000_000))
-	key := []byte("0123456789abcdef0123456789abcdef")
 
-	r := newTestRouter(clk, map[string][]byte{"1": key})
+	r := newTestRouter(clk, newKeysMap(t, "1"))
 	req := httptest.NewRequest(http.MethodGet, "/stream/1/thing", nil)
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
@@ -79,12 +95,12 @@ func TestViewerTokenAuth_MissingToken_401(t *testing.T) {
 
 func TestViewerTokenAuth_ExpiredToken_401(t *testing.T) {
 	clk := clock.NewMock(time.UnixMilli(1_700_000_000_000))
-	key := []byte("0123456789abcdef0123456789abcdef")
+	keys := newKeysMap(t, "1")
 	// Mint with exp in the past relative to clk.
-	tok, err := viewer.Mint(key, clk.Now().Add(-1*time.Second).UnixMilli(), viewer.TypeViewer)
+	tok, err := viewer.Mint(keys["1"].Playlist, clk.Now().Add(-1*time.Second).UnixMilli())
 	require.NoError(t, err)
 
-	r := newTestRouter(clk, map[string][]byte{"1": key})
+	r := newTestRouter(clk, keys)
 	req := httptest.NewRequest(http.MethodGet, "/stream/1/thing?vt="+tok, nil)
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
@@ -93,55 +109,71 @@ func TestViewerTokenAuth_ExpiredToken_401(t *testing.T) {
 
 func TestViewerTokenAuth_TamperedToken_401(t *testing.T) {
 	clk := clock.NewMock(time.UnixMilli(1_700_000_000_000))
-	key := []byte("0123456789abcdef0123456789abcdef")
-	tok, err := viewer.Mint(key, clk.Now().Add(time.Hour).UnixMilli(), viewer.TypeViewer)
+	keys := newKeysMap(t, "1")
+	tok, err := viewer.Mint(keys["1"].Playlist, clk.Now().Add(time.Hour).UnixMilli())
 	require.NoError(t, err)
-	// Tamper at the byte level (decode → flip → re-encode) rather than at
-	// the base64 character level. The 22-byte payload encodes to 30
-	// base64url characters, 4 of which are excess padding bits, so a
-	// character flip may land on unused bits and leave the decoded
-	// payload (and therefore the MAC) intact.
+	// Tamper at the byte level (decode → flip → re-encode). With a
+	// 21-byte payload encoded to 28 base64url chars there are no unused
+	// trailing bits, but decoding and re-encoding works uniformly.
 	raw, err := base64.RawURLEncoding.DecodeString(tok)
 	require.NoError(t, err)
 	raw[len(raw)-1] ^= 0x01
 	bad := base64.RawURLEncoding.EncodeToString(raw)
 
-	r := newTestRouter(clk, map[string][]byte{"1": key})
+	r := newTestRouter(clk, keys)
 	req := httptest.NewRequest(http.MethodGet, "/stream/1/thing?vt="+bad, nil)
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 	assert.Equal(t, http.StatusUnauthorized, rec.Code)
 }
 
-// TestViewerTokenAuth_TypeNotAllowed_401 asserts that a cryptographically
-// valid token whose Type is not in the route's allowed-set is rejected. This
-// is the mechanism that prevents a TypeSegment token (baked into playlist
-// URIs) from being replayed on a playlist-scoped route to rotate into a fresh
-// token and defeat the TTL.
-func TestViewerTokenAuth_TypeNotAllowed_401(t *testing.T) {
+// TestViewerTokenAuth_SegmentTokenOnPlaylistRoute_401 asserts that a
+// token minted with the segment-derived key is rejected on a route that
+// only allows TypePlaylist. This is the mechanism (now KDF-backed rather
+// than type-byte-backed) that prevents a renderer-baked segment token
+// from being replayed on a playlist route to rotate into a fresh token
+// and defeat the TTL.
+func TestViewerTokenAuth_SegmentTokenOnPlaylistRoute_401(t *testing.T) {
 	clk := clock.NewMock(time.UnixMilli(1_700_000_000_000))
-	key := []byte("0123456789abcdef0123456789abcdef")
-	tok, err := viewer.Mint(key, clk.Now().Add(time.Hour).UnixMilli(), viewer.TypeSegment)
+	keys := newKeysMap(t, "1")
+	tok, err := viewer.Mint(keys["1"].Segment, clk.Now().Add(time.Hour).UnixMilli())
 	require.NoError(t, err)
 
-	// Playlist-scoped router: TypeViewer only.
-	r := newTestRouterWithTypes(clk, map[string][]byte{"1": key}, viewer.TypeViewer)
+	// Playlist-scoped router: TypePlaylist only.
+	r := newTestRouterWithTypes(clk, keys, viewer.TypePlaylist)
 	req := httptest.NewRequest(http.MethodGet, "/stream/1/thing?vt="+tok, nil)
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 	assert.Equal(t, http.StatusUnauthorized, rec.Code)
 }
 
-// TestViewerTokenAuth_TypeAllowed_PassesThrough asserts that a TypeSegment
-// token IS accepted on a route whose allowed-set includes TypeSegment (e.g.
-// the init/segment routes).
-func TestViewerTokenAuth_TypeAllowed_PassesThrough(t *testing.T) {
+// TestViewerTokenAuth_SegmentTokenOnSegmentRoute_PassesThrough asserts a
+// segment-class token is accepted on a route whose allowed set includes
+// TypeSegment (e.g. init/segment routes).
+func TestViewerTokenAuth_SegmentTokenOnSegmentRoute_PassesThrough(t *testing.T) {
 	clk := clock.NewMock(time.UnixMilli(1_700_000_000_000))
-	key := []byte("0123456789abcdef0123456789abcdef")
-	tok, err := viewer.Mint(key, clk.Now().Add(time.Hour).UnixMilli(), viewer.TypeSegment)
+	keys := newKeysMap(t, "1")
+	tok, err := viewer.Mint(keys["1"].Segment, clk.Now().Add(time.Hour).UnixMilli())
 	require.NoError(t, err)
 
-	r := newTestRouterWithTypes(clk, map[string][]byte{"1": key}, viewer.TypeViewer, viewer.TypeSegment)
+	r := newTestRouterWithTypes(clk, keys, viewer.TypeSegment, viewer.TypePlaylist)
+	req := httptest.NewRequest(http.MethodGet, "/stream/1/thing?vt="+tok, nil)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	assert.Equal(t, http.StatusOK, rec.Code)
+}
+
+// TestViewerTokenAuth_PlaylistTokenOnSegmentRoute_PassesThrough asserts
+// the operator-grant (playlist-class) token still works on segment routes
+// — the refactor preserves today's behavior that an operator token can
+// fetch both playlists and segments.
+func TestViewerTokenAuth_PlaylistTokenOnSegmentRoute_PassesThrough(t *testing.T) {
+	clk := clock.NewMock(time.UnixMilli(1_700_000_000_000))
+	keys := newKeysMap(t, "1")
+	tok, err := viewer.Mint(keys["1"].Playlist, clk.Now().Add(time.Hour).UnixMilli())
+	require.NoError(t, err)
+
+	r := newTestRouterWithTypes(clk, keys, viewer.TypeSegment, viewer.TypePlaylist)
 	req := httptest.NewRequest(http.MethodGet, "/stream/1/thing?vt="+tok, nil)
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
@@ -153,20 +185,37 @@ func TestViewerTokenAuth_TypeAllowed_PassesThrough(t *testing.T) {
 // reject all traffic; failing loudly at wiring time is strictly better.
 func TestViewerTokenAuth_NoAllowedTypes_Panics(t *testing.T) {
 	assert.Panics(t, func() {
-		_ = ViewerTokenAuth(clock.Real{}, map[string][]byte{}, slog.Default())
+		_ = ViewerTokenAuth(clock.Real{}, map[string]config.ViewerKeys{}, slog.Default())
+	})
+}
+
+// TestViewerTokenAuth_UnknownType_Panics asserts constructor-time refusal
+// of an unrecognized viewer.Type. This is a programmer-error guard — no
+// external input reaches the middleware with an unknown Type.
+func TestViewerTokenAuth_UnknownType_Panics(t *testing.T) {
+	assert.Panics(t, func() {
+		_ = ViewerTokenAuth(clock.Real{}, map[string]config.ViewerKeys{}, slog.Default(), viewer.Type(99))
 	})
 }
 
 func TestViewerTokenAuth_WrongStreamKey_401(t *testing.T) {
-	// Two streams, different keys. A token minted for stream 1 must not
-	// authorize requests to stream 2.
+	// Two streams, different derived keys (because stream IDs differ).
+	// A token minted for stream 1 must not authorize requests to stream 2
+	// — the KDF binds the stream ID.
 	clk := clock.NewMock(time.UnixMilli(1_700_000_000_000))
-	key1 := []byte("0123456789abcdef0123456789abcdef")
-	key2 := []byte("ffffffffffffffffffffffffffffffff")
-	tok, err := viewer.Mint(key1, clk.Now().Add(time.Hour).UnixMilli(), viewer.TypeViewer)
+	keys := newKeysMap(t, "1")
+	// Build stream 2's entry under the same env secret so the only
+	// distinguishing input to the KDF is the streamID.
+	pk2, err := viewer.DeriveKey([]byte(testEnvSecret), "2", viewer.TypePlaylist)
+	require.NoError(t, err)
+	sk2, err := viewer.DeriveKey([]byte(testEnvSecret), "2", viewer.TypeSegment)
+	require.NoError(t, err)
+	keys["2"] = config.ViewerKeys{Playlist: pk2, Segment: sk2}
+
+	tok, err := viewer.Mint(keys["1"].Playlist, clk.Now().Add(time.Hour).UnixMilli())
 	require.NoError(t, err)
 
-	r := newTestRouter(clk, map[string][]byte{"1": key1, "2": key2})
+	r := newTestRouter(clk, keys)
 	req := httptest.NewRequest(http.MethodGet, "/stream/2/thing?vt="+tok, nil)
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)

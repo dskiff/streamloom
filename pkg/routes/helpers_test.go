@@ -11,6 +11,7 @@ import (
 	"github.com/dskiff/streamloom/pkg/clock"
 	"github.com/dskiff/streamloom/pkg/config"
 	"github.com/dskiff/streamloom/pkg/stream"
+	"github.com/dskiff/streamloom/pkg/viewer"
 	"github.com/dskiff/streamloom/pkg/watcher"
 	"github.com/stretchr/testify/require"
 )
@@ -50,11 +51,26 @@ func testAPIRouterWithToken(t *testing.T, clk clock.Clock) (http.Handler, *strea
 	return router, store, env, tracker
 }
 
-// testViewerKey is the fixed signing key used across viewer-token tests.
-var testViewerKey = []byte("0123456789abcdef0123456789abcdef")
+// testViewerEnvSecret is the fixed raw env-var-style secret used across
+// viewer-token tests. The derived playlist/segment signing keys for a
+// given stream ID are obtained via testViewerKeys.
+var testViewerEnvSecret = []byte("0123456789abcdef0123456789abcdef")
+
+// testViewerKeys returns the pre-derived ViewerKeys for streamID under
+// testViewerEnvSecret — mirroring what config.parseStreamViewerTokenKeys
+// would produce in production. Tests that need a specific class key
+// access the struct's Playlist or Segment field.
+func testViewerKeys(t *testing.T, streamID string) config.ViewerKeys {
+	t.Helper()
+	pk, err := viewer.DeriveKey(testViewerEnvSecret, streamID, viewer.TypePlaylist)
+	require.NoError(t, err)
+	sk, err := viewer.DeriveKey(testViewerEnvSecret, streamID, viewer.TypeSegment)
+	require.NoError(t, err)
+	return config.ViewerKeys{Playlist: pk, Segment: sk}
+}
 
 // testAPIRouterWithViewerKey creates an API router with both a push token
-// and a viewer-token signing key configured for stream 1.
+// and pre-derived viewer-token signing keys configured for stream 1.
 func testAPIRouterWithViewerKey(t *testing.T, clk clock.Clock) (http.Handler, *stream.Store, config.Env, *watcher.Tracker) {
 	t.Helper()
 	store := stream.NewStore(clk)
@@ -66,16 +82,16 @@ func testAPIRouterWithViewerKey(t *testing.T, clk clock.Clock) (http.Handler, *s
 		STREAM_TOKENS: map[string]config.TokenDigest{
 			"1": sha256.Sum256([]byte("Bearer test-token")),
 		},
-		STREAM_VIEWER_TOKEN_KEYS: map[string][]byte{
-			"1": testViewerKey,
+		STREAM_VIEWER_TOKEN_KEYS: map[string]config.ViewerKeys{
+			"1": testViewerKeys(t, "1"),
 		},
 	}
 	router := API(l, env, store, nil, tracker)
 	return router, store, env, tracker
 }
 
-// testStreamRouterWithViewerKey creates a stream router with a viewer-token
-// signing key configured for stream 1.
+// testStreamRouterWithViewerKey creates a stream router with pre-derived
+// viewer-token signing keys configured for stream 1.
 func testStreamRouterWithViewerKey(t *testing.T, clk clock.Clock) (http.Handler, *stream.Store, *watcher.Tracker) {
 	t.Helper()
 	store := stream.NewStore(clk)
@@ -87,16 +103,16 @@ func testStreamRouterWithViewerKey(t *testing.T, clk clock.Clock) (http.Handler,
 		STREAM_TOKENS: map[string]config.TokenDigest{
 			"1": sha256.Sum256([]byte("Bearer test-token")),
 		},
-		STREAM_VIEWER_TOKEN_KEYS: map[string][]byte{
-			"1": testViewerKey,
+		STREAM_VIEWER_TOKEN_KEYS: map[string]config.ViewerKeys{
+			"1": testViewerKeys(t, "1"),
 		},
 	}
 	router := Stream(l, env, store, nil, tracker)
 	return router, store, tracker
 }
 
-// testBothRoutersWithViewerKey creates stream and API routers sharing a store,
-// with a viewer-token signing key configured for stream 1.
+// testBothRoutersWithViewerKey creates stream and API routers sharing a
+// store, with pre-derived viewer-token signing keys configured for stream 1.
 func testBothRoutersWithViewerKey(t *testing.T, clk clock.Clock) (streamRouter http.Handler, apiRouter http.Handler, store *stream.Store, tracker *watcher.Tracker) {
 	t.Helper()
 	store = stream.NewStore(clk)
@@ -108,8 +124,8 @@ func testBothRoutersWithViewerKey(t *testing.T, clk clock.Clock) (streamRouter h
 		STREAM_TOKENS: map[string]config.TokenDigest{
 			"1": sha256.Sum256([]byte("Bearer test-token")),
 		},
-		STREAM_VIEWER_TOKEN_KEYS: map[string][]byte{
-			"1": testViewerKey,
+		STREAM_VIEWER_TOKEN_KEYS: map[string]config.ViewerKeys{
+			"1": testViewerKeys(t, "1"),
 		},
 	}
 	streamRouter = Stream(l, env, store, nil, tracker)
@@ -127,19 +143,14 @@ func testBothRoutersWithMutableViewerKey(t *testing.T, clk clock.Clock) (streamR
 	store = stream.NewStore(clk)
 	tracker := watcher.NewTracker(clk)
 	l := slog.Default()
-	// Copy the baseline testViewerKey into the map so tests that mutate
-	// the entry don't leak across into other tests sharing the package
-	// global.
-	keyCopy := make([]byte, len(testViewerKey))
-	copy(keyCopy, testViewerKey)
 	env = config.Env{
 		STREAM_MAX_BUFFER_BYTES: config.DefaultStreamMaxBufferBytes,
 		BUFFER_WORKING_SPACE:    config.DefaultBufferWorkingSpace,
 		STREAM_TOKENS: map[string]config.TokenDigest{
 			"1": sha256.Sum256([]byte("Bearer test-token")),
 		},
-		STREAM_VIEWER_TOKEN_KEYS: map[string][]byte{
-			"1": keyCopy,
+		STREAM_VIEWER_TOKEN_KEYS: map[string]config.ViewerKeys{
+			"1": testViewerKeys(t, "1"),
 		},
 	}
 	streamRouter = Stream(l, env, store, nil, tracker)
