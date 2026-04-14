@@ -91,14 +91,30 @@ func TestE2E_ViewerToken_FullFlow(t *testing.T) {
 	assert.Contains(t, mediaBody, "segment_0.m4s?vt=")
 
 	// All embedded tokens on this playlist must be identical (single mint
-	// per render) and must verify against the viewer-token key.
+	// per render) and must verify against the viewer-token key. The
+	// renderer bakes TypeSegment tokens so they cannot be replayed on
+	// playlist routes to rotate into a fresh token.
 	playlistVT := matches[0][1]
 	for _, m := range matches {
 		assert.Equal(t, playlistVT, m[1],
 			"all URIs in a single playlist must share the same playlist-scoped token")
 	}
-	assert.NoError(t, viewer.Verify(testViewerKey, clk.Now(), playlistVT),
-		"baked playlist token must verify against the stream's viewer key")
+	typ, verr := viewer.Verify(testViewerKey, clk.Now(), playlistVT)
+	assert.NoError(t, verr, "baked playlist token must verify against the stream's viewer key")
+	assert.Equal(t, viewer.TypeSegment, typ,
+		"baked playlist token must be TypeSegment (playlist-scoped)")
+
+	// The baked TypeSegment token must be REFUSED on playlist routes.
+	// This is the central defense against the infinite-rotation attack:
+	// a scraper who pulls media.m3u8 once and harvests the baked token
+	// must not be able to refetch media.m3u8 with it.
+	for _, p := range []string{"/stream/1/media.m3u8", "/stream/1/stream.m3u8"} {
+		req = httptest.NewRequest(http.MethodGet, p+"?vt="+playlistVT, nil)
+		rec = httptest.NewRecorder()
+		streamRouter.ServeHTTP(rec, req)
+		assert.Equal(t, http.StatusUnauthorized, rec.Code,
+			"baked TypeSegment token must be refused on %s", p)
+	}
 
 	// 7. GET init.mp4 with the playlist-scoped vt → 200.
 	req = httptest.NewRequest(http.MethodGet, "/stream/1/init.mp4?vt="+playlistVT, nil)

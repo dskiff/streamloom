@@ -62,7 +62,11 @@ const viewerTokenMsPerMinute = 60_000
 func makePlaylistTokenMinter(key []byte, clk clock.Clock, logger *slog.Logger, streamID string) func() string {
 	return func() string {
 		expMs := clk.Now().Add(PlaylistTokenTTL).UnixMilli()
-		tok, err := viewer.Mint(key, expMs)
+		// Playlist-baked tokens are minted as TypeSegment so the stream
+		// middleware will refuse them on playlist routes. Without this
+		// scoping a holder could refetch the media playlist to rotate
+		// into a freshly-baked token indefinitely, defeating the TTL.
+		tok, err := viewer.Mint(key, expMs, viewer.TypeSegment)
 		if err != nil {
 			logger.Error("failed to mint playlist viewer token",
 				"streamID", streamID,
@@ -337,7 +341,9 @@ func API(logger *slog.Logger, env config.Env, store *stream.Store, requestLogger
 				return
 			}
 
-			token, err := viewer.Mint(key, alignedExpMs)
+			// The operator-facing endpoint mints TypeViewer tokens; these
+			// are accepted on every stream route, including playlists.
+			token, err := viewer.Mint(key, alignedExpMs, viewer.TypeViewer)
 			if err != nil {
 				logger.Error("failed to mint viewer token", "error", err, "streamID", streamID)
 				w.WriteHeader(http.StatusInternalServerError)

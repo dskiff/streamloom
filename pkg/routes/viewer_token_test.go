@@ -53,9 +53,11 @@ func TestViewerToken_Success(t *testing.T) {
 	assert.LessOrEqual(t, resp.ExpiresAtMs, exp,
 		"echoed expiry must never exceed the requested value")
 
-	// The minted token must verify against the same key.
-	err := viewer.Verify(testViewerKey, clk.Now(), resp.Token)
+	// The minted token must verify against the same key and be typed as
+	// TypeViewer (the operator-grant class accepted on all stream routes).
+	typ, err := viewer.Verify(testViewerKey, clk.Now(), resp.Token)
 	assert.NoError(t, err)
+	assert.Equal(t, viewer.TypeViewer, typ)
 }
 
 func TestViewerToken_NoKeyConfigured(t *testing.T) {
