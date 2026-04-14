@@ -107,13 +107,15 @@ const EncodedTokenLen = 28
 // package-private because the minute unit does not leak beyond serde.
 const msPerMinute = 60_000
 
-// tokenEncoding is the base64 encoding used for tokens: URL-safe alphabet,
-// no padding, and strict decoding. Strict mode rejects non-canonical
-// encodings whose unused trailing bits are non-zero. Without strict mode,
-// a single 21-byte payload would have multiple valid base64url encodings —
-// a canonicalization gap with no practical security impact but a source of
-// confusion for logging, caching, or deduplication layers that treat the
-// string form as the identifier.
+// tokenEncoding is the base64 encoding used for tokens: URL-safe
+// alphabet, no padding, and strict decoding. At the current TokenBytes
+// (21) the encoding is a 1:1 mapping — 21 bytes × 8 bits = 168 bits =
+// 28 chars × 6 bits, so there are no unused trailing bits and every
+// 21-byte payload has exactly one valid base64url string form. Strict
+// mode is therefore a no-op today and is retained only as a
+// future-proof guard: if TokenBytes ever becomes a non-multiple of 3,
+// non-canonical encodings (unused-bit variants) would otherwise slip
+// through silently.
 var tokenEncoding = base64.RawURLEncoding.Strict()
 
 // Sentinel errors returned by Verify / Mint / DeriveKey. HTTP handlers

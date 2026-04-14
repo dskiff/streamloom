@@ -290,16 +290,17 @@ func TestVerifyMalformedBase64(t *testing.T) {
 	assert.ErrorIs(t, err, ErrMalformed)
 }
 
-// TestVerifyRejectsNonCanonicalEncoding asserts that Strict base64 decoding
-// refuses encodings whose unused trailing bits are non-zero. A 21-byte
-// payload encodes to 28 base64url chars: 27 full 6-bit groups plus one
-// char that carries only 4 used bits. The remaining 2 bits must be zero in
-// a canonical encoding; this test mutates them and asserts rejection.
-//
-// Without strict decoding, each valid payload would have multiple distinct
-// string representations — a hygiene gap that would silently break any
-// layer keying off the token string.
-func TestVerifyRejectsNonCanonicalEncoding(t *testing.T) {
+// TestVerifyRejectsFinalCharMutation asserts that any mutation of the
+// token's final base64url character is rejected. At TokenBytes=21 the
+// encoding is a 1:1 mapping (168 payload bits = 28 chars × 6 bits, no
+// unused trailing bits), so every distinct final-char value decodes to a
+// distinct payload — which then fails the MAC check. This test doubles
+// as a regression guard: if TokenBytes ever becomes a non-multiple of 3,
+// some final-char variants would decode to the same bytes with differing
+// unused bits, and Strict() base64 decoding would reject them as
+// ErrMalformed. Either outcome (ErrBadMAC today, ErrMalformed under a
+// future payload size) is a valid rejection.
+func TestVerifyRejectsFinalCharMutation(t *testing.T) {
 	key := testKey(t)
 	now := time.UnixMilli(1_700_000_000_000)
 	tok, err := Mint(key, now.Add(time.Hour).UnixMilli())
@@ -330,17 +331,6 @@ func TestVerifyRejectsNonCanonicalEncoding(t *testing.T) {
 
 	last := tok[EncodedTokenLen-1]
 	origIdx := alphaIdx(last)
-	// A 21-byte payload uses 28 base64url chars = 168 bits, of which 21*8 = 168
-	// are data. Wait: 28 chars * 6 bits = 168 bits = 21 bytes exactly. So
-	// actually the encoding has NO unused bits? Let me recompute: ceil(21*4/3) =
-	// ceil(28) = 28, and 21*8 = 168 = 28*6, so yes 28 chars encode exactly
-	// 21 bytes with no padding/unused bits. Strict mode is a no-op here but
-	// we still exercise it as a regression guard in case constants shift.
-	//
-	// If there are no unused bits, every character mutation changes the
-	// decoded payload, which then fails MAC rather than strict-base64.
-	// The canonical-encoding test therefore degrades to a MAC-tamper test
-	// at this payload size; we still assert rejection-as-malformed-or-bad-MAC.
 	variants := 0
 	for flip := 1; flip < 64; flip++ {
 		idx := origIdx ^ flip
@@ -352,9 +342,6 @@ func TestVerifyRejectsNonCanonicalEncoding(t *testing.T) {
 			continue
 		}
 		verr := Verify(key, now, bad)
-		// Either ErrMalformed (non-canonical encoding caught by Strict,
-		// if any reside at this payload size) or ErrBadMAC (mutation
-		// changed the decoded bytes). Both are valid rejections.
 		assert.Truef(t,
 			errors.Is(verr, ErrMalformed) || errors.Is(verr, ErrBadMAC),
 			"mutated final char (flip=%d) must be rejected; got %v", flip, verr)

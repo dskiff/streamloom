@@ -318,11 +318,22 @@ func parseStreamTokens() (map[string]TokenDigest, error) {
 // SL_STREAM_<id>_VIEWER_TOKEN_KEY variables, validates that <id> is a
 // valid stream ID and the raw key is long enough, DERIVES both the
 // playlist-class and segment-class signing keys via viewer.DeriveKey, and
-// stores only the derived keys. The raw env secret is cleared from memory
-// as soon as derivation is done and the env var is unset. These derived
-// keys are used to sign and verify stateless viewer tokens for HLS
-// playback; binding the streamID and type into the KDF means a token
-// minted for one (stream, type) pair cannot verify under any other.
+// stores only the derived keys. These derived keys are used to sign and
+// verify stateless viewer tokens for HLS playback; binding the streamID
+// and type into the KDF means a token minted for one (stream, type) pair
+// cannot verify under any other.
+//
+// Secret-hygiene caveats (best-effort, given Go's memory model):
+//   - The env-var value is unset via os.Unsetenv so /proc/self/environ
+//     and child-process inheritance no longer expose it.
+//   - The byte-slice copy this function allocates for DeriveKey input
+//     is explicitly zeroed before it becomes GC-eligible, closing the
+//     one copy we control.
+//   - The string form of the secret returned by os.Environ is immutable
+//     in Go and cannot be zeroed in place; it simply becomes unreachable
+//     when this function returns and is freed by the garbage collector
+//     on some later cycle. A core dump captured between parse and the
+//     next GC may therefore still contain the raw secret.
 func parseStreamViewerTokenKeys() (map[string]ViewerKeys, error) {
 	keys := make(map[string]ViewerKeys)
 
@@ -357,15 +368,20 @@ func parseStreamViewerTokenKeys() (map[string]ViewerKeys, error) {
 			return nil, fmt.Errorf("viewer token key for env var %s is too short (%d chars); minimum is %d", key, len(value), MinTokenLength)
 		}
 
-		// Derive both class keys immediately so the raw secret never
-		// leaves this function. DeriveKey copies its input into an
-		// HMAC state, so no aliasing concern with os.Environ storage.
+		// Derive both class keys and zero the byte-slice copy of the
+		// secret before it becomes GC-eligible. DeriveKey has already
+		// fed the bytes into HMAC and does not retain a reference to
+		// rawKey, so zeroing here is safe. Note that the immutable
+		// string form in `value` remains in memory until GC (see the
+		// doc comment's secret-hygiene caveats).
 		rawKey := []byte(value)
 		playlistKey, err := viewer.DeriveKey(rawKey, streamIDStr, viewer.TypePlaylist)
 		if err != nil {
+			zero(rawKey)
 			return nil, fmt.Errorf("deriving playlist key for env var %s: %w", key, err)
 		}
 		segmentKey, err := viewer.DeriveKey(rawKey, streamIDStr, viewer.TypeSegment)
+		zero(rawKey)
 		if err != nil {
 			return nil, fmt.Errorf("deriving segment key for env var %s: %w", key, err)
 		}
@@ -396,6 +412,18 @@ func parsePort(envVar string, defaultPort int) (int, error) {
 		return 0, fmt.Errorf("%s must be between 1 and 65535, got %d", envVar, v)
 	}
 	return v, nil
+}
+
+// zero overwrites every byte of b with 0x00. Used to scrub locally-
+// allocated secret buffers before they become GC-eligible. Go does not
+// guarantee the write isn't elided, but in practice the compiler does
+// not remove writes to a slice whose backing array escapes the function
+// (as rawKey's does through DeriveKey's HMAC state during the call) —
+// so this is meaningful defense in depth, not cryptographic assurance.
+func zero(b []byte) {
+	for i := range b {
+		b[i] = 0
+	}
 }
 
 func trueish(s string) bool {
