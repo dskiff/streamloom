@@ -345,6 +345,18 @@ func API(logger *slog.Logger, env config.Env, store *stream.Store, requestLogger
 			// are accepted on every stream route, including playlists.
 			token, err := viewer.Mint(key, alignedExpMs, viewer.TypeViewer)
 			if err != nil {
+				// ErrMalformed here is client-triggerable (e.g. an
+				// expires_at_ms so large its minute value overflows
+				// uint32), so surface it as 400 rather than 500.
+				// Anything else is a server-side failure.
+				if errors.Is(err, viewer.ErrMalformed) {
+					logger.Warn("viewer token exp out of encodable range",
+						"streamID", streamID,
+						"aligned_expires_at_ms", alignedExpMs,
+						"error", err)
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
 				logger.Error("failed to mint viewer token", "error", err, "streamID", streamID)
 				w.WriteHeader(http.StatusInternalServerError)
 				return

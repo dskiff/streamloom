@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -199,4 +200,22 @@ func TestViewerToken_TrailingWhitespace(t *testing.T) {
 	body := []byte(fmt.Sprintf("{\"expires_at_ms\": %d}\n\t  \n", exp))
 	rec := postViewerToken(router, "1", "test-token", body)
 	assert.Equal(t, http.StatusCreated, rec.Code)
+}
+
+// TestViewerToken_ExpiryOverflowsUint32Minutes asserts that a client-supplied
+// expiration so large that its minute value overflows uint32 (the encoded
+// field's size) is rejected with 400 rather than 500. This exp passes the
+// min-TTL check, reaches viewer.Mint, and returns viewer.ErrMalformed —
+// without explicit mapping the handler would surface it as an internal error,
+// making a client-triggerable condition look like a server failure.
+func TestViewerToken_ExpiryOverflowsUint32Minutes(t *testing.T) {
+	clk := clock.NewMock(time.UnixMilli(1_700_000_000_000))
+	router, _, _, _ := testAPIRouterWithViewerKey(t, clk)
+
+	// One minute past the uint32 range, in ms.
+	const msPerMin = int64(60_000)
+	exp := (int64(math.MaxUint32) + 1) * msPerMin
+	body, _ := json.Marshal(map[string]any{"expires_at_ms": exp})
+	rec := postViewerToken(router, "1", "test-token", body)
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
 }
