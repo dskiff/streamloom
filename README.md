@@ -78,6 +78,7 @@ in front of streamloom (e.g. nginx, caddy, or the WAF of your choice). TLS termi
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `SL_STREAM_<id>_TOKEN` | Yes (at least one) | Per-stream bearer token for authenticating push API requests. `<id>` is an alphanumeric stream ID (max 512 characters). |
+| `SL_STREAM_<id>_VIEWER_TOKEN_KEY` | No | Per-stream signing key (minimum 32 chars) that enables per-viewer token auth on stream playback. When set, stream routes require `?vt=<token>` and viewers mint short-lived tokens via `POST /api/v1/stream/{id}/viewer_token`. When unset, playback is fully public (default). Rotating this value immediately invalidates all outstanding viewer tokens for that stream. |
 | `SL_STREAM_PORT` | No | Port for the public HLS stream server (default: 8080) |
 | `SL_API_PORT` | No | Port for the API server (default: 8081) |
 | `SL_BIND_ADDR` | No | IP address to bind both servers to. Defaults to `127.0.0.1` in dev, `0.0.0.0` (all interfaces) in production. Override to restrict binding in non-container deployments. |
@@ -119,3 +120,50 @@ Upload a video segment. Requires the following headers:
 | `X-SL-DURATION` | Integer (milliseconds, >0) | Segment duration in milliseconds |
 
 The request body should contain the raw segment data.
+
+### `POST /api/v1/stream/{streamID}/viewer_token`
+
+Mint a short-lived, stateless viewer token for stream playback. Requires the push bearer token (`Authorization: Bearer <SL_STREAM_<id>_TOKEN>`). Requires that `SL_STREAM_<id>_VIEWER_TOKEN_KEY` is configured for the stream; otherwise the endpoint returns `409 Conflict`.
+
+Request body (JSON):
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `expires_at_ms` | int64 | Token expiration as unix milliseconds. The server floors this value to the nearest minute boundary before encoding. The aligned value must be at least 5 minutes past the server's current time; requests below that floor are rejected with `400 Bad Request`. |
+
+Response `201 Created`:
+
+```json
+{
+  "token": "<30-char base64url>",
+  "expires_at_ms": 1700000000000
+}
+```
+
+The `expires_at_ms` in the response echoes the **aligned** value actually encoded in the token, which may be up to 59,999 ms less than the requested value. Clients should treat this as the authoritative expiry.
+
+The returned token must be passed as `?vt=<token>` on every stream URL (`stream.m3u8`, `media.m3u8`, `init.mp4`, `segment_*.m4s`). Tokens are verified statelessly: the server holds no per-token state. Rotating `SL_STREAM_<id>_VIEWER_TOKEN_KEY` immediately invalidates all outstanding tokens for that stream.
+
+**Two-token model with route scoping.** To keep the cached media playlist per-stream (not per-viewer) and to bound the replay window of URLs scraped from a playlist body, streamloom uses two token types keyed by the same `SL_STREAM_<id>_VIEWER_TOKEN_KEY`:
+
+- The **viewer token** (`TypeViewer`, minted via `POST /viewer_token`) is what you hand to a viewer. Its lifetime is caller-specified (minimum 5 minutes). It is accepted on **all** stream routes — playlists, init, and segments.
+- A **short-lived playlist token** (`TypeSegment`) is minted by the server once per media-playlist render (TTL ~10 minutes) and baked directly into every `init.mp4` / `segment_*.m4s` URI inside `media.m3u8`. It is accepted **only** on init/segment routes — never on playlists. HLS players simply follow the baked URIs; no client-side logic is required.
+
+The asymmetric scoping is deliberate: without it, a client holding a baked `TypeSegment` token could refetch `media.m3u8` to harvest a freshly-minted token and repeat the cycle indefinitely, making the 10-minute TTL meaningless. By refusing `TypeSegment` on playlist routes, only the viewer's original `TypeViewer` token can refresh the playlist, and that token's lifetime is the hard upper bound on how long scraped URLs remain useful. The token type is covered by the MAC, so a `TypeSegment` token cannot be re-typed to `TypeViewer` without the signing key.
+
+**Stale-playlist edge case.** The cached media playlist is re-rendered (and its baked `TypeSegment` token refreshed) on every segment commit. If a stream stops producing segments for longer than the 10-minute playlist-token TTL, the cached playlist will still serve with `200 OK` but its embedded `?vt=` tokens will be expired — so `init.mp4` and `segment_*.m4s` fetches derived from it will receive `401 Unauthorized` until the next segment commit triggers a fresh render. For live streams this is a non-issue (each commit refreshes the token well within the TTL); for streams that legitimately pause production for >10 minutes, viewers will need to refetch `media.m3u8` using their own `TypeViewer` token to pick up a new render. Viewers using their own long-lived `TypeViewer` token directly on init/segment URIs are unaffected.
+
+Example:
+
+```bash
+# Mint a token valid for one hour
+curl -X POST http://localhost:8081/api/v1/stream/1/viewer_token \
+  -H "Authorization: Bearer my_very_long_secret_token_here_1234" \
+  -H "Content-Type: application/json" \
+  -d '{"expires_at_ms": '"$(( $(date +%s%3N) + 3600000 ))"'}'
+
+# Play with the minted token (replace <vt> with the returned token)
+http://localhost:8080/stream/1/stream.m3u8?vt=<vt>
+```
+
+When `SL_STREAM_<id>_VIEWER_TOKEN_KEY` is configured, the server automatically rewrites playlist URIs so that `?vt=<token>` propagates from `stream.m3u8` (using the viewer's own `TypeViewer` token) to `media.m3u8` and from `media.m3u8` (using the server-minted short-lived `TypeSegment` token) to every init / segment URI. HLS players do not carry parent query strings across relative URIs, so this rewrite is required for standard-compliant playback.

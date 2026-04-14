@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 
@@ -13,6 +14,7 @@ import (
 	mw "github.com/dskiff/streamloom/pkg/middleware"
 	"github.com/dskiff/streamloom/pkg/pool"
 	"github.com/dskiff/streamloom/pkg/stream"
+	"github.com/dskiff/streamloom/pkg/viewer"
 	"github.com/dskiff/streamloom/pkg/watcher"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -58,150 +60,198 @@ func Stream(logger *slog.Logger, env config.Env, store *stream.Store, requestLog
 	})
 
 	router.Route("/stream/{streamID}", func(r chi.Router) {
-		r.Use(mw.RecordWatcher(tracker))
+		// Playlist routes accept only TypeViewer tokens. Playlist-scoped
+		// (TypeSegment) tokens are deliberately refused here so a holder of
+		// a baked segment token cannot refetch the media playlist to rotate
+		// into a fresh token and defeat the TTL.
+		//
+		// ViewerTokenAuth runs BEFORE RecordWatcher so that 401 responses
+		// do not inflate the active-viewer count.
+		r.Group(func(r chi.Router) {
+			r.Use(mw.ViewerTokenAuth(store.Clock(), env.STREAM_VIEWER_TOKEN_KEYS, logger, viewer.TypeViewer))
+			r.Use(mw.RecordWatcher(tracker))
 
-		r.Get("/media.m3u8", func(w http.ResponseWriter, r *http.Request) {
-			streamID := chi.URLParam(r, "streamID")
-			logger.Debug("handling media request", "streamID", streamID)
-
-			s, status := getStream(store, streamID)
-			if s == nil {
-				if status == http.StatusServiceUnavailable {
-					writeStreamUnavailable(w)
-				} else {
-					w.WriteHeader(status)
-				}
-				return
-			}
-
-			// Block until a valid playlist is available, the stream is
-			// deleted, or the request is cancelled.
-			select {
-			case <-s.HasPlaylist():
-			case <-s.Done():
-				writeStreamUnavailable(w)
-				return
-			case <-r.Context().Done():
-				writeStreamUnavailable(w)
-				return
-			}
-
-			playlist := s.CachedPlaylist()
-			if playlist == "" {
-				// All segments were evicted between the HasPlaylist gate
-				// and now.  Tell the player to retry rather than serving
-				// an empty body.
-				writeStreamUnavailable(w)
-				return
-			}
-			w.Header().Set("Content-Type", config.M3U8_MIME_TYPE)
-			w.Header().Set("Cache-Control", "no-cache")
-			w.Header().Set("Content-Length", strconv.Itoa(len(playlist)))
-			if _, err := io.WriteString(w, playlist); err != nil { // #nosec G705 -- playlist contains only numeric data from internal state, not user input
-				logger.Error("failed to write response", "error", err)
-			}
+			r.Get("/media.m3u8", mediaPlaylistHandler(logger, store))
+			r.Get("/stream.m3u8", masterPlaylistHandler(logger, store))
 		})
 
-		r.Get("/stream.m3u8", func(w http.ResponseWriter, r *http.Request) {
-			streamID := chi.URLParam(r, "streamID")
-			logger.Debug("handling stream request", "streamID", streamID)
+		// Init and segment routes accept both TypeViewer (direct operator
+		// grant) and TypeSegment (short-lived, baked into playlist URIs).
+		r.Group(func(r chi.Router) {
+			r.Use(mw.ViewerTokenAuth(store.Clock(), env.STREAM_VIEWER_TOKEN_KEYS, logger, viewer.TypeViewer, viewer.TypeSegment))
+			r.Use(mw.RecordWatcher(tracker))
 
-			s, status := getStream(store, streamID)
-			if s == nil {
-				if status == http.StatusServiceUnavailable {
-					writeStreamUnavailable(w)
-				} else {
-					w.WriteHeader(status)
-				}
-				return
-			}
-
-			meta := s.Metadata()
-
-			builder := strings.Builder{}
-			builder.WriteString("#EXTM3U\n")
-			builder.WriteString("#EXT-X-VERSION:7\n")
-			builder.WriteString("#EXT-X-INDEPENDENT-SEGMENTS\n")
-			builder.WriteString(
-				fmt.Sprintf("#EXT-X-STREAM-INF:BANDWIDTH=%d,RESOLUTION=%dx%d,CODECS=\"%s\",FRAME-RATE=%.3f\n", meta.Bandwidth, meta.Width, meta.Height, meta.Codecs, meta.FrameRate),
-			)
-			builder.WriteString("media.m3u8\n")
-
-			w.Header().Set("Content-Type", config.M3U8_MIME_TYPE)
-			w.Header().Set("Cache-Control", "no-cache")
-			body := builder.String()
-			w.Header().Set("Content-Length", strconv.Itoa(len(body)))
-			if _, err := io.WriteString(w, body); err != nil {
-				logger.Error("failed to write response", "error", err)
-			}
-		})
-
-		r.Get("/init.mp4", func(w http.ResponseWriter, r *http.Request) {
-			streamID := chi.URLParam(r, "streamID")
-			logger.Debug("handling init segment request", "streamID", streamID)
-
-			s, status := getStream(store, streamID)
-			if s == nil {
-				if status == http.StatusServiceUnavailable {
-					writeStreamUnavailable(w)
-				} else {
-					w.WriteHeader(status)
-				}
-				return
-			}
-
-			initData, ok := s.GetInit()
-			if !ok {
-				w.WriteHeader(http.StatusNotFound)
-				return
-			}
-
-			w.Header().Set("Content-Type", config.MP4_MIME_TYPE)
-			w.Header().Set("Cache-Control", "no-cache")
-			w.Header().Set("Content-Length", strconv.Itoa(len(initData)))
-			if _, err := w.Write(initData); err != nil {
-				logger.Error("failed to write response", "error", err)
-			}
-		})
-
-		r.Get("/segment_{segmentID}.m4s", func(w http.ResponseWriter, r *http.Request) {
-			streamID := chi.URLParam(r, "streamID")
-			segmentIDStr := chi.URLParam(r, "segmentID")
-			logger.Debug("handling segment request", "streamID", streamID, "segmentID", segmentIDStr)
-
-			s, status := getStream(store, streamID)
-			if s == nil {
-				if status == http.StatusServiceUnavailable {
-					writeStreamUnavailable(w)
-				} else {
-					w.WriteHeader(status)
-				}
-				return
-			}
-
-			segmentID, err := strconv.ParseUint(segmentIDStr, 10, 32)
-			if err != nil {
-				logger.Warn("invalid segmentID", "value", segmentIDStr, "error", err)
-				w.WriteHeader(http.StatusBadRequest)
-				return
-			}
-
-			err = s.RunWithSegmentSlot(uint32(segmentID), func(slot *pool.BufferSlot) error {
-				w.Header().Set("Content-Type", config.MP4_MIME_TYPE)
-				w.Header().Set("Content-Length", strconv.Itoa(slot.Len()))
-				w.Header().Set("Cache-Control", "no-cache")
-				_, err := slot.WriteTo(w)
-				return err
-			})
-			if err != nil {
-				if errors.Is(err, stream.ErrSegmentNotFound) {
-					w.WriteHeader(http.StatusNotFound)
-					return
-				}
-				logger.Error("failed to write response", "error", err)
-			}
+			r.Get("/init.mp4", initHandler(logger, store))
+			r.Get("/segment_{segmentID}.m4s", segmentHandler(logger, store))
 		})
 	})
 
 	return router
+}
+
+// mediaPlaylistHandler returns the handler for GET /stream/{streamID}/media.m3u8.
+func mediaPlaylistHandler(logger *slog.Logger, store *stream.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		streamID := chi.URLParam(r, "streamID")
+		logger.Debug("handling media request", "streamID", streamID)
+
+		s, status := getStream(store, streamID)
+		if s == nil {
+			if status == http.StatusServiceUnavailable {
+				writeStreamUnavailable(w)
+			} else {
+				w.WriteHeader(status)
+			}
+			return
+		}
+
+		// Block until a valid playlist is available, the stream is
+		// deleted, or the request is cancelled.
+		select {
+		case <-s.HasPlaylist():
+		case <-s.Done():
+			writeStreamUnavailable(w)
+			return
+		case <-r.Context().Done():
+			writeStreamUnavailable(w)
+			return
+		}
+
+		playlist := s.CachedPlaylist()
+		if playlist == "" {
+			// All segments were evicted between the HasPlaylist gate
+			// and now.  Tell the player to retry rather than serving
+			// an empty body.
+			writeStreamUnavailable(w)
+			return
+		}
+		// The playlist is served verbatim. The renderer has already
+		// baked a short-lived, playlist-scoped viewer token into every
+		// emitted URI (or left URIs unadorned when no key is configured
+		// for the stream), so no per-request substitution is needed.
+		w.Header().Set("Content-Type", config.M3U8_MIME_TYPE)
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Content-Length", strconv.Itoa(len(playlist)))
+		if _, err := io.WriteString(w, playlist); err != nil { // #nosec G705 -- playlist contains only numeric data from internal state, not user input
+			logger.Error("failed to write response", "error", err)
+		}
+	}
+}
+
+// masterPlaylistHandler returns the handler for GET /stream/{streamID}/stream.m3u8.
+func masterPlaylistHandler(logger *slog.Logger, store *stream.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		streamID := chi.URLParam(r, "streamID")
+		logger.Debug("handling stream request", "streamID", streamID)
+
+		s, status := getStream(store, streamID)
+		if s == nil {
+			if status == http.StatusServiceUnavailable {
+				writeStreamUnavailable(w)
+			} else {
+				w.WriteHeader(status)
+			}
+			return
+		}
+
+		meta := s.Metadata()
+
+		// Propagate ?vt= from the incoming request into the media
+		// playlist URI. HLS players do not carry a parent query string
+		// over to relative URIs, so each emitted URI needs its own copy.
+		mediaURI := "media.m3u8"
+		if vt := r.URL.Query().Get("vt"); vt != "" {
+			mediaURI += "?vt=" + url.QueryEscape(vt)
+		}
+
+		builder := strings.Builder{}
+		builder.WriteString("#EXTM3U\n")
+		builder.WriteString("#EXT-X-VERSION:7\n")
+		builder.WriteString("#EXT-X-INDEPENDENT-SEGMENTS\n")
+		builder.WriteString(
+			fmt.Sprintf("#EXT-X-STREAM-INF:BANDWIDTH=%d,RESOLUTION=%dx%d,CODECS=\"%s\",FRAME-RATE=%.3f\n", meta.Bandwidth, meta.Width, meta.Height, meta.Codecs, meta.FrameRate),
+		)
+		builder.WriteString(mediaURI)
+		builder.WriteByte('\n')
+
+		w.Header().Set("Content-Type", config.M3U8_MIME_TYPE)
+		w.Header().Set("Cache-Control", "no-cache")
+		body := builder.String()
+		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+		if _, err := io.WriteString(w, body); err != nil {
+			logger.Error("failed to write response", "error", err)
+		}
+	}
+}
+
+// initHandler returns the handler for GET /stream/{streamID}/init.mp4.
+func initHandler(logger *slog.Logger, store *stream.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		streamID := chi.URLParam(r, "streamID")
+		logger.Debug("handling init segment request", "streamID", streamID)
+
+		s, status := getStream(store, streamID)
+		if s == nil {
+			if status == http.StatusServiceUnavailable {
+				writeStreamUnavailable(w)
+			} else {
+				w.WriteHeader(status)
+			}
+			return
+		}
+
+		initData, ok := s.GetInit()
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+
+		w.Header().Set("Content-Type", config.MP4_MIME_TYPE)
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Content-Length", strconv.Itoa(len(initData)))
+		if _, err := w.Write(initData); err != nil {
+			logger.Error("failed to write response", "error", err)
+		}
+	}
+}
+
+// segmentHandler returns the handler for GET /stream/{streamID}/segment_{segmentID}.m4s.
+func segmentHandler(logger *slog.Logger, store *stream.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		streamID := chi.URLParam(r, "streamID")
+		segmentIDStr := chi.URLParam(r, "segmentID")
+		logger.Debug("handling segment request", "streamID", streamID, "segmentID", segmentIDStr)
+
+		s, status := getStream(store, streamID)
+		if s == nil {
+			if status == http.StatusServiceUnavailable {
+				writeStreamUnavailable(w)
+			} else {
+				w.WriteHeader(status)
+			}
+			return
+		}
+
+		segmentID, err := strconv.ParseUint(segmentIDStr, 10, 32)
+		if err != nil {
+			logger.Warn("invalid segmentID", "value", segmentIDStr, "error", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+
+		err = s.RunWithSegmentSlot(uint32(segmentID), func(slot *pool.BufferSlot) error {
+			w.Header().Set("Content-Type", config.MP4_MIME_TYPE)
+			w.Header().Set("Content-Length", strconv.Itoa(slot.Len()))
+			w.Header().Set("Cache-Control", "no-cache")
+			_, err := slot.WriteTo(w)
+			return err
+		})
+		if err != nil {
+			if errors.Is(err, stream.ErrSegmentNotFound) {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			logger.Error("failed to write response", "error", err)
+		}
+	}
 }

@@ -60,6 +60,7 @@ func TestRenderMediaPlaylist_BasicWindow(t *testing.T) {
 	assert.Contains(t, playlist, "#EXT-X-VERSION:7")
 	assert.Contains(t, playlist, "#EXT-X-TARGETDURATION:2")
 	assert.Contains(t, playlist, "#EXT-X-MEDIA-SEQUENCE:0")
+	// No mintToken configured: init URI is emitted without a ?vt= query.
 	assert.Contains(t, playlist, "#EXT-X-MAP:URI=\"init.mp4\"")
 
 	// All 5 segments should be present.
@@ -237,6 +238,7 @@ func TestRenderMediaPlaylist_SingleGeneration_NoDiscontinuity(t *testing.T) {
 	assert.NotContains(t, playlist, "#EXT-X-DISCONTINUITY")
 	// Should have exactly one EXT-X-MAP.
 	assert.Equal(t, 1, strings.Count(playlist, "#EXT-X-MAP:URI="))
+	// No mintToken configured: init URI is emitted without a ?vt= query.
 	assert.Contains(t, playlist, "#EXT-X-MAP:URI=\"init.mp4\"")
 	// No DISCONTINUITY-SEQUENCE header.
 	assert.NotContains(t, playlist, "#EXT-X-DISCONTINUITY-SEQUENCE")

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -14,14 +15,68 @@ import (
 	"strings"
 	"time"
 
+	"github.com/dskiff/streamloom/pkg/clock"
 	"github.com/dskiff/streamloom/pkg/config"
 	mw "github.com/dskiff/streamloom/pkg/middleware"
 	"github.com/dskiff/streamloom/pkg/pool"
 	"github.com/dskiff/streamloom/pkg/stream"
+	"github.com/dskiff/streamloom/pkg/viewer"
 	"github.com/dskiff/streamloom/pkg/watcher"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 )
+
+// MaxViewerTokenRequestBytes is the hard upper bound on a viewer-token mint
+// request body. The body is a tiny JSON object; 1 KiB is generous.
+const MaxViewerTokenRequestBytes = 1 << 10
+
+// MinViewerTokenTTLMs is the minimum viewer-token lifetime (measured from
+// mint time to the minute-aligned expiry). Sub-5-minute tokens are rejected
+// to make the encoding's minute precision a non-issue for callers — a
+// reasonable floor for share-link semantics and comfortably larger than a
+// typical client-clock drift budget.
+const MinViewerTokenTTLMs = 5 * 60 * 1000
+
+// PlaylistTokenTTL is the lifetime of the internal viewer token that the
+// media-playlist renderer bakes into init/segment URIs. Because the renderer
+// mints a fresh token on every re-render, this bounds how long a URL scraped
+// from a live playlist can be replayed by an unauthorized party. It also
+// caps how stale a cached playlist's embedded URIs can become; a live stream
+// re-renders on each segment commit and therefore refreshes the token well
+// within this window. Comfortably above MinViewerTokenTTLMs so the token
+// always passes the public mint-endpoint floor.
+const PlaylistTokenTTL = 10 * time.Minute
+
+// viewerTokenMsPerMinute is used to floor an expires_at_ms value to the
+// minute boundary at which tokens are encoded. Kept here to avoid leaking
+// the viewer package's private constant across the serde boundary.
+const viewerTokenMsPerMinute = 60_000
+
+// makePlaylistTokenMinter returns a closure that mints a playlist-scoped
+// viewer token valid for PlaylistTokenTTL from the current clock time. The
+// closure captures the per-stream signing key, the store clock, the logger,
+// and the streamID for diagnostics. It returns "" on failure so the renderer
+// falls back to emitting plain URIs for that render only (the middleware
+// still enforces vt on the resulting requests, so those plain URIs will 401
+// — this is the correct fail-closed behavior for a configured stream).
+func makePlaylistTokenMinter(key []byte, clk clock.Clock, logger *slog.Logger, streamID string) func() string {
+	return func() string {
+		expMs := clk.Now().Add(PlaylistTokenTTL).UnixMilli()
+		// Playlist-baked tokens are minted as TypeSegment so the stream
+		// middleware will refuse them on playlist routes. Without this
+		// scoping a holder could refetch the media playlist to rotate
+		// into a freshly-baked token indefinitely, defeating the TTL.
+		tok, err := viewer.Mint(key, expMs, viewer.TypeSegment)
+		if err != nil {
+			logger.Error("failed to mint playlist viewer token",
+				"streamID", streamID,
+				"error", err,
+			)
+			return ""
+		}
+		return tok
+	}
+}
 
 // contextKey is a private type for context keys to avoid collisions.
 type contextKey string
@@ -233,6 +288,110 @@ func API(logger *slog.Logger, env config.Env, store *stream.Store, requestLogger
 			w.WriteHeader(http.StatusNoContent)
 		})
 
+		r.Post("/viewer_token", func(w http.ResponseWriter, r *http.Request) {
+			streamID := r.Context().Value(streamIDKey).(string)
+			logger.Debug("handling viewer token mint request", "streamID", streamID)
+
+			key, ok := env.GetViewerTokenKey(streamID)
+			if !ok {
+				// No viewer-token key configured for this stream; the feature
+				// is opt-in per stream. Signal that the caller's request
+				// conflicts with the current server configuration.
+				logger.Warn("viewer token mint for unconfigured stream", "streamID", streamID)
+				w.WriteHeader(http.StatusConflict)
+				return
+			}
+
+			r.Body = http.MaxBytesReader(w, r.Body, MaxViewerTokenRequestBytes)
+			var req struct {
+				ExpiresAtMs int64 `json:"expires_at_ms"`
+			}
+			dec := json.NewDecoder(r.Body)
+			dec.DisallowUnknownFields()
+			if err := dec.Decode(&req); err != nil {
+				// Distinguish body-size overflow (413) from parse errors
+				// (400) so misbehaving clients get an accurate signal and
+				// the status matches the other authenticated endpoints.
+				var maxBytesErr *http.MaxBytesError
+				if errors.As(err, &maxBytesErr) {
+					logger.Warn("viewer token request body too large",
+						"streamID", streamID, "limit", MaxViewerTokenRequestBytes)
+					w.WriteHeader(http.StatusRequestEntityTooLarge)
+					return
+				}
+				logger.Warn("invalid viewer token request body", "error", err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			// Reject trailing data after the JSON object. Decode consumes a
+			// single value and ignores anything after it; without this
+			// check, an input like `{"expires_at_ms": N}{"extra":1}` would
+			// silently succeed.
+			if dec.More() {
+				logger.Warn("trailing data in viewer token request body", "streamID", streamID)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+
+			nowMs := store.Clock().Now().UnixMilli()
+			// Truncate the requested expiry to the minute boundary at which
+			// tokens are encoded, then enforce a minimum TTL on the encoded
+			// value. This surfaces the wire format's minute precision as an
+			// explicit contract rather than letting callers receive tokens
+			// that silently expire earlier than they expected.
+			//
+			// Go integer division truncates toward zero (not floor toward
+			// negative infinity), so negative inputs align toward zero
+			// rather than away from it. The TTL check below rejects any
+			// such value, so truncation semantics never surface to callers.
+			alignedExpMs := (req.ExpiresAtMs / viewerTokenMsPerMinute) * viewerTokenMsPerMinute
+			if alignedExpMs-nowMs < MinViewerTokenTTLMs {
+				logger.Warn("viewer token TTL below minimum",
+					"streamID", streamID,
+					"requested_expires_at_ms", req.ExpiresAtMs,
+					"aligned_expires_at_ms", alignedExpMs,
+					"now_ms", nowMs,
+					"min_ttl_ms", MinViewerTokenTTLMs)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+
+			// The operator-facing endpoint mints TypeViewer tokens; these
+			// are accepted on every stream route, including playlists.
+			token, err := viewer.Mint(key, alignedExpMs, viewer.TypeViewer)
+			if err != nil {
+				// ErrMalformed here is client-triggerable (e.g. an
+				// expires_at_ms so large its minute value overflows
+				// uint32), so surface it as 400 rather than 500.
+				// Anything else is a server-side failure.
+				if errors.Is(err, viewer.ErrMalformed) {
+					logger.Warn("viewer token exp out of encodable range",
+						"streamID", streamID,
+						"aligned_expires_at_ms", alignedExpMs,
+						"error", err)
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				logger.Error("failed to mint viewer token", "error", err, "streamID", streamID)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+
+			resp := struct {
+				Token       string `json:"token"`
+				ExpiresAtMs int64  `json:"expires_at_ms"`
+			}{
+				Token:       token,
+				ExpiresAtMs: alignedExpMs,
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Cache-Control", "no-store")
+			w.WriteHeader(http.StatusCreated)
+			if err := json.NewEncoder(w).Encode(resp); err != nil {
+				logger.Error("failed to write viewer token response", "error", err)
+			}
+		})
+
 		r.Post("/init", func(w http.ResponseWriter, r *http.Request) {
 			streamID := r.Context().Value(streamIDKey).(string)
 			logger.Debug("handling stream init request", "streamID", streamID)
@@ -313,7 +472,19 @@ func API(logger *slog.Logger, env config.Env, store *stream.Store, requestLogger
 				return
 			}
 
-			if err := store.Init(streamID, meta, initData, segmentCap, meta.SegmentByteCount, backwardBufferSize, env.BUFFER_WORKING_SPACE, config.DefaultMediaWindowSize); err != nil {
+			// When a viewer-token key is configured for this stream, wire a
+			// mint callback the renderer will use once per playlist render to
+			// bake a short-lived token into every emitted URI. Streams without
+			// a configured key receive no option and the renderer emits plain
+			// URIs (preserves public-playback parity with pre-viewer-token
+			// behavior).
+			var initOpts []stream.InitOption
+			if viewerKey, ok := env.GetViewerTokenKey(streamID); ok {
+				mintFn := makePlaylistTokenMinter(viewerKey, store.Clock(), logger, streamID)
+				initOpts = append(initOpts, stream.WithMintToken(mintFn))
+			}
+
+			if err := store.Init(streamID, meta, initData, segmentCap, meta.SegmentByteCount, backwardBufferSize, env.BUFFER_WORKING_SPACE, config.DefaultMediaWindowSize, initOpts...); err != nil {
 				if errors.Is(err, stream.ErrStreamExists) {
 					logger.Warn("stream already exists", "streamID", streamID)
 					w.WriteHeader(http.StatusConflict)

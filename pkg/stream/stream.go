@@ -106,6 +106,16 @@ type Stream struct {
 	// Set once during Init and never changed. Must not be modified.
 	initData []byte
 
+	// mintToken, when non-nil, is invoked once per media-playlist render to
+	// produce a short-lived viewer token that the renderer bakes into every
+	// emitted URI (EXT-X-MAP init URI and segment URIs). It returns "" if
+	// a token cannot be minted, in which case the renderer emits plain URIs.
+	//
+	// Set once during Init (before the renderer goroutine launches) and
+	// never mutated afterwards, so no lock is required to read it from
+	// inside the renderer.
+	mintToken func() string
+
 	segments          []Slot // sorted by Index
 	segmentCap        int    // maximum number of segments
 	currentGeneration int64  // latest generation seen; segments from older generations are dropped
@@ -458,6 +468,20 @@ var ErrInvalidWorkingSpace = errors.New("workingSpace must be >= 0 and segmentCa
 // re-initialize it.
 var ErrStreamExists = errors.New("stream already exists")
 
+// InitOption configures per-stream behavior at Init time. Options are applied
+// to the Stream before its renderer goroutine is launched, so they may safely
+// mutate fields that the renderer subsequently reads without locking.
+type InitOption func(*Stream)
+
+// WithMintToken installs a callback that the media-playlist renderer invokes
+// once per render to produce a short-lived viewer token. The token is baked
+// directly into every emitted URI (EXT-X-MAP init URI and each segment URI),
+// eliminating per-request substitution. When fn returns "", the renderer
+// emits plain URIs for that render only.
+func WithMintToken(fn func() string) InitOption {
+	return func(s *Stream) { s.mintToken = fn }
+}
+
 // Init creates a new stream with the given init segment and metadata.
 // The initData slice is cloned so that the caller cannot mutate the stored bytes.
 // initData must be non-empty (returns ErrEmptyInitData otherwise).
@@ -468,7 +492,8 @@ var ErrStreamExists = errors.New("stream already exists")
 // backwardBufferSize controls how many past segments are retained during eviction;
 // it must be >= 1 and < segmentCapacity.
 // playlistWindowSize is the maximum number of segments in the media playlist.
-func (s *Store) Init(id string, meta Metadata, initData []byte, segmentCapacity, segmentBytes, backwardBufferSize, workingSpace, playlistWindowSize int) error {
+// Optional InitOptions configure per-stream features (e.g. viewer-token minting).
+func (s *Store) Init(id string, meta Metadata, initData []byte, segmentCapacity, segmentBytes, backwardBufferSize, workingSpace, playlistWindowSize int, opts ...InitOption) error {
 	if len(initData) == 0 {
 		return ErrEmptyInitData
 	}
@@ -510,6 +535,11 @@ func (s *Store) Init(id string, meta Metadata, initData []byte, segmentCapacity,
 		stopped:            make(chan struct{}),
 		hasSegments:        make(chan struct{}),
 		hasPlaylist:        make(chan struct{}),
+	}
+	// Apply options before launching the renderer so the goroutine observes
+	// the fully-configured Stream (notably mintToken).
+	for _, opt := range opts {
+		opt(st)
 	}
 	s.streams[id] = st
 	s.mu.Unlock()
