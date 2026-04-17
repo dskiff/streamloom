@@ -37,6 +37,14 @@ const MaxViewerTokenRequestBytes = 1 << 10
 // typical client-clock drift budget.
 const MinViewerTokenTTLMs = 5 * 60 * 1000
 
+// MaxViewerTokenDefaultTTLMs is a soft upper bound on viewer-token
+// lifetime. Mint requests whose minute-aligned TTL exceeds this are
+// rejected unless the caller sets allow_long_token: true. It exists as a
+// failsafe against operator typos and misconfigured automation that would
+// otherwise produce share links valid for months or years; callers with a
+// legitimate long-lived use case opt in explicitly.
+const MaxViewerTokenDefaultTTLMs = 7 * 24 * 60 * 60 * 1000
+
 // PlaylistTokenTTL is the lifetime of the internal viewer token that the
 // media-playlist renderer bakes into init/segment URIs. Because the renderer
 // mints a fresh token on every re-render, this bounds how long a URL scraped
@@ -307,7 +315,8 @@ func API(logger *slog.Logger, env config.Env, store *stream.Store, requestLogger
 
 			r.Body = http.MaxBytesReader(w, r.Body, MaxViewerTokenRequestBytes)
 			var req struct {
-				ExpiresAtMs int64 `json:"expires_at_ms"`
+				ExpiresAtMs    int64 `json:"expires_at_ms"`
+				AllowLongToken bool  `json:"allow_long_token"`
 			}
 			dec := json.NewDecoder(r.Body)
 			dec.DisallowUnknownFields()
@@ -355,6 +364,16 @@ func API(logger *slog.Logger, env config.Env, store *stream.Store, requestLogger
 					"aligned_expires_at_ms", alignedExpMs,
 					"now_ms", nowMs,
 					"min_ttl_ms", MinViewerTokenTTLMs)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			if !req.AllowLongToken && alignedExpMs-nowMs > MaxViewerTokenDefaultTTLMs {
+				logger.Warn("viewer token TTL above default maximum",
+					"streamID", streamID,
+					"requested_expires_at_ms", req.ExpiresAtMs,
+					"aligned_expires_at_ms", alignedExpMs,
+					"now_ms", nowMs,
+					"max_ttl_ms", MaxViewerTokenDefaultTTLMs)
 				w.WriteHeader(http.StatusBadRequest)
 				return
 			}
