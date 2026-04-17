@@ -163,6 +163,90 @@ func TestViewerToken_TTLExactlyMinimum(t *testing.T) {
 	assert.Equal(t, exp, resp.ExpiresAtMs, "minute-aligned input should echo unchanged")
 }
 
+// TestViewerToken_TTLAboveDefaultMaxRejected asserts that a request whose
+// minute-aligned TTL exceeds the default 7-day cap is rejected when
+// allow_long_token is not set.
+func TestViewerToken_TTLAboveDefaultMaxRejected(t *testing.T) {
+	clk := clock.NewMock(time.UnixMilli(60_000 * 28_333_333))
+	router, _, _, _ := testAPIRouterWithViewerKey(t, clk)
+
+	exp := clk.Now().Add(7*24*time.Hour + time.Minute).UnixMilli()
+	body, _ := json.Marshal(map[string]any{"expires_at_ms": exp})
+	rec := postViewerToken(router, "1", "test-token", body)
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+// TestViewerToken_TTLExactlyDefaultMaxAccepted asserts that a request whose
+// minute-aligned TTL equals exactly the 7-day cap is accepted without the
+// opt-in flag.
+func TestViewerToken_TTLExactlyDefaultMaxAccepted(t *testing.T) {
+	clk := clock.NewMock(time.UnixMilli(60_000 * 28_333_333))
+	router, _, _, _ := testAPIRouterWithViewerKey(t, clk)
+
+	exp := clk.Now().Add(7 * 24 * time.Hour).UnixMilli()
+	body, _ := json.Marshal(map[string]any{"expires_at_ms": exp})
+	rec := postViewerToken(router, "1", "test-token", body)
+	require.Equal(t, http.StatusCreated, rec.Code)
+
+	var resp struct {
+		ExpiresAtMs int64 `json:"expires_at_ms"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	assert.Equal(t, exp, resp.ExpiresAtMs)
+}
+
+// TestViewerToken_TTLAboveDefaultMaxAllowedWithFlag asserts that a
+// well-above-cap expiry is accepted when allow_long_token is true.
+func TestViewerToken_TTLAboveDefaultMaxAllowedWithFlag(t *testing.T) {
+	clk := clock.NewMock(time.UnixMilli(60_000 * 28_333_333))
+	router, _, _, _ := testAPIRouterWithViewerKey(t, clk)
+
+	exp := clk.Now().Add(30 * 24 * time.Hour).UnixMilli()
+	body, _ := json.Marshal(map[string]any{
+		"expires_at_ms":    exp,
+		"allow_long_token": true,
+	})
+	rec := postViewerToken(router, "1", "test-token", body)
+	require.Equal(t, http.StatusCreated, rec.Code)
+
+	var resp struct {
+		ExpiresAtMs int64 `json:"expires_at_ms"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	assert.Equal(t, exp, resp.ExpiresAtMs)
+}
+
+// TestViewerToken_AllowLongTokenFalseStillCapped asserts that an explicit
+// allow_long_token: false behaves identically to the zero value — the cap
+// applies and the request is rejected.
+func TestViewerToken_AllowLongTokenFalseStillCapped(t *testing.T) {
+	clk := clock.NewMock(time.UnixMilli(60_000 * 28_333_333))
+	router, _, _, _ := testAPIRouterWithViewerKey(t, clk)
+
+	exp := clk.Now().Add(8 * 24 * time.Hour).UnixMilli()
+	body, _ := json.Marshal(map[string]any{
+		"expires_at_ms":    exp,
+		"allow_long_token": false,
+	})
+	rec := postViewerToken(router, "1", "test-token", body)
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+// TestViewerToken_AllowLongTokenWithShortTTL asserts that allow_long_token
+// is harmless when the requested TTL is already under the cap.
+func TestViewerToken_AllowLongTokenWithShortTTL(t *testing.T) {
+	clk := clock.NewMock(time.UnixMilli(60_000 * 28_333_333))
+	router, _, _, _ := testAPIRouterWithViewerKey(t, clk)
+
+	exp := clk.Now().Add(1 * time.Hour).UnixMilli()
+	body, _ := json.Marshal(map[string]any{
+		"expires_at_ms":    exp,
+		"allow_long_token": true,
+	})
+	rec := postViewerToken(router, "1", "test-token", body)
+	require.Equal(t, http.StatusCreated, rec.Code)
+}
+
 func TestViewerToken_EmptyBody(t *testing.T) {
 	router, _, _, _ := testAPIRouterWithViewerKey(t, clock.Real{})
 
