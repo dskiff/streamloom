@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -13,23 +12,19 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// fakeMinter is a test stub implementing PlaylistTokenMinter. It records
-// the arguments it was called with and returns tokens from caller-supplied
-// functions so each test can target its own behavior.
+// fakeMinter is a test stub implementing PlaylistTokenMinter. Its methods
+// delegate to caller-supplied pure functions, so a single fakeMinter is
+// safe to call concurrently (the renderer goroutine may invoke it in
+// parallel with the test's direct renderMediaPlaylist call). Tests assert
+// behavior by inspecting the returned playlist string rather than
+// recording calls — the playlist is the test's own local value and is
+// unaffected by any background renders.
 type fakeMinter struct {
 	segmentFn func(ts int64) string
 	initFn    func(now int64) string
-
-	segmentCalls atomic.Int32
-	initCalls    atomic.Int32
-
-	segmentTimestamps []int64
-	initNows          []int64
 }
 
 func (f *fakeMinter) SegmentToken(ts int64) string {
-	f.segmentCalls.Add(1)
-	f.segmentTimestamps = append(f.segmentTimestamps, ts)
 	if f.segmentFn == nil {
 		return ""
 	}
@@ -37,8 +32,6 @@ func (f *fakeMinter) SegmentToken(ts int64) string {
 }
 
 func (f *fakeMinter) InitToken(now int64) string {
-	f.initCalls.Add(1)
-	f.initNows = append(f.initNows, now)
 	if f.initFn == nil {
 		return ""
 	}
@@ -88,10 +81,12 @@ func TestRenderMediaPlaylist_NoMintToken_PlainURIs(t *testing.T) {
 	}
 }
 
-// TestRenderMediaPlaylist_WithMintToken_BakesTokenAtEveryURI asserts the
-// minter is invoked once per emitted URI (one InitToken, one SegmentToken
-// per segment in the window) and the returned tokens are baked into the
-// corresponding URIs.
+// TestRenderMediaPlaylist_WithMintToken_BakesTokenAtEveryURI asserts that
+// the renderer calls InitToken with the render's nowMs and SegmentToken
+// with each segment's timestamp, and bakes the returned tokens into the
+// corresponding URIs. Behavior is verified purely from the playlist
+// string so the assertions are unaffected by any concurrent background
+// renders the renderer goroutine may perform.
 func TestRenderMediaPlaylist_WithMintToken_BakesTokenAtEveryURI(t *testing.T) {
 	m := &fakeMinter{
 		segmentFn: func(ts int64) string { return fmt.Sprintf("SEG_%d", ts) },
@@ -103,28 +98,20 @@ func TestRenderMediaPlaylist_WithMintToken_BakesTokenAtEveryURI(t *testing.T) {
 		mustCommitSlot(t, s, i, []byte("data"), int64(i)*2000, 2000)
 	}
 
-	// Reset counters and any calls accumulated during the renderer-goroutine
-	// auto-renders that fire as segments commit.
-	m.segmentCalls.Store(0)
-	m.initCalls.Store(0)
-	m.segmentTimestamps = nil
-	m.initNows = nil
-
 	s.mu.RLock()
 	playlist, _ := s.renderMediaPlaylist(20000, 12)
 	s.mu.RUnlock()
 
-	assert.EqualValues(t, 1, m.initCalls.Load(), "InitToken must fire once per render")
-	assert.EqualValues(t, 3, m.segmentCalls.Load(), "SegmentToken must fire once per segment in the window")
-	assert.Equal(t, []int64{0, 2000, 4000}, m.segmentTimestamps,
-		"SegmentToken must receive the segment's timestamp")
-	assert.Equal(t, []int64{20000}, m.initNows, "InitToken must receive the render's nowMs")
-
+	// InitToken received the render's nowMs.
 	assert.Contains(t, playlist, `#EXT-X-MAP:URI="init.mp4?vt=INIT_20000"`)
+	// SegmentToken received each segment's own timestamp.
 	for i := range 3 {
 		assert.Contains(t, playlist,
 			fmt.Sprintf("segment_%d.m4s?vt=SEG_%d\n", i, i*2000))
 	}
+	// One init URI and one per segment — no duplicate emissions.
+	assert.Equal(t, 1, strings.Count(playlist, "init.mp4?vt="))
+	assert.Equal(t, 3, strings.Count(playlist, ".m4s?vt="))
 }
 
 // TestRenderMediaPlaylist_EmptyMintReturn_PlainURIs asserts that a minter
@@ -194,11 +181,12 @@ func TestRenderMediaPlaylist_StableSegmentURIsAcrossRenders(t *testing.T) {
 	assert.Contains(t, second, "segment_2.m4s?vt=tok_seg_4000")
 }
 
-// TestRenderMediaPlaylist_InitTokenRefreshesOnEveryRender confirms that
-// InitToken is called on each render with the current nowMs so the minter
-// can rotate the init URI at its own cadence (e.g. hourly buckets). The
-// renderer itself does not cache or reuse the init token between calls.
-func TestRenderMediaPlaylist_InitTokenRefreshesOnEveryRender(t *testing.T) {
+// TestRenderMediaPlaylist_InitTokenReceivesRenderNowMs confirms that
+// InitToken is invoked with the nowMs of its render — this is what lets a
+// production minter rotate the init URI at its own cadence (e.g. hourly
+// buckets) while keeping segment URIs stable. Asserted via the playlist
+// string so the check is unaffected by background renders.
+func TestRenderMediaPlaylist_InitTokenReceivesRenderNowMs(t *testing.T) {
 	m := &fakeMinter{
 		segmentFn: func(ts int64) string { return fmt.Sprintf("seg%d", ts) },
 		initFn:    func(now int64) string { return fmt.Sprintf("init_at_%d", now) },
@@ -218,5 +206,5 @@ func TestRenderMediaPlaylist_InitTokenRefreshesOnEveryRender(t *testing.T) {
 	// Segment URI stays stable — only the init URI reflects the new nowMs.
 	seg0 := regexp.MustCompile(`segment_0\.m4s\?vt=[A-Za-z0-9_-]+`)
 	assert.Equal(t, seg0.FindString(first), seg0.FindString(second))
-	assert.True(t, strings.Contains(first, "segment_0.m4s?vt=seg0"))
+	assert.Contains(t, first, "segment_0.m4s?vt=seg0")
 }
