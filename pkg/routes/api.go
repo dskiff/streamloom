@@ -15,7 +15,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/dskiff/streamloom/pkg/clock"
 	"github.com/dskiff/streamloom/pkg/config"
 	mw "github.com/dskiff/streamloom/pkg/middleware"
 	"github.com/dskiff/streamloom/pkg/pool"
@@ -60,33 +59,80 @@ const PlaylistTokenTTL = 10 * time.Minute
 // the viewer package's private constant across the serde boundary.
 const viewerTokenMsPerMinute = 60_000
 
-// makePlaylistTokenMinter returns a closure that mints a playlist-baked
-// segment-class viewer token valid for PlaylistTokenTTL from the current
-// clock time. The closure captures the per-stream segment-derived signing
-// key, the store clock, the logger, and the streamID for diagnostics. It
-// returns "" on failure so the renderer falls back to emitting plain URIs
-// for that render only (the middleware still enforces vt on the resulting
-// requests, so those plain URIs will 401 — this is the correct
-// fail-closed behavior for a configured stream).
+// playlistTokenMinter implements stream.PlaylistTokenMinter. It produces
+// segment-class viewer tokens that the media-playlist renderer bakes into
+// emitted URIs.
 //
 // The segment-derived key binds these tokens to the segment capability
 // class via the KDF, so a refetch of the media playlist carrying one of
 // these tokens fails MAC under the playlist-derived key (tried alone on
 // playlist routes) and is rejected. This preserves the infinite-rotation
 // defense without spending a payload byte on a type marker.
-func makePlaylistTokenMinter(segmentKey []byte, clk clock.Clock, logger *slog.Logger, streamID string) func() string {
-	return func() string {
-		expMs := clk.Now().Add(PlaylistTokenTTL).UnixMilli()
-		tok, err := viewer.Mint(segmentKey, expMs)
-		if err != nil {
-			logger.Error("failed to mint playlist viewer token",
-				"streamID", streamID,
-				"error", err,
-			)
-			return ""
-		}
-		return tok
+//
+// Per-URI minting (one call per segment) with a deterministic expiry
+// derived from the segment's own timestamp guarantees that a given
+// segment's URL is byte-identical across playlist renders, satisfying
+// the URI-stability expectation of HLS clients (RFC 8216 §6.2.2). The
+// init URI's expiry is bucketed to the hour so EXT-X-MAP is stable for
+// ~1 h at a time rather than flipping on every render.
+type playlistTokenMinter struct {
+	segmentKey []byte
+	logger     *slog.Logger
+	streamID   string
+}
+
+// initTokenBucketMs is the quantum the init-segment token's expiry is
+// bucketed to. One hour matches the init segment's role as a
+// stream-lifetime artifact (rather than a per-segment one) while still
+// capping URL-scraping replay to at most 1h + PlaylistTokenTTL.
+const initTokenBucketMs = int64(time.Hour / time.Millisecond)
+
+// makePlaylistTokenMinter returns a PlaylistTokenMinter bound to the given
+// per-stream segment-derived signing key. It returns "" from either mint
+// method on failure so the renderer emits that single URI plain; the
+// middleware then 401s the fetch (fail-closed).
+func makePlaylistTokenMinter(segmentKey []byte, logger *slog.Logger, streamID string) *playlistTokenMinter {
+	return &playlistTokenMinter{
+		segmentKey: segmentKey,
+		logger:     logger,
+		streamID:   streamID,
 	}
+}
+
+// SegmentToken mints a token whose expiry is anchored to the segment's own
+// presentation timestamp. Two renders that both include the same segment
+// therefore bake the same token string into that segment's URI, keeping
+// the URL stable for the life of the segment in the window.
+func (m *playlistTokenMinter) SegmentToken(segmentTimestampMs int64) string {
+	expMs := segmentTimestampMs + PlaylistTokenTTL.Milliseconds()
+	tok, err := viewer.Mint(m.segmentKey, expMs)
+	if err != nil {
+		m.logger.Error("failed to mint segment viewer token",
+			"streamID", m.streamID,
+			"error", err,
+		)
+		return ""
+	}
+	return tok
+}
+
+// InitToken mints a token whose expiry is bucketed to the current hour.
+// All renders within the same hour produce the same token, so EXT-X-MAP's
+// URI does not churn every render. The expiry is set one TTL past the
+// bucket's end so a client that loads the playlist near the boundary
+// still has a valid init URI.
+func (m *playlistTokenMinter) InitToken(nowMs int64) string {
+	bucketStart := (nowMs / initTokenBucketMs) * initTokenBucketMs
+	expMs := bucketStart + initTokenBucketMs + PlaylistTokenTTL.Milliseconds()
+	tok, err := viewer.Mint(m.segmentKey, expMs)
+	if err != nil {
+		m.logger.Error("failed to mint init viewer token",
+			"streamID", m.streamID,
+			"error", err,
+		)
+		return ""
+	}
+	return tok
 }
 
 // contextKey is a private type for context keys to avoid collisions.
@@ -504,8 +550,8 @@ func API(logger *slog.Logger, env config.Env, store *stream.Store, requestLogger
 			// with pre-viewer-token behavior).
 			var initOpts []stream.InitOption
 			if viewerKeys, ok := env.GetViewerKeys(streamID); ok {
-				mintFn := makePlaylistTokenMinter(viewerKeys.Segment, store.Clock(), logger, streamID)
-				initOpts = append(initOpts, stream.WithMintToken(mintFn))
+				minter := makePlaylistTokenMinter(viewerKeys.Segment, logger, streamID)
+				initOpts = append(initOpts, stream.WithMintToken(minter))
 			}
 
 			if err := store.Init(streamID, meta, initData, segmentCap, meta.SegmentByteCount, backwardBufferSize, env.BUFFER_WORKING_SPACE, config.DefaultMediaWindowSize, initOpts...); err != nil {

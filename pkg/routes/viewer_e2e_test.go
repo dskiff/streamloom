@@ -91,23 +91,30 @@ func TestE2E_ViewerToken_FullFlow(t *testing.T) {
 	assert.Contains(t, mediaBody, `#EXT-X-MAP:URI="init.mp4?vt=`)
 	assert.Contains(t, mediaBody, "segment_0.m4s?vt=")
 
-	// All embedded tokens on this playlist must be identical (single mint
-	// per render) and must verify against the segment-derived key (the
-	// renderer bakes segment-class tokens). They must NOT verify against
-	// the playlist-derived key — that mismatch is what scopes them off
-	// playlist routes.
-	playlistVT := matches[0][1]
-	for _, m := range matches {
-		assert.Equal(t, playlistVT, m[1],
-			"all URIs in a single playlist must share the same playlist-scoped token")
-	}
+	// Every embedded token must verify against the segment-derived key (the
+	// renderer bakes segment-class tokens) and must NOT verify against the
+	// playlist-derived key — that mismatch is what scopes them off
+	// playlist routes. Unlike the previous "one token per render" design,
+	// per-URI minting produces distinct tokens per URI so that each
+	// segment's URL can be held stable across renders (RFC 8216 §6.2.2).
 	keys := testViewerKeys(t, "1")
-	assert.NoError(t, viewer.Verify(keys.Segment, clk.Now(), playlistVT),
-		"baked playlist token must verify under the stream's segment-derived key")
-	assert.ErrorIs(t,
-		viewer.Verify(keys.Playlist, clk.Now(), playlistVT),
-		viewer.ErrBadMAC,
-		"baked playlist token must NOT verify under the playlist-derived key (that's how scoping works)")
+	for _, m := range matches {
+		assert.NoError(t, viewer.Verify(keys.Segment, clk.Now(), m[1]),
+			"baked token must verify under the stream's segment-derived key")
+		assert.ErrorIs(t,
+			viewer.Verify(keys.Playlist, clk.Now(), m[1]),
+			viewer.ErrBadMAC,
+			"baked token must NOT verify under the playlist-derived key")
+	}
+	// Init and segment tokens are derived from different inputs (hour
+	// bucket vs. segment timestamp) and must therefore differ.
+	initTokMatch := regexp.MustCompile(`init\.mp4\?vt=([A-Za-z0-9_-]+)`).FindStringSubmatch(mediaBody)
+	segTokMatch := regexp.MustCompile(`segment_0\.m4s\?vt=([A-Za-z0-9_-]+)`).FindStringSubmatch(mediaBody)
+	require.Len(t, initTokMatch, 2)
+	require.Len(t, segTokMatch, 2)
+	assert.NotEqual(t, initTokMatch[1], segTokMatch[1],
+		"init and segment tokens derive from different inputs, so they must differ")
+	playlistVT := segTokMatch[1]
 
 	// The baked segment-class token must be REFUSED on playlist routes.
 	// This is the central defense against the infinite-rotation attack:
@@ -155,6 +162,90 @@ func TestE2E_ViewerToken_FullFlow(t *testing.T) {
 		streamRouter.ServeHTTP(rec, req)
 		assert.Equal(t, http.StatusUnauthorized, rec.Code, "expected 401 for %s without vt", p)
 	}
+}
+
+// TestE2E_ViewerToken_SegmentURIsStableAcrossRenders is the regression
+// test for the HLS URI-stability bug: a segment's ?vt= token must not
+// change across successive media-playlist renders. Without this, HLS
+// clients that dedupe segments by URI (or that re-fetch EXT-X-MAP when
+// its URI changes) churn through every reload.
+//
+// The test commits a segment, renders, commits a second segment (forcing
+// a re-render), renders again, and asserts the first segment's full URI
+// line (including ?vt=) is byte-identical across both bodies.
+func TestE2E_ViewerToken_SegmentURIsStableAcrossRenders(t *testing.T) {
+	clk := clock.NewMock(time.UnixMilli(0))
+	streamRouter, apiRouter, store, _ := testBothRoutersWithViewerKey(t, clk)
+
+	hdrs := initHeaders()
+	rec := postInit(apiRouter, "1", "test-token", hdrs, []byte("init-data"))
+	require.Equal(t, http.StatusCreated, rec.Code)
+	t.Cleanup(func() { store.Delete("1") })
+
+	clk.Set(time.UnixMilli(10000))
+	rec = postSegment(apiRouter, "1", "test-token", "0", "5000", "2000", []byte("seg0"))
+	require.Equal(t, http.StatusCreated, rec.Code)
+
+	// Mint a long-lived viewer token so we can fetch the playlist through
+	// the auth'd route.
+	exp := clk.Now().Add(time.Hour).UnixMilli()
+	body, _ := json.Marshal(map[string]any{"expires_at_ms": exp})
+	rec = postViewerToken(apiRouter, "1", "test-token", body)
+	require.Equal(t, http.StatusCreated, rec.Code)
+	var mintResp struct {
+		Token string `json:"token"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &mintResp))
+	vt := mintResp.Token
+
+	s := store.Get("1")
+	require.NotNil(t, s)
+	require.Eventually(t, func() bool {
+		return strings.Contains(s.CachedPlaylist(), "segment_0.m4s")
+	}, 2*time.Second, 10*time.Millisecond)
+
+	// First render.
+	req := httptest.NewRequest(http.MethodGet, "/stream/1/media.m3u8?vt="+vt, nil)
+	rec = httptest.NewRecorder()
+	streamRouter.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+	firstBody := rec.Body.String()
+
+	// Commit a second segment, then advance the clock past its timestamp
+	// so the renderer makes it eligible. Post first + advance second
+	// because a segment's timestamp must be >= the store clock at commit
+	// time (after the first-segment exemption is spent).
+	rec = postSegment(apiRouter, "1", "test-token", "1", "10000", "2000", []byte("seg1"))
+	require.Equal(t, http.StatusCreated, rec.Code)
+	clk.Set(time.UnixMilli(13000))
+	require.Eventually(t, func() bool {
+		return strings.Contains(s.CachedPlaylist(), "segment_1.m4s")
+	}, 2*time.Second, 10*time.Millisecond)
+
+	// Second render.
+	req = httptest.NewRequest(http.MethodGet, "/stream/1/media.m3u8?vt="+vt, nil)
+	rec = httptest.NewRecorder()
+	streamRouter.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+	secondBody := rec.Body.String()
+
+	// The first segment's URI line (including its ?vt= token) must be
+	// byte-identical between the two playlist bodies. This is what HLS
+	// clients need to avoid re-downloading segments they already have.
+	seg0Re := regexp.MustCompile(`segment_0\.m4s\?vt=[A-Za-z0-9_-]+`)
+	firstSeg0 := seg0Re.FindString(firstBody)
+	secondSeg0 := seg0Re.FindString(secondBody)
+	require.NotEmpty(t, firstSeg0)
+	require.NotEmpty(t, secondSeg0)
+	assert.Equal(t, firstSeg0, secondSeg0,
+		"segment_0 URI must be byte-identical across renders (HLS URI-stability)")
+
+	// Same contract for the init URI across renders within the same hour.
+	initRe := regexp.MustCompile(`init\.mp4\?vt=[A-Za-z0-9_-]+`)
+	assert.Equal(t,
+		initRe.FindString(firstBody),
+		initRe.FindString(secondBody),
+		"init URI must be stable within the hour bucket")
 }
 
 // TestE2E_ViewerToken_KeyRotationInvalidatesOutstanding asserts that

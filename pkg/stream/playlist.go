@@ -16,11 +16,16 @@ const minRenderInterval = 50 * time.Millisecond
 // A sliding window of at most windowSize segments is applied to the tail of
 // the eligible set.
 //
-// When s.mintToken is set, it is invoked once per render and the returned
-// token is baked into every emitted URI as "?vt=<token>". When it is nil
-// (or returns ""), URIs are emitted without a query string. The base64url
-// alphabet produced by viewer.Mint is already URL-safe, so no escaping is
-// required at render time.
+// When s.mintToken is set, the renderer calls InitToken(nowMs) once and
+// SegmentToken(seg.Timestamp) per segment, and bakes each returned token
+// into its own URI as "?vt=<token>". Per-URI minting (rather than one
+// token shared across the playlist) lets implementations return tokens
+// that are a pure function of the URI's identity, so a segment's URL is
+// byte-identical across renders — required by HLS clients (RFC 8216
+// §6.2.2). An empty return degrades that single URI to bare; the
+// middleware then 401s the fetch (fail-closed). The base64url alphabet
+// produced by viewer.Mint is already URL-safe, so no escaping is required
+// at render time.
 //
 // Returns (playlist, nextEligibleMs) where nextEligibleMs is the timestamp
 // of the first segment not yet eligible (0 if no such segment exists).
@@ -47,21 +52,12 @@ func (s *Stream) renderMediaPlaylist(nowMs int64, windowSize int) (string, int64
 	start := max(eligible-windowSize, 0)
 	window := s.segments[start:eligible]
 
-	// Mint the playlist-scoped viewer token once per render. The renderer
-	// bakes it into every URI so viewers use a single short-lived token
-	// for all init/segment fetches linked from this playlist.
-	var vtQuery string
-	if s.mintToken != nil {
-		if tok := s.mintToken(); tok != "" {
-			vtQuery = "?vt=" + tok
-		}
-	}
-
 	var b strings.Builder
 	var scratch [64]byte
 
-	// Estimate capacity: ~150 bytes per segment entry + ~200 bytes header.
-	b.Grow(200 + len(window)*(150+len(vtQuery)))
+	// Estimate capacity: ~150 bytes per segment entry + a base64url vt query.
+	// Tokens are 28 chars + "?vt=" = 32 bytes; round to 40 for slack.
+	b.Grow(200 + len(window)*(150+40))
 
 	b.WriteString("#EXTM3U\n")
 	b.WriteString("#EXT-X-VERSION:7\n")
@@ -76,7 +72,12 @@ func (s *Stream) renderMediaPlaylist(nowMs int64, windowSize int) (string, int64
 	b.WriteByte('\n')
 
 	b.WriteString("#EXT-X-MAP:URI=\"init.mp4")
-	b.WriteString(vtQuery)
+	if s.mintToken != nil {
+		if tok := s.mintToken.InitToken(nowMs); tok != "" {
+			b.WriteString("?vt=")
+			b.WriteString(tok)
+		}
+	}
 	b.WriteString("\"\n")
 
 	for _, seg := range window {
@@ -92,7 +93,12 @@ func (s *Stream) renderMediaPlaylist(nowMs int64, windowSize int) (string, int64
 		b.WriteString("segment_")
 		b.Write(strconv.AppendUint(scratch[:0], uint64(seg.Index), 10))
 		b.WriteString(".m4s")
-		b.WriteString(vtQuery)
+		if s.mintToken != nil {
+			if tok := s.mintToken.SegmentToken(seg.Timestamp); tok != "" {
+				b.WriteString("?vt=")
+				b.WriteString(tok)
+			}
+		}
 		b.WriteByte('\n')
 	}
 

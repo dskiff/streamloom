@@ -154,35 +154,50 @@ the aligned value in the response so callers see exactly what was encoded.
   substitution (and no per-viewer per-fetch allocation) is required.
 
 ### `pkg/stream/playlist.go`
-- The media-playlist renderer calls a per-stream `mintToken() string`
-  callback once per render and bakes the returned token into every emitted
-  URI as `?vt=<token>`. When the callback is nil (stream without a viewer
-  key) or returns `""`, URIs are emitted plain. This replaces the earlier
-  `{VT}` placeholder + serve-time substitution scheme — the playlist is
-  now a fully-formed artifact that can be served verbatim. The cached
-  playlist remains per-stream (not per-viewer): every viewer that fetches
-  `media.m3u8` in the same render window sees the same short-lived token
-  embedded in its URIs.
+- The media-playlist renderer consults a per-stream `PlaylistTokenMinter`
+  interface and bakes a token into every emitted URI as `?vt=<token>`.
+  `InitToken(nowMs)` fires once per render; `SegmentToken(segmentTsMs)`
+  fires once per segment in the window. Per-URI minting (rather than one
+  token reused across the playlist) lets the minter return tokens that
+  are a pure function of the URI's identity, so a segment's URL is
+  byte-identical across renders — required by HLS clients (RFC 8216
+  §6.2.2). When the minter is nil (stream without a viewer key) or a
+  method returns `""`, the corresponding URI is emitted plain (fail-closed
+  via the middleware). This replaces the earlier `{VT}` placeholder +
+  serve-time substitution scheme — the playlist is now a fully-formed
+  artifact that can be served verbatim. The cached playlist remains
+  per-stream (not per-viewer).
 
 ### `pkg/stream/stream.go`
-- Added a `mintToken func() string` field to `Stream` and an `InitOption` /
-  `WithMintToken(fn)` functional-options pattern on `Store.Init`. The
-  option is applied before the renderer goroutine is launched, so the
-  renderer observes a fully-configured Stream without additional locking.
-  Streams without a viewer key are initialized with no options and run
-  identically to the pre-viewer-token path.
+- Added the `PlaylistTokenMinter` interface (`SegmentToken(tsMs int64) string`
+  + `InitToken(nowMs int64) string`), a `mintToken PlaylistTokenMinter`
+  field on `Stream`, and an `InitOption` / `WithMintToken(m)`
+  functional-options pattern on `Store.Init`. The option is applied before
+  the renderer goroutine is launched, so the renderer observes a
+  fully-configured Stream without additional locking. Streams without a
+  viewer key are initialized with no options and run identically to the
+  pre-viewer-token path.
 
 ### `pkg/routes/api.go` (playlist-token plumbing)
 - Added `PlaylistTokenTTL = 10 * time.Minute`. The `/init` handler builds
-  a `makePlaylistTokenMinter` closure when the stream has configured
-  viewer keys, capturing the **segment-derived** key, store clock, and
-  logger. The closure mints a segment-class token on every call so the
-  playlist middleware refuses it (the playlist route only tries the
-  playlist-derived key). The closure is passed to `store.Init` via
-  `stream.WithMintToken(...)`. Streams without keys receive no option,
-  preserving fully-public playback. The operator-facing
-  `POST /viewer_token` endpoint uses the **playlist-derived** key
-  instead, producing tokens accepted on every stream route.
+  a `playlistTokenMinter` struct when the stream has configured viewer
+  keys, capturing the **segment-derived** key, logger, and streamID.
+  Both methods mint a segment-class token so the playlist middleware
+  refuses it (the playlist route only tries the playlist-derived key).
+  - `SegmentToken(tsMs)` sets `exp = tsMs + PlaylistTokenTTL`; since the
+    input is intrinsic to the segment, the token for a given segment is
+    deterministic and thus stable across playlist renders — the HLS
+    URI-stability requirement.
+  - `InitToken(nowMs)` buckets the expiry to the current hour (exp =
+    hour_bucket_end + PlaylistTokenTTL), so EXT-X-MAP's URI is stable
+    within each hour rather than flipping every render. The init
+    segment has no natural per-URI anchor; hourly rotation is a
+    reasonable cap on URL-scraping replay for that URI.
+  The minter is passed to `store.Init` via `stream.WithMintToken(...)`.
+  Streams without keys receive no option, preserving fully-public
+  playback. The operator-facing `POST /viewer_token` endpoint uses the
+  **playlist-derived** key, producing tokens accepted on every stream
+  route.
 
 ### `main.go`
 - Logs `viewer token key configured` for each configured stream at startup.
@@ -208,13 +223,18 @@ the aligned value in the response so callers see exactly what was encoded.
 - `pkg/routes/viewer_stream_test.go` — per-route integration including the
   critical `TestStream_UnauthorizedRequest_DoesNotRecordWatcher` which locks
   in the middleware ordering.
-- `pkg/stream/playlist_vt_test.go` — asserts the renderer's mint callback
-  fires exactly once per render, its token is baked into EXT-X-MAP and
-  every segment URI, distinct renders embed distinct tokens, an empty
-  return from the callback produces plain URIs (fail-closed via the
-  middleware), and streams with no mint callback emit no `?vt=`.
+- `pkg/stream/playlist_vt_test.go` — asserts the renderer calls `InitToken`
+  once per render and `SegmentToken` once per segment in the window with
+  the correct arguments (nowMs / segment timestamp); asserts that a
+  deterministic minter yields byte-identical segment URIs across
+  renders; asserts an empty return per URI fails closed to plain URIs;
+  asserts streams with no minter emit no `?vt=`.
 - `pkg/routes/viewer_e2e_test.go` — full flow: mint → master → media → init
-  → segment with `vt` threaded through, and a post-expiry rejection test.
+  → segment with `vt` threaded through; asserts each baked token verifies
+  under the segment-derived key and fails under the playlist-derived key;
+  asserts init and segment tokens differ (derived from different inputs);
+  `TestE2E_ViewerToken_SegmentURIsStableAcrossRenders` locks in the
+  URI-stability regression (RFC 8216 §6.2.2); post-expiry rejection test.
 
 ## Risks & mitigations
 
@@ -230,14 +250,18 @@ the aligned value in the response so callers see exactly what was encoded.
    coexist; unknown version → 401.
 6. **Secret hygiene** — keys are `os.Unsetenv`'d after parsing (mirrors push
    tokens), never logged, never included in responses.
-7. **Playlist URL scraping** — the playlist embeds a short-lived
-   (`PlaylistTokenTTL = 10m`) token rather than the viewer's long-lived
+7. **Playlist URL scraping** — the playlist embeds short-lived
+   (`PlaylistTokenTTL = 10m`) tokens rather than the viewer's long-lived
    one, bounding the replay window of URLs scraped from a playlist body
-   while keeping the cached playlist per-stream (not per-viewer). If a
-   stream stops producing segments for longer than this TTL, the cached
-   playlist's embedded token will expire; subsequent segment fetches 401
-   until the next render refreshes the token. For live streams this is a
-   non-issue because each segment commit triggers a re-render.
+   while keeping the cached playlist per-stream (not per-viewer). Each
+   segment URI's token expires ~10 minutes after that segment's own
+   timestamp (per-URI anchor), not 10 minutes after the enclosing
+   render; the init URI's token is hour-bucketed (exp =
+   bucket_end + 10m). Tokens are deterministic per URI so segment URLs
+   don't churn across renders (HLS URI-stability requirement). If a
+   stream stops producing segments for longer than ~10 minutes, scraped
+   segment URLs for segments already past their TTL will 401 — same
+   bound as the prior design, just applied per-segment.
 8. **Token rotation via playlist refetch** — without route scoping, a
    client holding any valid token could refetch `media.m3u8` to harvest a
    freshly-minted token and repeat indefinitely, making the 10-minute TTL
