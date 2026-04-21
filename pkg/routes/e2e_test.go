@@ -157,6 +157,14 @@ func TestE2E_LookaheadLiveEdge(t *testing.T) {
 	// HOLD-BACK reflects the configured look-ahead cap (6000ms = 6.000s).
 	assert.Contains(t, body, "#EXT-X-SERVER-CONTROL:HOLD-BACK=6.000\n")
 
+	// EXT-X-START anchors clients to the same live-edge across devices.
+	// TIME-OFFSET must mirror HOLD-BACK so the two server hints agree;
+	// PRECISE=YES eliminates segment-boundary snap jitter. Playlist end
+	// (tail PDT 6.000s + its duration 2.000s = 8.000s) minus |TIME-OFFSET|
+	// 6.000s lands the active-segment start at PDT 2.000s — within one
+	// target-duration of wall clock 1.000s.
+	assert.Contains(t, body, "#EXT-X-START:TIME-OFFSET=-6.000,PRECISE=YES\n")
+
 	// Tail PDT ≈ 1970-01-01T00:00:06.000Z (now + 6s).
 	assert.Contains(t, body, "#EXT-X-PROGRAM-DATE-TIME:1970-01-01T00:00:06.000Z")
 
