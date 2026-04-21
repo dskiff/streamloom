@@ -113,10 +113,11 @@ func TestE2E_InitPushRetrieve(t *testing.T) {
 }
 
 // TestE2E_LookaheadLiveEdge pushes segments with PDTs spanning several
-// target durations ahead of wall clock and confirms: (1) the playlist tail
-// sits approximately at now + lookahead rather than at wall clock, (2) the
-// HOLD-BACK header matches the configured cap, and (3) the contiguity gate
-// holds the tail in place when an index arrives out of order.
+// target durations ahead of wall clock and confirms: (1) the playlist
+// tail sits approximately at now + lookahead rather than at wall clock,
+// (2) segments beyond the cap are excluded until they cross it, and
+// (3) the HOLD-BACK header matches the configured cap. The contiguity
+// gate is covered separately by TestE2E_LookaheadContiguityUnderReordering.
 func TestE2E_LookaheadLiveEdge(t *testing.T) {
 	clk := clock.NewMock(time.UnixMilli(0))
 	streamRouter, apiRouter, store, _ := testBothRoutersWithToken(t, clk)
