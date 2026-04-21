@@ -89,8 +89,8 @@ func (snap *PlaylistSnapshot) Assemble(nowMs int64) string {
 // segments. Eligibility, sliding window, and contiguity rules match the
 // previous single-string renderer; the only shape change is that the
 // EXT-X-START line is omitted from the body and its ingredients
-// (EndMs, HoldBackSecs, MinHoldBackSecs, WindowDurationSecs) are captured
-// on the snapshot for per-request synthesis in StartLine.
+// (EndMs, HoldBackSecs, MinHoldBackSecs) are captured on the snapshot
+// for per-request synthesis in StartLine.
 //
 // Returns (snapshot, nextEligibleMs). snapshot is nil when no segments are
 // eligible; nextEligibleMs is the timestamp of the first segment beyond

@@ -141,15 +141,25 @@ func mediaPlaylistHandler(logger *slog.Logger, store *stream.Store) http.Handler
 		w.Header().Set("Content-Type", config.M3U8_MIME_TYPE)
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Content-Length", strconv.Itoa(total))
-		if _, err := io.WriteString(w, snap.Prefix); err != nil { // #nosec G705 -- numeric content from internal state
+		// #nosec G705 -- server-generated playlist body: HLS tags and
+		// numeric fields built in pkg/stream/playlist.go, segment URIs
+		// of the form "segment_<uint32>.m4s", and optional viewer
+		// tokens minted server-side (base64url of an HMAC over fixed
+		// server-controlled fields, see pkg/viewer/viewer.go). No path
+		// carries user-supplied request data into this body.
+		if _, err := io.WriteString(w, snap.Prefix); err != nil {
 			logger.Error("failed to write response", "error", err)
 			return
 		}
-		if _, err := io.WriteString(w, startLine); err != nil { // #nosec G705
+		// #nosec G705 -- formatted from server-derived floats
+		// (TIME-OFFSET) via strconv.AppendFloat with a fixed "%.3f"
+		// layout; see PlaylistSnapshot.StartLine.
+		if _, err := io.WriteString(w, startLine); err != nil {
 			logger.Error("failed to write response", "error", err)
 			return
 		}
-		if _, err := io.WriteString(w, snap.Suffix); err != nil { // #nosec G705
+		// #nosec G705 -- see Prefix justification; same renderer output.
+		if _, err := io.WriteString(w, snap.Suffix); err != nil {
 			logger.Error("failed to write response", "error", err)
 		}
 	}
