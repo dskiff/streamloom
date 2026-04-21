@@ -106,15 +106,20 @@ type Stream struct {
 	// Set once during Init and never changed. Must not be modified.
 	initData []byte
 
-	// mintToken, when non-nil, is invoked once per media-playlist render to
-	// produce a short-lived viewer token that the renderer bakes into every
-	// emitted URI (EXT-X-MAP init URI and segment URIs). It returns "" if
-	// a token cannot be minted, in which case the renderer emits plain URIs.
+	// mintToken, when non-nil, produces short-lived viewer tokens that the
+	// renderer bakes into emitted URIs (EXT-X-MAP init URI and segment URIs).
+	// The renderer calls InitToken once per render and SegmentToken once per
+	// segment in the window, then writes whatever strings the methods
+	// return. The renderer itself does not enforce determinism; URI
+	// stability across re-renders is the minter's contract (see
+	// PlaylistTokenMinter). An empty return from either method causes the
+	// renderer to emit that single URI plain; downstream middleware will
+	// then 401 the fetch (fail-closed).
 	//
 	// Set once during Init (before the renderer goroutine launches) and
 	// never mutated afterwards, so no lock is required to read it from
 	// inside the renderer.
-	mintToken func() string
+	mintToken PlaylistTokenMinter
 
 	segments          []Slot // sorted by Index
 	segmentCap        int    // maximum number of segments
@@ -473,13 +478,46 @@ var ErrStreamExists = errors.New("stream already exists")
 // mutate fields that the renderer subsequently reads without locking.
 type InitOption func(*Stream)
 
-// WithMintToken installs a callback that the media-playlist renderer invokes
-// once per render to produce a short-lived viewer token. The token is baked
-// directly into every emitted URI (EXT-X-MAP init URI and each segment URI),
-// eliminating per-request substitution. When fn returns "", the renderer
-// emits plain URIs for that render only.
-func WithMintToken(fn func() string) InitOption {
-	return func(s *Stream) { s.mintToken = fn }
+// PlaylistTokenMinter produces the short-lived viewer tokens that the
+// media-playlist renderer bakes into emitted URIs.
+//
+// Contract:
+//   - Implementations MUST derive each token's contents deterministically
+//     from the URI's identity (the init segment, or a segment's
+//     timestamp) so the URL for a given segment is byte-identical across
+//     playlist re-renders. HLS clients (RFC 8216 §6.2.2) dedup by URI;
+//     churning URIs across reloads causes redundant downloads.
+//   - Implementations MUST be safe for concurrent use. The renderer is
+//     currently single-goroutine per stream, but tests and future
+//     callers may invoke the minter from multiple goroutines.
+//   - Either method may return "" to indicate a mint failure; the
+//     renderer then emits that single URI plain and the middleware 401s
+//     the fetch (fail-closed). Returning "" must not affect the other
+//     URIs in the same render.
+type PlaylistTokenMinter interface {
+	// SegmentToken returns the token to bake into the URI of the segment
+	// whose presentation timestamp is segmentTimestampMs. The returned
+	// token must be stable for a given segmentTimestampMs so the URL
+	// doesn't change across renders.
+	SegmentToken(segmentTimestampMs int64) string
+
+	// InitToken returns the token to bake into the EXT-X-MAP init URI at
+	// the render whose wall-clock time is nowMs. Implementations are
+	// expected to return stable tokens within a coarse time bucket (e.g.
+	// one per hour) so the init URI does not change on every render.
+	InitToken(nowMs int64) string
+}
+
+// WithMintToken installs a PlaylistTokenMinter that the media-playlist
+// renderer invokes while emitting URIs. See PlaylistTokenMinter for the
+// URI-stability contract.
+//
+// Pass a nil interface value (not a typed nil pointer) to disable minting
+// — e.g. omit WithMintToken entirely rather than passing
+// WithMintToken((*myMinter)(nil)), which would satisfy the interface-non-nil
+// check and panic at first call.
+func WithMintToken(m PlaylistTokenMinter) InitOption {
+	return func(s *Stream) { s.mintToken = m }
 }
 
 // Init creates a new stream with the given init segment and metadata.
