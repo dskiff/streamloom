@@ -20,6 +20,14 @@ const minRenderInterval = 50 * time.Millisecond
 //
 // A nil *PlaylistSnapshot means "no eligible segments yet"; the handler
 // treats that the same as the pre-live-edge case and returns 503.
+//
+// Instances are shared immutably between the renderer goroutine and any
+// number of concurrent handler goroutines via an atomic pointer swap.
+// Callers must treat every field as read-only: a single in-place mutation
+// would race with every in-flight StartLine / Assemble call. The fields
+// are exported only to keep the HTTP handler allocation-free; prefer the
+// StartLine, Assemble, and CachedPlaylistSnapshot entry points in code
+// outside this package.
 type PlaylistSnapshot struct {
 	// Prefix is the playlist bytes from "#EXTM3U" through the trailing
 	// "\n" of the EXT-X-SERVER-CONTROL line (the line immediately
@@ -50,7 +58,20 @@ type PlaylistSnapshot struct {
 // client's start position. It is clamped from below at MinHoldBackSecs
 // so we never advertise a tighter latency than the HOLD-BACK header
 // promises.
+//
+// The shrink only produces a visible change when HoldBackSecs is strictly
+// greater than MinHoldBackSecs. At the default configuration
+// (maxLookaheadMs = 3 × targetDuration × 1000) the two are equal, the
+// clamp fires on any positive staleness, and the emitted offset is
+// always -HoldBackSecs — identical to the pre-split static behavior.
+// Operators who want cross-device convergence within a target-duration
+// must configure a larger X-SL-MAX-LOOKAHEAD-MS.
+//
+// Safe to call on a nil receiver (returns ""), mirroring Assemble.
 func (snap *PlaylistSnapshot) StartLine(nowMs int64) string {
+	if snap == nil {
+		return ""
+	}
 	staleSecs := float64(nowMs-snap.EndMs) / 1000.0
 	if staleSecs < 0 {
 		staleSecs = 0

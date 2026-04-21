@@ -236,6 +236,12 @@ func (s *Stream) CachedPlaylist() string {
 // snapshot, or nil if no playlist has been rendered yet. The HTTP handler
 // uses this to write Prefix / StartLine(now) / Suffix without allocating
 // the full body per request.
+//
+// The returned value is a shared, read-only view. Multiple goroutines may
+// hold it concurrently; none may mutate its fields. The renderer replaces
+// the snapshot atomically on each re-render, so a goroutine that captured
+// an earlier pointer keeps seeing a consistent (but possibly stale) view
+// until it drops the reference.
 func (s *Stream) CachedPlaylistSnapshot() *PlaylistSnapshot {
 	return s.cachedPlaylist.Load()
 }

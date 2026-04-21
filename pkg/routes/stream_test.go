@@ -476,6 +476,45 @@ func TestMediaPlaylist_StartOffset_TwoStaggeredRequestsAgreeOnStartTime(t *testi
 		"staggered viewers must agree on (wall−start); A=%d B=%d", elapsedA, elapsedB)
 }
 
+// TestMediaPlaylist_StartOffset_ContentLengthMatchesBody guards against
+// the three-part write drifting out of sync with the Content-Length
+// header. The handler composes total = len(Prefix) + len(StartLine) +
+// len(Suffix) where StartLine is a freshly-formatted string whose width
+// depends on the offset value; a future change to either the header or
+// the writes must keep the two in lockstep or clients see a truncated /
+// padded body.
+func TestMediaPlaylist_StartOffset_ContentLengthMatchesBody(t *testing.T) {
+	clk := clock.NewMock(time.UnixMilli(0))
+	router, store, _ := testStreamRouter(t, clk)
+	initStreamWithLookahead(t, store, "1", 2, 10000)
+
+	s := store.Get("1")
+	require.NotNil(t, s)
+
+	commitSegment(t, s, 0, []byte("seg0"), 2000) // endMs = 4000
+
+	clk.Set(time.UnixMilli(4000))
+	require.Eventually(t, func() bool {
+		return s.CachedPlaylist() != ""
+	}, 2*time.Second, 10*time.Millisecond)
+
+	// Exercise a few request clocks that produce different StartLine
+	// widths (fresh vs stale vs clamped), to make sure the invariant
+	// holds across the range of offset magnitudes the handler emits.
+	for _, wall := range []int64{4000, 4200, 5500, 104_000} {
+		clk.Set(time.UnixMilli(wall))
+		req := httptest.NewRequest(http.MethodGet, "/stream/1/media.m3u8", nil)
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		require.Equal(t, http.StatusOK, rec.Code, "wall=%d", wall)
+		cl, err := strconv.Atoi(rec.Header().Get("Content-Length"))
+		require.NoError(t, err, "wall=%d: Content-Length must parse", wall)
+		assert.Equal(t, cl, rec.Body.Len(),
+			"wall=%d: Content-Length header (%d) must match body length (%d)",
+			wall, cl, rec.Body.Len())
+	}
+}
+
 // extractStartOffsetSecs parses the TIME-OFFSET value (a positive magnitude)
 // out of the single EXT-X-START line in a playlist body.
 func extractStartOffsetSecs(t *testing.T, body string) float64 {

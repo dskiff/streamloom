@@ -104,9 +104,16 @@ PDT close to wall time.
       during the same cached playlist. The renderer now stores a
       `PlaylistSnapshot` with body split around the EXT-X-START line; the
       HTTP handler synthesizes `TIME-OFFSET = -(HoldBack − staleSecs)`
-      per request (clamped at `MinHoldBack` = 3 × target-duration) so two
-      staggered fetches converge on the same absolute start PDT. New
-      types: `PlaylistSnapshot` in `pkg/stream/playlist.go`. New tests:
+      per request (clamped at `MinHoldBack` = 3 × target-duration). The
+      invariant: two staggered viewers diverge in start PDT by exactly
+      their wall-clock gap, so they play the same content at every shared
+      wall time. Drift cancellation only engages when `HoldBack >
+      MinHoldBack`; at the default `maxLookaheadMs = 3 × targetDuration`
+      the two are equal and the clamp pins the offset at `-HoldBack`
+      every render (same as the pre-split behavior). Operators who want
+      convergence within a target-duration must set
+      `X-SL-MAX-LOOKAHEAD-MS` above the default. New types:
+      `PlaylistSnapshot` in `pkg/stream/playlist.go`. New tests:
       `TestPlaylistSnapshot_*`, `TestMediaPlaylist_StartOffset_*`,
       `TestE2E_StartOffsetTracksWallClock`.
 

@@ -161,6 +161,7 @@ func mediaPlaylistHandler(logger *slog.Logger, store *stream.Store) http.Handler
 		// #nosec G705 -- see Prefix justification; same renderer output.
 		if _, err := io.WriteString(w, snap.Suffix); err != nil {
 			logger.Error("failed to write response", "error", err)
+			return
 		}
 	}
 }
