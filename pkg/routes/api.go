@@ -44,14 +44,18 @@ const MinViewerTokenTTLMs = 5 * 60 * 1000
 // legitimate long-lived use case opt in explicitly.
 const MaxViewerTokenDefaultTTLMs = 7 * 24 * 60 * 60 * 1000
 
-// PlaylistTokenTTL is the lifetime of the internal viewer token that the
-// media-playlist renderer bakes into init/segment URIs. Because the renderer
-// mints a fresh token on every re-render, this bounds how long a URL scraped
-// from a live playlist can be replayed by an unauthorized party. It also
-// caps how stale a cached playlist's embedded URIs can become; a live stream
-// re-renders on each segment commit and therefore refreshes the token well
-// within this window. Comfortably above MinViewerTokenTTLMs so the token
-// always passes the public mint-endpoint floor.
+// PlaylistTokenTTL is the lifetime applied to tokens the renderer bakes
+// into init/segment URIs. For segments it is a grace period past the
+// segment's own presentation timestamp (`exp = seg.Timestamp + TTL`); for
+// the init URI it is a grace period past the end of the current hour
+// bucket (`exp = bucketEnd + TTL`). Using intrinsic anchors (segment
+// timestamp, hour boundary) rather than the render wall clock keeps a
+// given URI byte-identical across re-renders, which HLS clients require
+// for correct dedup behavior (RFC 8216 §6.2.2). The TTL itself bounds
+// how long a scraped URL can be replayed: ~10 minutes past the segment
+// timestamp for segments, and up to one hour + TTL for init. Comfortably
+// above MinViewerTokenTTLMs so the token always passes the public
+// mint-endpoint floor.
 const PlaylistTokenTTL = 10 * time.Minute
 
 // viewerTokenMsPerMinute is used to floor an expires_at_ms value to the
@@ -83,8 +87,11 @@ type playlistTokenMinter struct {
 
 // initTokenBucketMs is the quantum the init-segment token's expiry is
 // bucketed to. One hour matches the init segment's role as a
-// stream-lifetime artifact (rather than a per-segment one) while still
-// capping URL-scraping replay to at most 1h + PlaylistTokenTTL.
+// stream-lifetime artifact (rather than a per-segment one). Applies only
+// to the init URI; segment URIs use a tighter per-segment anchor
+// (seg.Timestamp + PlaylistTokenTTL). The init-URI scraping replay bound
+// is therefore up to 1h + PlaylistTokenTTL, strictly wider than the
+// segment bound.
 const initTokenBucketMs = int64(time.Hour / time.Millisecond)
 
 // makePlaylistTokenMinter returns a PlaylistTokenMinter bound to the given
@@ -103,6 +110,16 @@ func makePlaylistTokenMinter(segmentKey []byte, logger *slog.Logger, streamID st
 // presentation timestamp. Two renders that both include the same segment
 // therefore bake the same token string into that segment's URI, keeping
 // the URL stable for the life of the segment in the window.
+//
+// Note: for the first segment of an empty stream, the commit logic exempts
+// the "timestamp must be >= now" check (see CommitSlot in pkg/stream). If
+// an operator commits a first segment whose timestamp is older than
+// now - PlaylistTokenTTL, the baked token's expiry (ts + TTL) is already
+// in the past and viewer.Verify immediately returns ErrExpired. This
+// mirrors the stream's own "stale content" posture: such a segment is
+// unlikely to be a useful live asset anyway. Subsequent commits are
+// required to have timestamps >= the store clock, so the issue is
+// confined to the exempt first segment.
 func (m *playlistTokenMinter) SegmentToken(segmentTimestampMs int64) string {
 	expMs := segmentTimestampMs + PlaylistTokenTTL.Milliseconds()
 	tok, err := viewer.Mint(m.segmentKey, expMs)

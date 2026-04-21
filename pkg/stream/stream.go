@@ -109,12 +109,12 @@ type Stream struct {
 	// mintToken, when non-nil, produces short-lived viewer tokens that the
 	// renderer bakes into emitted URIs (EXT-X-MAP init URI and segment URIs).
 	// The renderer calls InitToken once per render and SegmentToken once per
-	// segment in the window. Token inputs are pure functions of the URI's
-	// identity (init vs. segment timestamp) so segment URLs remain
-	// byte-identical across renders — a stability requirement of HLS clients
-	// (RFC 8216 §6.2.2). Either method may return "" if a token cannot be
-	// minted, in which case the renderer emits that single URI plain;
-	// downstream middleware will then 401 the fetch (fail-closed).
+	// segment in the window, then writes whatever strings the methods
+	// return. The renderer itself does not enforce determinism; URI
+	// stability across re-renders is the minter's contract (see
+	// PlaylistTokenMinter). An empty return from either method causes the
+	// renderer to emit that single URI plain; downstream middleware will
+	// then 401 the fetch (fail-closed).
 	//
 	// Set once during Init (before the renderer goroutine launches) and
 	// never mutated afterwards, so no lock is required to read it from
@@ -479,16 +479,21 @@ var ErrStreamExists = errors.New("stream already exists")
 type InitOption func(*Stream)
 
 // PlaylistTokenMinter produces the short-lived viewer tokens that the
-// media-playlist renderer bakes into emitted URIs. Implementations must
-// derive each token's contents deterministically from the URI's identity
-// (the init segment, or a segment's timestamp) so the URL for a given
-// segment is byte-identical across playlist renders. This is required by
-// HLS clients (RFC 8216 §6.2.2) — re-renders that change a segment URI
-// cause clients to re-download already-seen segments.
+// media-playlist renderer bakes into emitted URIs.
 //
-// Either method may return "" when a token cannot be minted. The renderer
-// emits that single URI plain in that case; the middleware then 401s the
-// fetch (fail-closed).
+// Contract:
+//   - Implementations MUST derive each token's contents deterministically
+//     from the URI's identity (the init segment, or a segment's
+//     timestamp) so the URL for a given segment is byte-identical across
+//     playlist re-renders. HLS clients (RFC 8216 §6.2.2) dedup by URI;
+//     churning URIs across reloads causes redundant downloads.
+//   - Implementations MUST be safe for concurrent use. The renderer is
+//     currently single-goroutine per stream, but tests and future
+//     callers may invoke the minter from multiple goroutines.
+//   - Either method may return "" to indicate a mint failure; the
+//     renderer then emits that single URI plain and the middleware 401s
+//     the fetch (fail-closed). Returning "" must not affect the other
+//     URIs in the same render.
 type PlaylistTokenMinter interface {
 	// SegmentToken returns the token to bake into the URI of the segment
 	// whose presentation timestamp is segmentTimestampMs. The returned
@@ -505,7 +510,12 @@ type PlaylistTokenMinter interface {
 
 // WithMintToken installs a PlaylistTokenMinter that the media-playlist
 // renderer invokes while emitting URIs. See PlaylistTokenMinter for the
-// URI-stability contract. When m is nil, URIs are emitted plain.
+// URI-stability contract.
+//
+// Pass a nil interface value (not a typed nil pointer) to disable minting
+// — e.g. omit WithMintToken entirely rather than passing
+// WithMintToken((*myMinter)(nil)), which would satisfy the interface-non-nil
+// check and panic at first call.
 func WithMintToken(m PlaylistTokenMinter) InitOption {
 	return func(s *Stream) { s.mintToken = m }
 }

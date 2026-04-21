@@ -208,3 +208,49 @@ func TestRenderMediaPlaylist_InitTokenReceivesRenderNowMs(t *testing.T) {
 	assert.Equal(t, seg0.FindString(first), seg0.FindString(second))
 	assert.Contains(t, first, "segment_0.m4s?vt=seg0")
 }
+
+// TestRenderMediaPlaylist_PartialEmptyMintReturn_BareOnlyAffectedURI asserts
+// that each URI's ?vt= is suppressed independently: when InitToken returns
+// "" but SegmentToken returns real tokens (or vice versa), only the
+// affected URI becomes bare. This is the contract that keeps per-URI
+// mint failures from cascading into whole-render failures.
+func TestRenderMediaPlaylist_PartialEmptyMintReturn_BareOnlyAffectedURI(t *testing.T) {
+	// InitToken empty; SegmentToken returns a real value.
+	s := setupStreamWithMintToken(t, &fakeMinter{
+		segmentFn: func(ts int64) string { return fmt.Sprintf("tok%d", ts) },
+		initFn:    func(int64) string { return "" },
+	})
+	for i := range uint32(2) {
+		mustCommitSlot(t, s, i, []byte("data"), int64(i)*2000, 2000)
+	}
+	s.mu.RLock()
+	playlist, _ := s.renderMediaPlaylist(20000, 12)
+	s.mu.RUnlock()
+
+	assert.Contains(t, playlist, "#EXT-X-MAP:URI=\"init.mp4\"",
+		"bare init URI when InitToken returns empty")
+	for i := range 2 {
+		assert.Contains(t, playlist,
+			fmt.Sprintf("segment_%d.m4s?vt=tok%d\n", i, i*2000),
+			"segment URIs still carry ?vt= when SegmentToken returns non-empty")
+	}
+
+	// Inverse: InitToken returns a real value; SegmentToken returns "".
+	s2 := setupStreamWithMintToken(t, &fakeMinter{
+		segmentFn: func(int64) string { return "" },
+		initFn:    func(int64) string { return "INIT_OK" },
+	})
+	for i := range uint32(2) {
+		mustCommitSlot(t, s2, i, []byte("data"), int64(i)*2000, 2000)
+	}
+	s2.mu.RLock()
+	playlist2, _ := s2.renderMediaPlaylist(20000, 12)
+	s2.mu.RUnlock()
+
+	assert.Contains(t, playlist2, "#EXT-X-MAP:URI=\"init.mp4?vt=INIT_OK\"",
+		"init URI carries ?vt= when InitToken returns non-empty")
+	for i := range 2 {
+		assert.Contains(t, playlist2, fmt.Sprintf("segment_%d.m4s\n", i),
+			"bare segment URIs when SegmentToken returns empty")
+	}
+}

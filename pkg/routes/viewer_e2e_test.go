@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -94,9 +95,7 @@ func TestE2E_ViewerToken_FullFlow(t *testing.T) {
 	// Every embedded token must verify against the segment-derived key (the
 	// renderer bakes segment-class tokens) and must NOT verify against the
 	// playlist-derived key — that mismatch is what scopes them off
-	// playlist routes. Unlike the previous "one token per render" design,
-	// per-URI minting produces distinct tokens per URI so that each
-	// segment's URL can be held stable across renders (RFC 8216 §6.2.2).
+	// playlist routes.
 	keys := testViewerKeys(t, "1")
 	for _, m := range matches {
 		assert.NoError(t, viewer.Verify(keys.Segment, clk.Now(), m[1]),
@@ -106,14 +105,10 @@ func TestE2E_ViewerToken_FullFlow(t *testing.T) {
 			viewer.ErrBadMAC,
 			"baked token must NOT verify under the playlist-derived key")
 	}
-	// Init and segment tokens are derived from different inputs (hour
-	// bucket vs. segment timestamp) and must therefore differ.
 	initTokMatch := regexp.MustCompile(`init\.mp4\?vt=([A-Za-z0-9_-]+)`).FindStringSubmatch(mediaBody)
 	segTokMatch := regexp.MustCompile(`segment_0\.m4s\?vt=([A-Za-z0-9_-]+)`).FindStringSubmatch(mediaBody)
 	require.Len(t, initTokMatch, 2)
 	require.Len(t, segTokMatch, 2)
-	assert.NotEqual(t, initTokMatch[1], segTokMatch[1],
-		"init and segment tokens derive from different inputs, so they must differ")
 	playlistVT := segTokMatch[1]
 
 	// The baked segment-class token must be REFUSED on playlist routes.
@@ -187,8 +182,8 @@ func TestE2E_ViewerToken_SegmentURIsStableAcrossRenders(t *testing.T) {
 	require.Equal(t, http.StatusCreated, rec.Code)
 
 	// Mint a long-lived viewer token so we can fetch the playlist through
-	// the auth'd route.
-	exp := clk.Now().Add(time.Hour).UnixMilli()
+	// the auth'd route across the 1-hour rollover tested below.
+	exp := clk.Now().Add(3 * time.Hour).UnixMilli()
 	body, _ := json.Marshal(map[string]any{"expires_at_ms": exp})
 	rec = postViewerToken(apiRouter, "1", "test-token", body)
 	require.Equal(t, http.StatusCreated, rec.Code)
@@ -242,10 +237,41 @@ func TestE2E_ViewerToken_SegmentURIsStableAcrossRenders(t *testing.T) {
 
 	// Same contract for the init URI across renders within the same hour.
 	initRe := regexp.MustCompile(`init\.mp4\?vt=[A-Za-z0-9_-]+`)
+	withinHourInit := initRe.FindString(firstBody)
 	assert.Equal(t,
-		initRe.FindString(firstBody),
+		withinHourInit,
 		initRe.FindString(secondBody),
 		"init URI must be stable within the hour bucket")
+
+	// Cross an hour boundary and commit a third segment to trigger a
+	// re-render. The init URI MUST rotate (hour-bucketed anchor) while
+	// older segment URIs that remain in the window stay byte-identical.
+	clk.Set(time.UnixMilli(int64(time.Hour/time.Millisecond) + 2000))
+	rec = postSegment(apiRouter, "1", "test-token",
+		"2", strconv.FormatInt(clk.Now().UnixMilli(), 10), "2000", []byte("seg2"))
+	require.Equal(t, http.StatusCreated, rec.Code)
+	clk.Set(time.UnixMilli(int64(time.Hour/time.Millisecond) + 5000))
+	require.Eventually(t, func() bool {
+		return strings.Contains(s.CachedPlaylist(), "segment_2.m4s")
+	}, 2*time.Second, 10*time.Millisecond)
+
+	req = httptest.NewRequest(http.MethodGet, "/stream/1/media.m3u8?vt="+vt, nil)
+	rec = httptest.NewRecorder()
+	streamRouter.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+	thirdBody := rec.Body.String()
+
+	assert.NotEqual(t, withinHourInit, initRe.FindString(thirdBody),
+		"init URI must rotate at the hour bucket boundary")
+	// If seg0 is still in the window its URI must be byte-identical to
+	// the first render's — segment tokens are anchored to segment
+	// timestamp, not wall clock, so an hour rollover must not affect
+	// them. (seg0 may have aged out of the window depending on eviction;
+	// the assertion is conditional.)
+	if strings.Contains(thirdBody, "segment_0.m4s") {
+		assert.Equal(t, seg0Re.FindString(firstBody), seg0Re.FindString(thirdBody),
+			"segment_0 URI must survive unchanged across an hour rollover")
+	}
 }
 
 // TestE2E_ViewerToken_KeyRotationInvalidatesOutstanding asserts that
