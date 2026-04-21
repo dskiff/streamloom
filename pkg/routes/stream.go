@@ -120,22 +120,36 @@ func mediaPlaylistHandler(logger *slog.Logger, store *stream.Store) http.Handler
 			return
 		}
 
-		playlist := s.CachedPlaylist()
-		if playlist == "" {
+		snap := s.CachedPlaylistSnapshot()
+		if snap == nil {
 			// All segments were evicted between the HasPlaylist gate
 			// and now.  Tell the player to retry rather than serving
 			// an empty body.
 			writeStreamUnavailable(w)
 			return
 		}
-		// The playlist is served verbatim. The renderer has already
-		// baked a short-lived, playlist-scoped viewer token into every
-		// emitted URI (or left URIs unadorned when no key is configured
-		// for the stream), so no per-request substitution is needed.
+		// Prefix and Suffix were baked at render time (with viewer
+		// tokens already embedded in segment URIs). StartLine is
+		// synthesized here from the current wall clock so TIME-OFFSET
+		// stays anchored to "now" instead of drifting away from the
+		// last commit — every viewer joining between commits gets the
+		// same absolute content start time.
+		nowMs := store.Clock().Now().UnixMilli()
+		startLine := snap.StartLine(nowMs)
+		total := len(snap.Prefix) + len(startLine) + len(snap.Suffix)
+
 		w.Header().Set("Content-Type", config.M3U8_MIME_TYPE)
 		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("Content-Length", strconv.Itoa(len(playlist)))
-		if _, err := io.WriteString(w, playlist); err != nil { // #nosec G705 -- playlist contains only numeric data from internal state, not user input
+		w.Header().Set("Content-Length", strconv.Itoa(total))
+		if _, err := io.WriteString(w, snap.Prefix); err != nil { // #nosec G705 -- numeric content from internal state
+			logger.Error("failed to write response", "error", err)
+			return
+		}
+		if _, err := io.WriteString(w, startLine); err != nil { // #nosec G705
+			logger.Error("failed to write response", "error", err)
+			return
+		}
+		if _, err := io.WriteString(w, snap.Suffix); err != nil { // #nosec G705
 			logger.Error("failed to write response", "error", err)
 		}
 	}

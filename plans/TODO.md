@@ -99,6 +99,17 @@ PDT close to wall time.
       ClampedToSpecMinimum, HeaderOrder, PreciseAttr}`. E2E coverage
       extended in `TestE2E_LookaheadLiveEdge`.
 
+- [x] Dynamic `EXT-X-START` per request. Static `TIME-OFFSET` left up to
+      one target-duration of within-segment drift between viewers joining
+      during the same cached playlist. The renderer now stores a
+      `PlaylistSnapshot` with body split around the EXT-X-START line; the
+      HTTP handler synthesizes `TIME-OFFSET = -(HoldBack − staleSecs)`
+      per request (clamped at `MinHoldBack` = 3 × target-duration) so two
+      staggered fetches converge on the same absolute start PDT. New
+      types: `PlaylistSnapshot` in `pkg/stream/playlist.go`. New tests:
+      `TestPlaylistSnapshot_*`, `TestMediaPlaylist_StartOffset_*`,
+      `TestE2E_StartOffsetTracksWallClock`.
+
 - [ ] (Future, larger effort) Low-Latency HLS: emit `EXT-X-PART-INF`,
       per-part `EXT-X-PART`, `CAN-BLOCK-RELOAD=YES`, `PART-HOLD-BACK`,
       and support `_HLS_msn` / `_HLS_part` blocking playlist reload.

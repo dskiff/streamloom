@@ -164,9 +164,13 @@ type Stream struct {
 	hasPlaylist     chan struct{}
 	hasPlaylistOnce sync.Once
 
-	// cachedPlaylist holds the most recently rendered media playlist string.
-	// Written by the renderer goroutine, read by HTTP handlers.
-	cachedPlaylist atomic.Pointer[string]
+	// cachedPlaylist holds the most recently rendered playlist snapshot.
+	// The body is split around EXT-X-START so the HTTP handler can
+	// synthesize that line from the current wall clock per request —
+	// canceling the start-offset drift that a statically-cached body
+	// introduces between commits. Written by the renderer goroutine,
+	// read by HTTP handlers.
+	cachedPlaylist atomic.Pointer[PlaylistSnapshot]
 }
 
 // Metadata returns a copy of the stream's metadata.
@@ -216,14 +220,24 @@ func (s *Stream) HasPlaylist() <-chan struct{} {
 	return s.hasPlaylist
 }
 
-// CachedPlaylist returns the most recently rendered media playlist string.
-// Returns "" if no playlist has been rendered yet.
+// CachedPlaylist returns the most recently rendered media playlist string,
+// assembled for the stream's current clock. Returns "" if no playlist has
+// been rendered yet. Allocates; HTTP handlers should use
+// CachedPlaylistSnapshot and write the parts directly.
 func (s *Stream) CachedPlaylist() string {
-	p := s.cachedPlaylist.Load()
-	if p == nil {
+	snap := s.cachedPlaylist.Load()
+	if snap == nil {
 		return ""
 	}
-	return *p
+	return snap.Assemble(s.clock.Now().UnixMilli())
+}
+
+// CachedPlaylistSnapshot returns the most recently rendered playlist
+// snapshot, or nil if no playlist has been rendered yet. The HTTP handler
+// uses this to write Prefix / StartLine(now) / Suffix without allocating
+// the full body per request.
+func (s *Stream) CachedPlaylistSnapshot() *PlaylistSnapshot {
+	return s.cachedPlaylist.Load()
 }
 
 // GetInit returns the init segment bytes, or nil and false if the stream has
