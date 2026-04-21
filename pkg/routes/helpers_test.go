@@ -189,7 +189,8 @@ func initStream(t *testing.T, store *stream.Store, id string) {
 		FrameRate:          23.976,
 		TargetDurationSecs: 2,
 	}
-	err := store.Init(id, meta, []byte("init-data"), 10, 1024, 5, 2, config.DefaultMediaWindowSize)
+	err := store.Init(id, meta, []byte("init-data"), 10, 1024, 5, 2, config.DefaultMediaWindowSize,
+		int64(config.DefaultMaxLookaheadMultiplier)*int64(meta.TargetDurationSecs)*1000)
 	require.NoError(t, err)
 	t.Cleanup(func() { store.Delete(id) })
 }

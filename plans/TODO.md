@@ -41,49 +41,45 @@ the playlist tail ahead of wall clock so PDT-sync'd clients don't fight
 the "3 segments behind end" heuristic, while bounding playlist size and
 preserving HLS's append-only invariant under out-of-order ingest.
 
-- [ ] Add `maxLookaheadMs` to `Stream` + `Store.Init` (threaded through
+- [x] Add `maxLookaheadMs` to `Stream` + `Store.Init` (threaded through
       `pkg/stream/stream.go` and call sites). Default to
-      `3 × TargetDurationSecs × 1000` via a new
-      `DefaultMaxLookaheadMultiplier` in `pkg/config/const.go`. Update
-      test helpers to pass through.
-      *Validation: existing tests green; new unit test confirms the
-      default value on an Init with no override.*
+      `3 × TargetDurationSecs × 1000` at the `/init` handler via a new
+      `DefaultMaxLookaheadMultiplier` in `pkg/config/const.go`. Unit
+      tests pass `0` for the legacy "pin tail at now" baseline; route
+      tests exercise the default.
 
-- [ ] Swap `renderMediaPlaylist` filter from `Timestamp > nowMs` to
-      `Timestamp > nowMs + maxLookaheadMs`. Update
-      `TestRenderMediaPlaylist_WallClockFiltering` and
-      `TestRenderMediaPlaylist_NextEligibleMs`. Add tests: future-PDT
-      segment within cap appears immediately; segment beyond cap does
-      not; `nextEligibleMs` reflects the shifted cutoff.
-      *Validation: stutter-repro scenario (tail PDT ≈ now + cap) in a
-      unit test.*
+- [x] Swap `renderMediaPlaylist` filter from `Timestamp > nowMs` to
+      `Timestamp > nowMs + s.maxLookaheadMs`. New
+      `TestRenderMediaPlaylist_Lookahead*` tests cover future-within-cap
+      inclusion, beyond-cap exclusion, stutter-repro tail, and
+      `maxLookaheadMs=0` degenerate behavior. Route-level filtering
+      tests updated for the shifted cutoff.
 
-- [ ] Add contiguity gate to `renderMediaPlaylist` (truncate at first
-      index gap within the window). Tests: `[0,1,2,4]` → playlist ends
-      at 2; after 4→3 arrival → extends to 4; gap entirely before the
-      window is a no-op.
-      *Validation: out-of-order commit test passes; append-only
-      invariant held across successive renders.*
+- [x] Contiguity gate in `renderMediaPlaylist`: truncate window at the
+      first index gap. `TestRenderMediaPlaylist_ContiguityGate_*` and
+      `TestE2E_LookaheadContiguityUnderReordering` cover out-of-order
+      commit, gap-fill, and pre-window gap no-op scenarios.
 
-- [ ] Emit `EXT-X-SERVER-CONTROL:HOLD-BACK=<maxLookaheadSecs>` in the
-      playlist header. Update `playlist_test.go` header assertions.
-      *Validation: header present, value matches configured
-      `maxLookaheadMs`.*
+- [x] `EXT-X-SERVER-CONTROL:HOLD-BACK=<secs>` emitted right after
+      `EXT-X-INDEPENDENT-SEGMENTS`. Clamped up to `3 × target-duration`
+      per RFC 8216 §4.4.3.8. Tests:
+      `TestRenderMediaPlaylist_HoldBack{MatchesLookahead,
+      ClampedToSpecMinimum, HeaderOrder}`.
 
-- [ ] Accept `X-SL-MAX-LOOKAHEAD-MS` on `/init` in `pkg/routes/api.go`.
-      Validate `>= TargetDurationMs` and `<= reasonable ceiling`. Thread
-      into `Store.Init`. Route tests for accept / reject / default.
-      *Validation: route tests cover bounds; README documents the
-      header alongside `X-SL-BACKWARD-BUFFER-SIZE`.*
+- [x] `X-SL-MAX-LOOKAHEAD-MS` parsed on `/init`. Validated: non-negative,
+      `0` accepted (legacy), otherwise `>= target-duration-ms`, `<=
+      MaxLookaheadCeilingMs` (1 hour). Threaded into `store.Init`.
+      `TestPostInit_MaxLookahead*` covers accept / default / rejections.
 
-- [ ] End-to-end test in `pkg/routes/e2e_test.go`: push segments with
-      PDTs spanning several target durations into the future, poll
-      playlist, verify tail PDT ≈ `now + maxLookaheadMs`, verify
-      `HOLD-BACK` header, induce reordering and verify contiguity gate
-      holds.
-      *Validation: pre-commit gauntlet green
-      (`go fmt && go vet && go test && gosec`).*
+- [x] End-to-end test in `pkg/routes/e2e_test.go`:
+      `TestE2E_LookaheadLiveEdge` pushes segments spanning several
+      target durations ahead, verifies tail PDT ≈ `now + cap` and the
+      `HOLD-BACK` header value.
+      `TestE2E_LookaheadContiguityUnderReordering` covers the
+      index-reorder scenario.
+      Pre-commit: `go fmt / vet / test` green. `gosec` not available in
+      this environment (run via devbox locally).
 
-- [ ] (Optional / follow-up) Metric or log line when contiguity gate
-      truncates the window, to surface ingest reordering rather than
-      silently masking it.
+- [ ] (Optional / follow-up) Metric or log line when the contiguity
+      gate truncates the window, to surface ingest reordering rather
+      than silently masking it.

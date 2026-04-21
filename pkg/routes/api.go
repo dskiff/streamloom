@@ -559,6 +559,39 @@ func API(logger *slog.Logger, env config.Env, store *stream.Store, requestLogger
 				return
 			}
 
+			// Playlist look-ahead cap: how far ahead of wall clock the
+			// media-playlist tail may sit. Defaults to
+			// DefaultMaxLookaheadMultiplier × target-duration so PDT-sync'd
+			// clients align their start position with the buffer-target
+			// heuristic (RFC 8216 §6.3.3). Overridable via
+			// X-SL-MAX-LOOKAHEAD-MS; bounded below by the target duration
+			// (shorter caps defeat the purpose and risk clients anchoring
+			// between two adjacent segments) and above by a ceiling to catch
+			// operator typos.
+			targetDurationMs := int64(meta.TargetDurationSecs) * 1000
+			maxLookaheadMs := int64(config.DefaultMaxLookaheadMultiplier) * targetDurationMs
+			if v := r.Header.Get("X-SL-MAX-LOOKAHEAD-MS"); v != "" {
+				parsed, perr := strconv.ParseInt(v, 10, 64)
+				if perr != nil || parsed < 0 {
+					logger.Warn("invalid max-lookahead-ms header", "value", v, "error", perr)
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				if parsed != 0 && parsed < targetDurationMs {
+					logger.Warn("max-lookahead-ms below target duration",
+						"value", parsed, "target_ms", targetDurationMs)
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				if parsed > config.MaxLookaheadCeilingMs {
+					logger.Warn("max-lookahead-ms above ceiling",
+						"value", parsed, "ceiling_ms", config.MaxLookaheadCeilingMs)
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				maxLookaheadMs = parsed
+			}
+
 			// When a viewer-token key is configured for this stream, wire a
 			// PlaylistTokenMinter the renderer will invoke per URI —
 			// InitToken once per render (hour-bucketed) and SegmentToken
@@ -576,7 +609,7 @@ func API(logger *slog.Logger, env config.Env, store *stream.Store, requestLogger
 				initOpts = append(initOpts, stream.WithMintToken(minter))
 			}
 
-			if err := store.Init(streamID, meta, initData, segmentCap, meta.SegmentByteCount, backwardBufferSize, env.BUFFER_WORKING_SPACE, config.DefaultMediaWindowSize, initOpts...); err != nil {
+			if err := store.Init(streamID, meta, initData, segmentCap, meta.SegmentByteCount, backwardBufferSize, env.BUFFER_WORKING_SPACE, config.DefaultMediaWindowSize, maxLookaheadMs, initOpts...); err != nil {
 				if errors.Is(err, stream.ErrStreamExists) {
 					logger.Warn("stream already exists", "streamID", streamID)
 					w.WriteHeader(http.StatusConflict)

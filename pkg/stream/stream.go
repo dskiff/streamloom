@@ -133,6 +133,13 @@ type Stream struct {
 	// the oldest are evicted until the backward count is within this limit.
 	backwardBufferSize int
 
+	// maxLookaheadMs bounds how far ahead of wall-clock the media playlist
+	// tail is allowed to sit. The renderer includes any segment with
+	// Timestamp <= nowMs + maxLookaheadMs. A value of 0 pins the tail at
+	// wall clock (legacy behavior). Set once during Init and never mutated,
+	// so the renderer reads it without locking.
+	maxLookaheadMs int64
+
 	// totalSegmentCount is the total number of segments ever added to this stream.
 	// Useful for deriving EXT-X-MEDIA-SEQUENCE in playlist generation.
 	totalSegmentCount int64
@@ -174,6 +181,13 @@ func (s *Stream) TotalSegmentCount() int64 {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.totalSegmentCount
+}
+
+// MaxLookaheadMs returns the per-stream playlist look-ahead cap in
+// milliseconds. The field is set once at Init and immutable, so no lock is
+// required.
+func (s *Stream) MaxLookaheadMs() int64 {
+	return s.maxLookaheadMs
 }
 
 // SegmentLoad returns the current number of buffered segments and the capacity.
@@ -464,6 +478,9 @@ var ErrInvalidPlaylistWindowSize = errors.New("playlistWindowSize must be > 0")
 // or not less than the segment capacity.
 var ErrInvalidBackwardBufferSize = errors.New("backwardBufferSize must be >= 1 and < segmentCapacity")
 
+// ErrInvalidMaxLookahead is returned when maxLookaheadMs is negative.
+var ErrInvalidMaxLookahead = errors.New("maxLookaheadMs must be >= 0")
+
 // ErrInvalidWorkingSpace is returned when workingSpace is negative or would
 // overflow when added to segmentCapacity.
 var ErrInvalidWorkingSpace = errors.New("workingSpace must be >= 0 and segmentCapacity + workingSpace must not overflow")
@@ -530,8 +547,10 @@ func WithMintToken(m PlaylistTokenMinter) InitOption {
 // backwardBufferSize controls how many past segments are retained during eviction;
 // it must be >= 1 and < segmentCapacity.
 // playlistWindowSize is the maximum number of segments in the media playlist.
+// maxLookaheadMs is how far ahead of wall-clock the playlist tail may sit;
+// must be >= 0. A value of 0 pins the tail at wall clock (legacy behavior).
 // Optional InitOptions configure per-stream features (e.g. viewer-token minting).
-func (s *Store) Init(id string, meta Metadata, initData []byte, segmentCapacity, segmentBytes, backwardBufferSize, workingSpace, playlistWindowSize int, opts ...InitOption) error {
+func (s *Store) Init(id string, meta Metadata, initData []byte, segmentCapacity, segmentBytes, backwardBufferSize, workingSpace, playlistWindowSize int, maxLookaheadMs int64, opts ...InitOption) error {
 	if len(initData) == 0 {
 		return ErrEmptyInitData
 	}
@@ -546,6 +565,9 @@ func (s *Store) Init(id string, meta Metadata, initData []byte, segmentCapacity,
 	}
 	if workingSpace < 0 || segmentCapacity > math.MaxInt-workingSpace {
 		return ErrInvalidWorkingSpace
+	}
+	if maxLookaheadMs < 0 {
+		return ErrInvalidMaxLookahead
 	}
 
 	cloned := make([]byte, len(initData))
@@ -568,6 +590,7 @@ func (s *Store) Init(id string, meta Metadata, initData []byte, segmentCapacity,
 		segmentCap:         segmentCapacity,
 		bufPool:            pool.NewBufferPool(segmentCapacity+workingSpace, segmentBytes),
 		backwardBufferSize: backwardBufferSize,
+		maxLookaheadMs:     maxLookaheadMs,
 		notifyCh:           make(chan struct{}, 1),
 		done:               make(chan struct{}),
 		stopped:            make(chan struct{}),
