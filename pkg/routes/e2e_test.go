@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -109,6 +110,118 @@ func TestE2E_InitPushRetrieve(t *testing.T) {
 	streamRouter.ServeHTTP(rec, req)
 	assert.Equal(t, http.StatusOK, rec.Code)
 	assert.Contains(t, rec.Body.String(), "segment_0.m4s")
+}
+
+// TestE2E_LookaheadLiveEdge pushes segments with PDTs spanning several
+// target durations ahead of wall clock and confirms: (1) the playlist
+// tail sits approximately at now + lookahead rather than at wall clock,
+// (2) segments beyond the cap are excluded until they cross it, and
+// (3) the HOLD-BACK header matches the configured cap. The contiguity
+// gate is covered separately by TestE2E_LookaheadContiguityUnderReordering.
+func TestE2E_LookaheadLiveEdge(t *testing.T) {
+	clk := clock.NewMock(time.UnixMilli(0))
+	streamRouter, apiRouter, store, _ := testBothRoutersWithToken(t, clk)
+
+	hdrs := initHeaders() // target-duration=2 → default lookahead=6000ms
+	rec := postInit(apiRouter, "1", "test-token", hdrs, []byte("init-data"))
+	require.Equal(t, http.StatusCreated, rec.Code)
+	t.Cleanup(func() { store.Delete("1") })
+
+	s := store.Get("1")
+	require.NotNil(t, s)
+	require.Equal(t, int64(6000), s.MaxLookaheadMs())
+
+	// Clock at 1000ms; push indices 0..4 at ts=2000,4000,6000,8000,10000.
+	// With lookahead=6000, cap at now=1000 is 7000 → indices 0,1,2 are in,
+	// indices 3,4 are past the cap.
+	clk.Set(time.UnixMilli(1000))
+	for i, ts := range []int64{2000, 4000, 6000, 8000, 10000} {
+		rec := postSegment(apiRouter, "1", "test-token",
+			strconv.Itoa(i), strconv.FormatInt(ts, 10), "2000",
+			[]byte("seg"))
+		require.Equal(t, http.StatusCreated, rec.Code)
+	}
+
+	require.Eventually(t, func() bool {
+		p := s.CachedPlaylist()
+		return p != "" && strings.Contains(p, "segment_2.m4s")
+	}, 2*time.Second, 10*time.Millisecond)
+
+	req := httptest.NewRequest(http.MethodGet, "/stream/1/media.m3u8", nil)
+	rec = httptest.NewRecorder()
+	streamRouter.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	body := rec.Body.String()
+
+	// HOLD-BACK reflects the configured look-ahead cap (6000ms = 6.000s).
+	assert.Contains(t, body, "#EXT-X-SERVER-CONTROL:HOLD-BACK=6.000\n")
+
+	// Tail PDT ≈ 1970-01-01T00:00:06.000Z (now + 6s).
+	assert.Contains(t, body, "#EXT-X-PROGRAM-DATE-TIME:1970-01-01T00:00:06.000Z")
+
+	// Indices within the cap are present; beyond are excluded.
+	assert.Contains(t, body, "segment_0.m4s")
+	assert.Contains(t, body, "segment_1.m4s")
+	assert.Contains(t, body, "segment_2.m4s")
+	assert.NotContains(t, body, "segment_3.m4s",
+		"segment at ts=8000 is past now+lookahead=7000 and must not appear")
+	assert.NotContains(t, body, "segment_4.m4s")
+}
+
+func TestE2E_LookaheadContiguityUnderReordering(t *testing.T) {
+	clk := clock.NewMock(time.UnixMilli(0))
+	streamRouter, apiRouter, store, _ := testBothRoutersWithToken(t, clk)
+
+	hdrs := initHeaders()
+	rec := postInit(apiRouter, "1", "test-token", hdrs, []byte("init-data"))
+	require.Equal(t, http.StatusCreated, rec.Code)
+	t.Cleanup(func() { store.Delete("1") })
+
+	s := store.Get("1")
+	require.NotNil(t, s)
+
+	// Push 0, 1, 2 then leapfrog to 4 — transcoder delivered index 4 before 3.
+	// All within the default 6000ms look-ahead at clock=1000 (cap=7000).
+	clk.Set(time.UnixMilli(1000))
+	for _, c := range []struct {
+		idx string
+		ts  string
+	}{
+		{"0", "2000"},
+		{"1", "4000"},
+		{"2", "6000"},
+	} {
+		rec := postSegment(apiRouter, "1", "test-token", c.idx, c.ts, "2000", []byte("seg"))
+		require.Equal(t, http.StatusCreated, rec.Code)
+	}
+	// Advance clock so index 4's timestamp falls within the cap once committed.
+	// At clock=4000 the cap is 10000, so ts=10000 sits at the boundary.
+	clk.Set(time.UnixMilli(4000))
+	rec = postSegment(apiRouter, "1", "test-token", "4", "10000", "2000", []byte("seg"))
+	require.Equal(t, http.StatusCreated, rec.Code)
+
+	// Contiguity gate must hold the tail at index 2 because 3 is missing.
+	require.Eventually(t, func() bool {
+		return strings.Contains(s.CachedPlaylist(), "segment_2.m4s")
+	}, 2*time.Second, 10*time.Millisecond)
+
+	req := httptest.NewRequest(http.MethodGet, "/stream/1/media.m3u8", nil)
+	rec = httptest.NewRecorder()
+	streamRouter.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+	body := rec.Body.String()
+	assert.Contains(t, body, "segment_2.m4s")
+	assert.NotContains(t, body, "segment_4.m4s",
+		"contiguity gate must truncate before the gap at index 3")
+
+	// Fill the gap: index 3 arrives. Now the playlist extends to 4.
+	rec = postSegment(apiRouter, "1", "test-token", "3", "8000", "2000", []byte("seg"))
+	require.Equal(t, http.StatusCreated, rec.Code)
+
+	require.Eventually(t, func() bool {
+		return strings.Contains(s.CachedPlaylist(), "segment_4.m4s")
+	}, 2*time.Second, 10*time.Millisecond)
 }
 
 func TestE2E_StringStreamID(t *testing.T) {
