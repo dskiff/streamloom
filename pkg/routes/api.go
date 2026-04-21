@@ -560,11 +560,16 @@ func API(logger *slog.Logger, env config.Env, store *stream.Store, requestLogger
 			}
 
 			// When a viewer-token key is configured for this stream, wire a
-			// mint callback the renderer will use once per playlist render to
-			// bake a short-lived segment-class token into every emitted URI.
-			// Streams without a configured key receive no option and the
-			// renderer emits plain URIs (preserves public-playback parity
-			// with pre-viewer-token behavior).
+			// PlaylistTokenMinter the renderer will invoke per URI —
+			// InitToken once per render (hour-bucketed) and SegmentToken
+			// once per segment in the window (anchored to the segment's
+			// own timestamp). Per-URI minting with intrinsic anchors keeps
+			// a given segment's URL byte-identical across re-renders so
+			// HLS clients don't redundantly re-download segments they
+			// already have (RFC 8216 §6.2.2). Streams without a configured
+			// key receive no option and the renderer emits plain URIs
+			// (preserves public-playback parity with pre-viewer-token
+			// behavior).
 			var initOpts []stream.InitOption
 			if viewerKeys, ok := env.GetViewerKeys(streamID); ok {
 				minter := makePlaylistTokenMinter(viewerKeys.Segment, logger, streamID)
