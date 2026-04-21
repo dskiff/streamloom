@@ -159,9 +159,10 @@ func TestE2E_LookaheadLiveEdge(t *testing.T) {
 
 	// EXT-X-START anchors clients to the same live-edge across devices.
 	// TIME-OFFSET must mirror HOLD-BACK so the two server hints agree;
-	// PRECISE=YES eliminates segment-boundary snap jitter. End-of-tail PDT
-	// (≈ now + lookahead = 7.000s) minus |TIME-OFFSET| (6.000s) lands the
-	// active segment's PDT at ≈ wall clock (1.000s).
+	// PRECISE=YES eliminates segment-boundary snap jitter. Playlist end
+	// (tail PDT 6.000s + its duration 2.000s = 8.000s) minus |TIME-OFFSET|
+	// 6.000s lands the active-segment start at PDT 2.000s — within one
+	// target-duration of wall clock 1.000s.
 	assert.Contains(t, body, "#EXT-X-START:TIME-OFFSET=-6.000,PRECISE=YES\n")
 
 	// Tail PDT ≈ 1970-01-01T00:00:06.000Z (now + 6s).

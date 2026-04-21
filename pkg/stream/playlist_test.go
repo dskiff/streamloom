@@ -451,7 +451,7 @@ func TestRenderMediaPlaylist_StartOffset_PreciseAttr(t *testing.T) {
 	startLine := extractTagLine(t, playlist, "#EXT-X-START:")
 	assert.Contains(t, startLine, "PRECISE=YES")
 	assert.True(t, strings.HasPrefix(startLine, "#EXT-X-START:TIME-OFFSET=-"),
-		"TIME-OFFSET must be negative (from end of last segment); got %q", startLine)
+		"TIME-OFFSET must be negative (from the end of the Playlist); got %q", startLine)
 }
 
 // extractTagLine returns the single playlist line that begins with the

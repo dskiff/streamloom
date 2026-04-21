@@ -106,12 +106,13 @@ func (s *Stream) renderMediaPlaylist(nowMs int64, windowSize int) (string, int64
 	// AVPlayer, Shaka) anchor primarily on EXT-X-START:TIME-OFFSET and fall
 	// back to vendor heuristics when it is absent — which causes two devices
 	// joining at different times to pick different starting positions and
-	// drift. Tying TIME-OFFSET to holdBackSecs (negative, "from end of last
-	// segment" per RFC 8216 §4.4.5.2) makes the two server-emitted hints
-	// agree, and PRECISE=YES tells clients to start at exactly that offset
-	// rather than snap to a segment boundary. Combined with per-segment PDT
-	// and the look-ahead cap, this makes the actively-playing segment's PDT
-	// converge to wall clock across devices.
+	// drift. Tying TIME-OFFSET to holdBackSecs (negative, "from the end of
+	// the Playlist" per RFC 8216 §4.3.5.2 — i.e. last-segment PDT + its
+	// duration) makes the two server-emitted hints agree, and PRECISE=YES
+	// tells clients to start at exactly that offset rather than snap to a
+	// segment boundary. Combined with per-segment PDT and the look-ahead
+	// cap, this brings the actively-playing segment's PDT to within one
+	// target-duration of wall clock across devices.
 	b.WriteString("#EXT-X-START:TIME-OFFSET=-")
 	b.Write(strconv.AppendFloat(scratch[:0], holdBackSecs, 'f', 3, 64))
 	b.WriteString(",PRECISE=YES\n")
