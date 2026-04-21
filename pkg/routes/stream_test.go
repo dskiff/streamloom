@@ -184,9 +184,14 @@ func TestMediaPlaylist_WithSegments(t *testing.T) {
 	// Advance time so all segments are eligible.
 	clk.Set(time.UnixMilli(10000))
 
-	// Wait for renderer to populate the cached playlist.
+	// Wait for the LAST committed segment to appear in the cache.
+	// CommitSlot's notifyCh is a coalescing single-slot channel: if the
+	// renderer is mid-render when a follow-up commit fires, it may store
+	// a snapshot containing only the earliest segment. Polling just for
+	// `!= ""` returns true against that intermediate render, and the
+	// follow-up HTTP request races the next re-render.
 	require.Eventually(t, func() bool {
-		return s.CachedPlaylist() != ""
+		return strings.Contains(s.CachedPlaylist(), "segment_2.m4s")
 	}, 2*time.Second, 10*time.Millisecond)
 
 	req := httptest.NewRequest(http.MethodGet, "/stream/1/media.m3u8", nil)
@@ -229,8 +234,11 @@ func TestMediaPlaylist_WallClockFiltering(t *testing.T) {
 
 	clk.Set(time.UnixMilli(5000))
 
+	// Wait for the last eligible segment (seg2) to land in the cache —
+	// polling just `!= ""` would race the coalesced notifyCh and
+	// short-circuit on a render that only contains seg0.
 	require.Eventually(t, func() bool {
-		return s.CachedPlaylist() != ""
+		return strings.Contains(s.CachedPlaylist(), "segment_2.m4s")
 	}, 2*time.Second, 10*time.Millisecond)
 
 	req := httptest.NewRequest(http.MethodGet, "/stream/1/media.m3u8", nil)
