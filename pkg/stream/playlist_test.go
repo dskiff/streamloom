@@ -340,7 +340,8 @@ func TestRenderMediaPlaylist_HoldBackMatchesLookahead(t *testing.T) {
 
 // TestRenderMediaPlaylist_HoldBackClampedToSpecMinimum asserts HOLD-BACK
 // clamps up to 3 × target-duration when the configured look-ahead is below
-// the spec minimum (RFC 8216 §4.4.3.8 requires >= 3 × target-duration).
+// the spec minimum (draft-pantos-hls-rfc8216bis requires HOLD-BACK >=
+// 3 × Target Duration).
 func TestRenderMediaPlaylist_HoldBackClampedToSpecMinimum(t *testing.T) {
 	// target=4s, lookahead=0 → clamp to 12.000.
 	_, s := setupStreamForPlaylistWithLookahead(t, 4, 0)
@@ -503,6 +504,59 @@ func TestRenderMediaPlaylist_SingleGeneration_NoDiscontinuity(t *testing.T) {
 	assert.Contains(t, playlist, "#EXT-X-MAP:URI=\"init.mp4\"")
 	// No DISCONTINUITY-SEQUENCE header.
 	assert.NotContains(t, playlist, "#EXT-X-DISCONTINUITY-SEQUENCE")
+}
+
+// TestRunPlaylistRenderer_WakesAtCapCrossing asserts the renderer wakes when
+// the next pending segment crosses the look-ahead cap (ts - maxLookaheadMs),
+// not at the segment's raw timestamp. Without this, a batch of future
+// segments pushed once with no follow-up commits appears in the playlist
+// up to maxLookaheadMs late, because notifyCh — which otherwise masks a
+// too-long timer — doesn't fire.
+func TestRunPlaylistRenderer_WakesAtCapCrossing(t *testing.T) {
+	const lookaheadMs = 6000
+	clk := clock.NewMock(time.UnixMilli(0))
+	store := NewStore(clk)
+	meta := Metadata{
+		Bandwidth:          4000000,
+		Codecs:             "avc1.64001f",
+		Width:              1920,
+		Height:             1080,
+		FrameRate:          23.976,
+		TargetDurationSecs: 2,
+	}
+	require.NoError(t, store.Init("1", meta, []byte("init"), 20, testSegmentBytes, 10, 2, 12, lookaheadMs))
+	t.Cleanup(func() { store.Delete("1") })
+
+	s := store.Get("1")
+	require.NotNil(t, s)
+
+	// Push two segments: one within the cap at clock=0 (ts=4000, cap=6000),
+	// one beyond (ts=12000, cap-crossing at clock=6000).
+	buf, ok := s.AcquireSlot()
+	require.True(t, ok)
+	_, _ = buf.ReadFrom(bytes.NewReader([]byte("seg0")))
+	require.NoError(t, s.CommitSlot(0, buf, 4000, 2000, 0))
+
+	buf, ok = s.AcquireSlot()
+	require.True(t, ok)
+	_, _ = buf.ReadFrom(bytes.NewReader([]byte("seg1")))
+	require.NoError(t, s.CommitSlot(1, buf, 12000, 2000, 0))
+
+	// Wait for the first render (segment_0 visible, segment_1 past cap).
+	require.Eventually(t, func() bool {
+		p := s.CachedPlaylist()
+		return p != "" && strings.Contains(p, "segment_0.m4s") && !strings.Contains(p, "segment_1.m4s")
+	}, 2*time.Second, 10*time.Millisecond)
+
+	// Advance clock to exactly the cap-crossing time (12000 - 6000 = 6000).
+	// The renderer's timer should have been set for this moment, not for
+	// clock=12000. If it fires, segment_1 appears without any new commit
+	// to kick notifyCh.
+	clk.Set(time.UnixMilli(6000))
+
+	require.Eventually(t, func() bool {
+		return strings.Contains(s.CachedPlaylist(), "segment_1.m4s")
+	}, 2*time.Second, 10*time.Millisecond)
 }
 
 // --- Renderer notify tests ---

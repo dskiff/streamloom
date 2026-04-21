@@ -56,8 +56,8 @@ func (s *Stream) renderMediaPlaylist(nowMs int64, windowSize int) (string, int64
 	// Contiguity gate: truncate the window at the first index gap. Segments
 	// may arrive out of Index order (CommitSlot inserts by binary search), so
 	// a later index can land before an earlier one is committed. HLS (RFC
-	// 8216 §6.2.1) forbids mid-playlist insertions — a segment, once
-	// published, must keep its position. Publishing index 7 while 6 is still
+	// 8216 §6.2.1) requires a published segment to keep its position and
+	// URI; new entries append-only. Publishing index 7 while 6 is still
 	// missing and then inserting 6 later would violate that. We stop at the
 	// first gap so the tail stays where it is until the missing index
 	// arrives.
@@ -92,9 +92,11 @@ func (s *Stream) renderMediaPlaylist(nowMs int64, windowSize int) (string, int64
 	// intended live edge sits relative to the playlist tail. Without it,
 	// clients fall back to the "3 × target-duration" heuristic (RFC 8216
 	// §6.3.3), which fights the shifted tail and causes rebuffering. The
-	// spec requires HOLD-BACK to be at least 3 × target-duration, so clamp
-	// up — a smaller configured look-ahead still produces a spec-compliant
-	// playlist.
+	// tag is defined in draft-pantos-hls-rfc8216bis (LL-HLS), which
+	// requires "HOLD-BACK ... MUST be at least three times the Target
+	// Duration." Clamp up so a smaller configured look-ahead still
+	// produces a spec-compliant playlist. The tag requires
+	// EXT-X-VERSION >= 6; we already emit version 7 above.
 	holdBackSecs := float64(s.maxLookaheadMs) / 1000.0
 	if minHoldBack := 3.0 * float64(s.metadata.TargetDurationSecs); holdBackSecs < minHoldBack {
 		holdBackSecs = minHoldBack
@@ -164,8 +166,14 @@ func (s *Stream) runPlaylistRenderer(windowSize int) {
 		}
 
 		// Determine how long to sleep before the next segment becomes eligible.
+		// nextEligibleMs is the raw timestamp of the first segment past the
+		// look-ahead cap; that segment crosses the cap at
+		// nextEligibleMs - maxLookaheadMs. Sleeping until the raw timestamp
+		// instead of the crossing time would delay playlist visibility by
+		// maxLookaheadMs when no new commits arrive to wake the renderer via
+		// notifyCh (e.g. transcoder pushes a batch ahead of now and pauses).
 		if nextEligibleMs > 0 {
-			sleepMs := nextEligibleMs - s.clock.Now().UnixMilli()
+			sleepMs := nextEligibleMs - s.maxLookaheadMs - s.clock.Now().UnixMilli()
 			if sleepMs <= 0 {
 				// Next segment is already eligible — re-render after a short
 				// minimum interval to prevent busy-looping when many segments
