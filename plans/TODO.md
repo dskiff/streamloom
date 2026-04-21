@@ -34,6 +34,56 @@ All tasks below are **complete**. Kept here until the change lands on
       and revised scoping model.
 - [x] Pre-commit: `go fmt ./... && go vet ./... && go test ./... && gosec ./...`.
 
-## Open
+## Playlist live-edge look-ahead
 
-(none)
+See `plans/playlist-lookahead.md` for full context and design. Goal: move
+the playlist tail ahead of wall clock so PDT-sync'd clients don't fight
+the "3 segments behind end" heuristic, while bounding playlist size and
+preserving HLS's append-only invariant under out-of-order ingest.
+
+- [ ] Add `maxLookaheadMs` to `Stream` + `Store.Init` (threaded through
+      `pkg/stream/stream.go` and call sites). Default to
+      `3 × TargetDurationSecs × 1000` via a new
+      `DefaultMaxLookaheadMultiplier` in `pkg/config/const.go`. Update
+      test helpers to pass through.
+      *Validation: existing tests green; new unit test confirms the
+      default value on an Init with no override.*
+
+- [ ] Swap `renderMediaPlaylist` filter from `Timestamp > nowMs` to
+      `Timestamp > nowMs + maxLookaheadMs`. Update
+      `TestRenderMediaPlaylist_WallClockFiltering` and
+      `TestRenderMediaPlaylist_NextEligibleMs`. Add tests: future-PDT
+      segment within cap appears immediately; segment beyond cap does
+      not; `nextEligibleMs` reflects the shifted cutoff.
+      *Validation: stutter-repro scenario (tail PDT ≈ now + cap) in a
+      unit test.*
+
+- [ ] Add contiguity gate to `renderMediaPlaylist` (truncate at first
+      index gap within the window). Tests: `[0,1,2,4]` → playlist ends
+      at 2; after 4→3 arrival → extends to 4; gap entirely before the
+      window is a no-op.
+      *Validation: out-of-order commit test passes; append-only
+      invariant held across successive renders.*
+
+- [ ] Emit `EXT-X-SERVER-CONTROL:HOLD-BACK=<maxLookaheadSecs>` in the
+      playlist header. Update `playlist_test.go` header assertions.
+      *Validation: header present, value matches configured
+      `maxLookaheadMs`.*
+
+- [ ] Accept `X-SL-MAX-LOOKAHEAD-MS` on `/init` in `pkg/routes/api.go`.
+      Validate `>= TargetDurationMs` and `<= reasonable ceiling`. Thread
+      into `Store.Init`. Route tests for accept / reject / default.
+      *Validation: route tests cover bounds; README documents the
+      header alongside `X-SL-BACKWARD-BUFFER-SIZE`.*
+
+- [ ] End-to-end test in `pkg/routes/e2e_test.go`: push segments with
+      PDTs spanning several target durations into the future, poll
+      playlist, verify tail PDT ≈ `now + maxLookaheadMs`, verify
+      `HOLD-BACK` header, induce reordering and verify contiguity gate
+      holds.
+      *Validation: pre-commit gauntlet green
+      (`go fmt && go vet && go test && gosec`).*
+
+- [ ] (Optional / follow-up) Metric or log line when contiguity gate
+      truncates the window, to surface ingest reordering rather than
+      silently masking it.
