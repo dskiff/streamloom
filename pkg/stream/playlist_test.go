@@ -18,6 +18,14 @@ import (
 // them). Use renderMediaPlaylist with a custom nowMs for filtering.
 func setupStreamForPlaylist(t *testing.T, targetDurationSecs int) (*Store, *Stream) {
 	t.Helper()
+	return setupStreamForPlaylistWithLookahead(t, targetDurationSecs, testMaxLookaheadMs)
+}
+
+// setupStreamForPlaylistWithLookahead is like setupStreamForPlaylist but lets
+// the test pick the per-stream look-ahead cap. Used by tests that exercise
+// the playlist tail running ahead of wall clock.
+func setupStreamForPlaylistWithLookahead(t *testing.T, targetDurationSecs int, maxLookaheadMs int64) (*Store, *Stream) {
+	t.Helper()
 
 	clk := clock.NewMock(time.UnixMilli(0))
 
@@ -30,7 +38,7 @@ func setupStreamForPlaylist(t *testing.T, targetDurationSecs int) (*Store, *Stre
 		FrameRate:          23.976,
 		TargetDurationSecs: targetDurationSecs,
 	}
-	err := store.Init("1", meta, []byte("init"), 50, testSegmentBytes, 20, 5, 12)
+	err := store.Init("1", meta, []byte("init"), 50, testSegmentBytes, 20, 5, 12, maxLookaheadMs)
 	require.NoError(t, err)
 	s := store.Get("1")
 	require.NotNil(t, s)
@@ -184,7 +192,8 @@ func TestRenderMediaPlaylist_TimestampFormat(t *testing.T) {
 }
 
 func TestRenderMediaPlaylist_WallClockFiltering(t *testing.T) {
-	// Mix of past and future segments relative to nowMs=10000.
+	// Mix of past and future segments relative to nowMs=10000. Uses the
+	// zero-lookahead helper, so the cutoff collapses to nowMs.
 	_, s := setupStreamForPlaylist(t, 2)
 
 	mustCommitSlot(t, s, 0, []byte("d"), 2000, 2000)  // eligible
@@ -209,6 +218,9 @@ func TestRenderMediaPlaylist_WallClockFiltering(t *testing.T) {
 }
 
 func TestRenderMediaPlaylist_NextEligibleMs(t *testing.T) {
+	// Zero-lookahead baseline: nextEligibleMs is the timestamp of the
+	// first segment past nowMs. Shifted-cutoff behavior is covered by
+	// TestRenderMediaPlaylist_LookaheadExcludesBeyondCap.
 	_, s := setupStreamForPlaylist(t, 2)
 
 	mustCommitSlot(t, s, 0, []byte("d"), 1000, 2000)
@@ -221,6 +233,255 @@ func TestRenderMediaPlaylist_NextEligibleMs(t *testing.T) {
 
 	// Next segment not yet eligible is at 9000.
 	assert.Equal(t, int64(9000), nextMs)
+}
+
+// --- Look-ahead cap tests ---
+
+// TestRenderMediaPlaylist_LookaheadIncludesFuturePDT asserts that a segment
+// with PDT ahead of nowMs but within maxLookaheadMs appears in the playlist.
+func TestRenderMediaPlaylist_LookaheadIncludesFuturePDT(t *testing.T) {
+	// Target duration 2s, look-ahead 6s (3× multiplier).
+	_, s := setupStreamForPlaylistWithLookahead(t, 2, 6000)
+
+	mustCommitSlot(t, s, 0, []byte("d"), 2000, 2000)
+	mustCommitSlot(t, s, 1, []byte("d"), 4000, 2000)
+	mustCommitSlot(t, s, 2, []byte("d"), 6000, 2000)
+
+	// nowMs=1000, cap=1000+6000=7000. All three segments are within the cap.
+	s.mu.RLock()
+	playlist, nextMs := s.renderMediaPlaylist(1000, 12)
+	s.mu.RUnlock()
+
+	assert.Contains(t, playlist, "segment_0.m4s")
+	assert.Contains(t, playlist, "segment_1.m4s")
+	assert.Contains(t, playlist, "segment_2.m4s")
+	assert.Equal(t, int64(0), nextMs, "no segment past the cap")
+}
+
+// TestRenderMediaPlaylist_LookaheadExcludesBeyondCap asserts that a segment
+// whose PDT exceeds nowMs + maxLookaheadMs does not appear.
+func TestRenderMediaPlaylist_LookaheadExcludesBeyondCap(t *testing.T) {
+	_, s := setupStreamForPlaylistWithLookahead(t, 2, 6000)
+
+	mustCommitSlot(t, s, 0, []byte("d"), 2000, 2000)  // within cap
+	mustCommitSlot(t, s, 1, []byte("d"), 6000, 2000)  // within cap
+	mustCommitSlot(t, s, 2, []byte("d"), 10000, 2000) // beyond cap
+
+	// nowMs=1000, cap=7000. Segment 2 at ts=10000 is past the cap.
+	s.mu.RLock()
+	playlist, nextMs := s.renderMediaPlaylist(1000, 12)
+	s.mu.RUnlock()
+
+	assert.Contains(t, playlist, "segment_0.m4s")
+	assert.Contains(t, playlist, "segment_1.m4s")
+	assert.NotContains(t, playlist, "segment_2.m4s")
+	assert.Equal(t, int64(10000), nextMs, "first segment past cap")
+}
+
+// TestRenderMediaPlaylist_LookaheadTailTracksCap asserts the playlist tail
+// sits at roughly nowMs + maxLookaheadMs when the transcoder is running far
+// ahead — the stutter-repro configuration the feature exists to fix.
+func TestRenderMediaPlaylist_LookaheadTailTracksCap(t *testing.T) {
+	const durMs = 2000
+	_, s := setupStreamForPlaylistWithLookahead(t, 2, 6000)
+
+	// 50 segments covering 100 seconds, all ahead of wall clock.
+	for i := range uint32(50) {
+		mustCommitSlot(t, s, i, []byte("d"), int64(i)*durMs, durMs)
+	}
+
+	// nowMs=0, cap=6000. Eligible segments: indices 0..3 (ts 0, 2000, 4000, 6000).
+	s.mu.RLock()
+	playlist, nextMs := s.renderMediaPlaylist(0, 12)
+	s.mu.RUnlock()
+
+	assert.Contains(t, playlist, "segment_0.m4s")
+	assert.Contains(t, playlist, "segment_3.m4s")
+	assert.NotContains(t, playlist, "segment_4.m4s")
+	// Tail PDT ≈ now + maxLookaheadMs.
+	assert.Contains(t, playlist, "#EXT-X-PROGRAM-DATE-TIME:1970-01-01T00:00:06.000Z")
+	assert.Equal(t, int64(8000), nextMs, "first segment past the cap is index 4 at ts=8000")
+}
+
+// TestRenderMediaPlaylist_LookaheadZeroPinsAtWallClock confirms that a zero
+// look-ahead keeps the legacy "tail at wall clock" behavior.
+func TestRenderMediaPlaylist_LookaheadZeroPinsAtWallClock(t *testing.T) {
+	_, s := setupStreamForPlaylistWithLookahead(t, 2, 0)
+
+	mustCommitSlot(t, s, 0, []byte("d"), 2000, 2000) // eligible at now=4000
+	mustCommitSlot(t, s, 1, []byte("d"), 4000, 2000) // eligible (ts == now)
+	mustCommitSlot(t, s, 2, []byte("d"), 6000, 2000) // not eligible (future)
+
+	s.mu.RLock()
+	playlist, nextMs := s.renderMediaPlaylist(4000, 12)
+	s.mu.RUnlock()
+
+	assert.Contains(t, playlist, "segment_0.m4s")
+	assert.Contains(t, playlist, "segment_1.m4s")
+	assert.NotContains(t, playlist, "segment_2.m4s")
+	assert.Equal(t, int64(6000), nextMs)
+}
+
+// --- EXT-X-SERVER-CONTROL:HOLD-BACK tests ---
+
+// TestRenderMediaPlaylist_HoldBackMatchesLookahead asserts HOLD-BACK equals
+// the configured look-ahead cap in seconds (formatted to 3 decimal places).
+func TestRenderMediaPlaylist_HoldBackMatchesLookahead(t *testing.T) {
+	// target=2s, lookahead=6s. HOLD-BACK should be 6.000.
+	_, s := setupStreamForPlaylistWithLookahead(t, 2, 6000)
+	mustCommitSlot(t, s, 0, []byte("d"), 2000, 2000)
+
+	s.mu.RLock()
+	playlist, _ := s.renderMediaPlaylist(10000, 12)
+	s.mu.RUnlock()
+
+	assert.Contains(t, playlist, "#EXT-X-SERVER-CONTROL:HOLD-BACK=6.000\n")
+}
+
+// TestRenderMediaPlaylist_HoldBackClampedToSpecMinimum asserts HOLD-BACK
+// clamps up to 3 × target-duration when the configured look-ahead is below
+// the spec minimum (RFC 8216 §4.4.3.8 requires >= 3 × target-duration).
+func TestRenderMediaPlaylist_HoldBackClampedToSpecMinimum(t *testing.T) {
+	// target=4s, lookahead=0 → clamp to 12.000.
+	_, s := setupStreamForPlaylistWithLookahead(t, 4, 0)
+	mustCommitSlot(t, s, 0, []byte("d"), 2000, 4000)
+
+	s.mu.RLock()
+	playlist, _ := s.renderMediaPlaylist(10000, 12)
+	s.mu.RUnlock()
+
+	assert.Contains(t, playlist, "#EXT-X-SERVER-CONTROL:HOLD-BACK=12.000\n")
+}
+
+// TestRenderMediaPlaylist_HoldBackHeaderOrder asserts HOLD-BACK sits right
+// after EXT-X-INDEPENDENT-SEGMENTS and before EXT-X-TARGETDURATION.
+func TestRenderMediaPlaylist_HoldBackHeaderOrder(t *testing.T) {
+	_, s := setupStreamForPlaylistWithLookahead(t, 2, 6000)
+	mustCommitSlot(t, s, 0, []byte("d"), 2000, 2000)
+
+	s.mu.RLock()
+	playlist, _ := s.renderMediaPlaylist(10000, 12)
+	s.mu.RUnlock()
+
+	indep := strings.Index(playlist, "#EXT-X-INDEPENDENT-SEGMENTS")
+	sctrl := strings.Index(playlist, "#EXT-X-SERVER-CONTROL:")
+	target := strings.Index(playlist, "#EXT-X-TARGETDURATION:")
+	require.Greater(t, indep, -1)
+	require.Greater(t, sctrl, -1)
+	require.Greater(t, target, -1)
+	assert.Less(t, indep, sctrl)
+	assert.Less(t, sctrl, target)
+}
+
+// --- Contiguity gate tests ---
+
+// TestRenderMediaPlaylist_ContiguityGate_TruncatesAtFirstGap asserts that a
+// gap within the window truncates the playlist at the segment before the gap.
+// Scenario: indices [0,1,2,4] committed (index 3 still missing). The playlist
+// must end at index 2.
+func TestRenderMediaPlaylist_ContiguityGate_TruncatesAtFirstGap(t *testing.T) {
+	_, s := setupStreamForPlaylistWithLookahead(t, 2, 10000)
+
+	// Commit 0,1,2 in order, then 4. Index 3 is missing.
+	mustCommitSlot(t, s, 0, []byte("d"), 2000, 2000)
+	mustCommitSlot(t, s, 1, []byte("d"), 4000, 2000)
+	mustCommitSlot(t, s, 2, []byte("d"), 6000, 2000)
+	mustCommitSlot(t, s, 4, []byte("d"), 10000, 2000)
+
+	s.mu.RLock()
+	playlist, _ := s.renderMediaPlaylist(0, 12)
+	s.mu.RUnlock()
+
+	assert.Contains(t, playlist, "segment_0.m4s")
+	assert.Contains(t, playlist, "segment_1.m4s")
+	assert.Contains(t, playlist, "segment_2.m4s")
+	assert.NotContains(t, playlist, "segment_3.m4s")
+	assert.NotContains(t, playlist, "segment_4.m4s",
+		"contiguity gate must truncate before the gap even though index 4 is in the cap")
+}
+
+// TestRenderMediaPlaylist_ContiguityGate_ExtendsOnceGapFilled asserts the
+// playlist extends through previously-truncated segments as soon as the
+// missing index arrives — preserving HLS's append-only invariant.
+func TestRenderMediaPlaylist_ContiguityGate_ExtendsOnceGapFilled(t *testing.T) {
+	_, s := setupStreamForPlaylistWithLookahead(t, 2, 10000)
+
+	mustCommitSlot(t, s, 0, []byte("d"), 2000, 2000)
+	mustCommitSlot(t, s, 1, []byte("d"), 4000, 2000)
+	mustCommitSlot(t, s, 2, []byte("d"), 6000, 2000)
+	mustCommitSlot(t, s, 4, []byte("d"), 10000, 2000) // leapfrog
+
+	// Before: tail at index 2.
+	s.mu.RLock()
+	before, _ := s.renderMediaPlaylist(0, 12)
+	s.mu.RUnlock()
+	assert.NotContains(t, before, "segment_4.m4s")
+
+	// The missing index 3 arrives.
+	mustCommitSlot(t, s, 3, []byte("d"), 8000, 2000)
+
+	s.mu.RLock()
+	after, _ := s.renderMediaPlaylist(0, 12)
+	s.mu.RUnlock()
+	assert.Contains(t, after, "segment_3.m4s")
+	assert.Contains(t, after, "segment_4.m4s", "playlist extends through 4 once 3 fills the gap")
+}
+
+// TestRenderMediaPlaylist_ContiguityGate_GapBeforeWindowIsNoOp asserts that
+// a gap entirely before the sliding window (i.e. outside the published
+// segments) does not cause truncation. The window itself is contiguous.
+func TestRenderMediaPlaylist_ContiguityGate_GapBeforeWindowIsNoOp(t *testing.T) {
+	// windowSize=3; commit indices [0,1,3,4,5]. With windowSize=3 applied to
+	// eligible set [0,1,3,4,5] the window becomes [3,4,5] — contiguous.
+	_, s := setupStreamForPlaylistWithLookahead(t, 2, 20000)
+
+	mustCommitSlot(t, s, 0, []byte("d"), 2000, 2000)
+	mustCommitSlot(t, s, 1, []byte("d"), 4000, 2000)
+	// index 2 missing
+	mustCommitSlot(t, s, 3, []byte("d"), 8000, 2000)
+	mustCommitSlot(t, s, 4, []byte("d"), 10000, 2000)
+	mustCommitSlot(t, s, 5, []byte("d"), 12000, 2000)
+
+	s.mu.RLock()
+	playlist, _ := s.renderMediaPlaylist(0, 3)
+	s.mu.RUnlock()
+
+	assert.Contains(t, playlist, "segment_3.m4s")
+	assert.Contains(t, playlist, "segment_4.m4s")
+	assert.Contains(t, playlist, "segment_5.m4s")
+	// Segments 0,1 are outside the window; segment 2 is the pre-window gap.
+	assert.NotContains(t, playlist, "segment_0.m4s")
+	assert.NotContains(t, playlist, "segment_1.m4s")
+	assert.NotContains(t, playlist, "segment_2.m4s")
+}
+
+// TestRenderMediaPlaylist_ContiguityGate_OutOfOrderCommit asserts that
+// receiving segments out of index order (index 4 committed before 3) still
+// ends up with a correct, contiguous playlist after the missing index fills.
+func TestRenderMediaPlaylist_ContiguityGate_OutOfOrderCommit(t *testing.T) {
+	_, s := setupStreamForPlaylistWithLookahead(t, 2, 20000)
+
+	mustCommitSlot(t, s, 0, []byte("d"), 2000, 2000)
+	mustCommitSlot(t, s, 1, []byte("d"), 4000, 2000)
+	mustCommitSlot(t, s, 2, []byte("d"), 6000, 2000)
+	// Transcoder delivered 4 before 3.
+	mustCommitSlot(t, s, 4, []byte("d"), 10000, 2000)
+
+	s.mu.RLock()
+	playlist, _ := s.renderMediaPlaylist(0, 12)
+	s.mu.RUnlock()
+	assert.NotContains(t, playlist, "segment_4.m4s")
+
+	mustCommitSlot(t, s, 3, []byte("d"), 8000, 2000)
+
+	s.mu.RLock()
+	playlist, _ = s.renderMediaPlaylist(0, 12)
+	s.mu.RUnlock()
+	assert.Contains(t, playlist, "segment_0.m4s")
+	assert.Contains(t, playlist, "segment_1.m4s")
+	assert.Contains(t, playlist, "segment_2.m4s")
+	assert.Contains(t, playlist, "segment_3.m4s")
+	assert.Contains(t, playlist, "segment_4.m4s")
 }
 
 func TestRenderMediaPlaylist_SingleGeneration_NoDiscontinuity(t *testing.T) {
@@ -266,7 +527,7 @@ func TestRunPlaylistRenderer_NotifyDuringMinRenderInterval(t *testing.T) {
 		FrameRate:          23.976,
 		TargetDurationSecs: 2,
 	}
-	err := store.Init("1", meta, []byte("init"), 20, testSegmentBytes, 10, 2, 12)
+	err := store.Init("1", meta, []byte("init"), 20, testSegmentBytes, 10, 2, 12, testMaxLookaheadMs)
 	require.NoError(t, err)
 	t.Cleanup(func() { store.Delete("1") })
 
@@ -346,7 +607,7 @@ func TestRunPlaylistRenderer_NotifyRacesWithTimer(t *testing.T) {
 		FrameRate:          23.976,
 		TargetDurationSecs: 2,
 	}
-	err := store.Init("1", meta, []byte("init"), 20, testSegmentBytes, 10, 2, 12)
+	err := store.Init("1", meta, []byte("init"), 20, testSegmentBytes, 10, 2, 12, testMaxLookaheadMs)
 	require.NoError(t, err)
 	t.Cleanup(func() { store.Delete("1") })
 

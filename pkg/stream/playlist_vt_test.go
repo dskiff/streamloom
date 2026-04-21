@@ -27,7 +27,7 @@ func setupStreamWithMintToken(t *testing.T, mintFn func() string) *Stream {
 		FrameRate:          23.976,
 		TargetDurationSecs: 2,
 	}
-	err := store.Init("1", meta, []byte("init"), 50, testSegmentBytes, 20, 5, 12,
+	err := store.Init("1", meta, []byte("init"), 50, testSegmentBytes, 20, 5, 12, testMaxLookaheadMs,
 		WithMintToken(mintFn))
 	require.NoError(t, err)
 	s := store.Get("1")

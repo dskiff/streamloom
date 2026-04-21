@@ -26,6 +26,20 @@ const MP4_MIME_TYPE = "video/mp4"
 // sliding window.
 const DefaultMediaWindowSize = 12
 
+// DefaultMaxLookaheadMultiplier is the default multiplier applied to the
+// stream's target duration (in seconds) to derive the playlist look-ahead
+// cap in milliseconds: `maxLookaheadMs = multiplier * TargetDurationSecs *
+// 1000`. A value of 3 aligns the cap with HLS's "start at least three target
+// durations from the end" heuristic (RFC 8216 §6.3.3), so PDT-sync'd clients
+// don't fight the buffering target.
+const DefaultMaxLookaheadMultiplier = 3
+
+// MaxLookaheadCeilingMs is the upper bound accepted for a per-stream
+// `X-SL-MAX-LOOKAHEAD-MS` override. Values above this are rejected as likely
+// operator typos rather than intentional configuration. An hour is well
+// beyond any reasonable live-edge look-ahead window.
+const MaxLookaheadCeilingMs int64 = 60 * 60 * 1000
+
 // DefaultStreamPort is the default port for the public HLS stream server.
 const DefaultStreamPort = 8080
 

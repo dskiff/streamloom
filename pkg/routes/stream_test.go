@@ -210,7 +210,8 @@ func TestMediaPlaylist_WithSegments(t *testing.T) {
 }
 
 func TestMediaPlaylist_WallClockFiltering(t *testing.T) {
-	// Start at time 0 so all segment commits are accepted.
+	// initStream configures the default look-ahead (3 × target-duration =
+	// 6000ms at target=2s). Only segments with ts > now+6000 are filtered.
 	clk := clock.NewMock(time.UnixMilli(0))
 	router, store, _ := testStreamRouter(t, clk)
 	initStream(t, store, "1")
@@ -218,16 +219,14 @@ func TestMediaPlaylist_WallClockFiltering(t *testing.T) {
 	s := store.Get("1")
 	require.NotNil(t, s)
 
-	// Segments: 0 at t=1000, 1 at t=3000, 2 at t=5000, 3 at t=7000
 	commitSegment(t, s, 0, []byte("seg0"), 1000)
 	commitSegment(t, s, 1, []byte("seg1"), 3000)
 	commitSegment(t, s, 2, []byte("seg2"), 5000)
-	commitSegment(t, s, 3, []byte("seg3"), 7000)
+	// Beyond now+lookahead = 5000+6000 = 11000; must be excluded.
+	commitSegment(t, s, 3, []byte("seg3"), 15000)
 
-	// Advance time to 5000: segments 0,1,2 eligible, segment 3 is future.
 	clk.Set(time.UnixMilli(5000))
 
-	// Wait for renderer to populate.
 	require.Eventually(t, func() bool {
 		return s.CachedPlaylist() != ""
 	}, 2*time.Second, 10*time.Millisecond)
@@ -239,11 +238,10 @@ func TestMediaPlaylist_WallClockFiltering(t *testing.T) {
 	assert.Equal(t, http.StatusOK, rec.Code)
 	body := rec.Body.String()
 
-	// Past + at-now segments should be present.
 	assert.Contains(t, body, "segment_0.m4s")
 	assert.Contains(t, body, "segment_1.m4s")
 	assert.Contains(t, body, "segment_2.m4s")
-	// Future segment should NOT be present.
+	// Segment 3's timestamp is past now+lookahead and must not appear.
 	assert.NotContains(t, body, "segment_3.m4s")
 }
 
@@ -277,7 +275,9 @@ func TestMediaPlaylist_Returns503WhenStreamDeletedWhileWaiting(t *testing.T) {
 func TestMediaPlaylist_Returns503WhenPlaylistBecomesEmpty(t *testing.T) {
 	// Simulate the edge case where HasPlaylist was closed (playlist was once
 	// valid) but the cached playlist has since become "". This can happen
-	// when the mock clock moves backward so all segments become future.
+	// when the mock clock moves backward so all segments fall past the
+	// look-ahead cap. initStream uses the default 6000ms look-ahead at
+	// target=2s; segments must be > now+6000 in the future.
 	clk := clock.NewMock(time.UnixMilli(0))
 	router, store, _ := testStreamRouter(t, clk)
 	initStream(t, store, "1")
@@ -286,21 +286,20 @@ func TestMediaPlaylist_Returns503WhenPlaylistBecomesEmpty(t *testing.T) {
 	require.NotNil(t, s)
 
 	// Commit segments in the future and advance clock so they become eligible.
-	commitSegment(t, s, 0, []byte("seg0"), 2000)
-	commitSegment(t, s, 1, []byte("seg1"), 4000)
-	clk.Set(time.UnixMilli(5000))
+	commitSegment(t, s, 0, []byte("seg0"), 12000)
+	commitSegment(t, s, 1, []byte("seg1"), 14000)
+	clk.Set(time.UnixMilli(10000))
 
 	require.Eventually(t, func() bool {
 		return s.CachedPlaylist() != ""
 	}, 2*time.Second, 10*time.Millisecond)
 
-	// Move the clock backward so all segments are now in the future.
-	// The renderer will re-render and produce an empty playlist while
-	// hasPlaylist remains closed.
+	// Move the clock backward so every segment is past the look-ahead cap
+	// (cap = 0 + 6000 = 6000, all segments ts >= 12000).
 	clk.Set(time.UnixMilli(0))
 
-	// Poke the renderer to re-render by committing a future segment.
-	commitSegment(t, s, 2, []byte("seg2"), 6000)
+	// Poke the renderer to re-render by committing another far-future segment.
+	commitSegment(t, s, 2, []byte("seg2"), 16000)
 
 	require.Eventually(t, func() bool {
 		return s.CachedPlaylist() == ""

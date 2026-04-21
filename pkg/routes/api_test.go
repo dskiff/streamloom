@@ -210,6 +210,89 @@ func TestPostInit_MissingBackwardBufferSize(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
 }
 
+func TestPostInit_MaxLookaheadDefault(t *testing.T) {
+	// Header absent → default applies (3 × target-duration × 1000).
+	router, store, _, _ := testAPIRouterWithToken(t, clock.Real{})
+	t.Cleanup(func() { store.Delete("1") })
+
+	hdrs := initHeaders() // target-duration=2
+	rec := postInit(router, "1", "test-token", hdrs, []byte("init-data"))
+	require.Equal(t, http.StatusCreated, rec.Code)
+
+	s := store.Get("1")
+	require.NotNil(t, s)
+	// 3 × 2 × 1000 = 6000ms.
+	assert.Equal(t, int64(6000), s.MaxLookaheadMs())
+}
+
+func TestPostInit_MaxLookaheadOverride(t *testing.T) {
+	router, store, _, _ := testAPIRouterWithToken(t, clock.Real{})
+	t.Cleanup(func() { store.Delete("1") })
+
+	hdrs := initHeaders()
+	hdrs["X-SL-MAX-LOOKAHEAD-MS"] = "10000"
+	rec := postInit(router, "1", "test-token", hdrs, []byte("init-data"))
+	require.Equal(t, http.StatusCreated, rec.Code)
+
+	s := store.Get("1")
+	require.NotNil(t, s)
+	assert.Equal(t, int64(10000), s.MaxLookaheadMs())
+}
+
+func TestPostInit_MaxLookaheadZeroAccepted(t *testing.T) {
+	// Zero is the documented "pin tail at wall clock" configuration and must
+	// bypass the >= target-duration floor.
+	router, store, _, _ := testAPIRouterWithToken(t, clock.Real{})
+	t.Cleanup(func() { store.Delete("1") })
+
+	hdrs := initHeaders()
+	hdrs["X-SL-MAX-LOOKAHEAD-MS"] = "0"
+	rec := postInit(router, "1", "test-token", hdrs, []byte("init-data"))
+	require.Equal(t, http.StatusCreated, rec.Code)
+
+	s := store.Get("1")
+	require.NotNil(t, s)
+	assert.Equal(t, int64(0), s.MaxLookaheadMs())
+}
+
+func TestPostInit_MaxLookaheadNegativeRejected(t *testing.T) {
+	router, _, _, _ := testAPIRouterWithToken(t, clock.Real{})
+
+	hdrs := initHeaders()
+	hdrs["X-SL-MAX-LOOKAHEAD-MS"] = "-1"
+	rec := postInit(router, "1", "test-token", hdrs, []byte("init-data"))
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+func TestPostInit_MaxLookaheadUnparseableRejected(t *testing.T) {
+	router, _, _, _ := testAPIRouterWithToken(t, clock.Real{})
+
+	hdrs := initHeaders()
+	hdrs["X-SL-MAX-LOOKAHEAD-MS"] = "abc"
+	rec := postInit(router, "1", "test-token", hdrs, []byte("init-data"))
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+func TestPostInit_MaxLookaheadBelowTargetDurationRejected(t *testing.T) {
+	// Target duration is 2s = 2000ms; anything between 1 and 1999 fails the
+	// >= target-duration floor. Zero is a special case handled separately.
+	router, _, _, _ := testAPIRouterWithToken(t, clock.Real{})
+
+	hdrs := initHeaders()
+	hdrs["X-SL-MAX-LOOKAHEAD-MS"] = "1000"
+	rec := postInit(router, "1", "test-token", hdrs, []byte("init-data"))
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+func TestPostInit_MaxLookaheadAboveCeilingRejected(t *testing.T) {
+	router, _, _, _ := testAPIRouterWithToken(t, clock.Real{})
+
+	hdrs := initHeaders()
+	hdrs["X-SL-MAX-LOOKAHEAD-MS"] = strconv.FormatInt(config.MaxLookaheadCeilingMs+1, 10)
+	rec := postInit(router, "1", "test-token", hdrs, []byte("init-data"))
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
 func TestPostInit_ExceedsMaxBufferBytes(t *testing.T) {
 	// With STREAM_MAX_BUFFER_BYTES=1024 and (segmentCap + workingSpace) * segmentBytes
 	// far exceeding that, the request should be rejected.
