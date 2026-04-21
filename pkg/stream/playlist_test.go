@@ -374,6 +374,102 @@ func TestRenderMediaPlaylist_HoldBackHeaderOrder(t *testing.T) {
 	assert.Less(t, sctrl, target)
 }
 
+// --- EXT-X-START tests ---
+
+// TestRenderMediaPlaylist_StartOffset_MatchesHoldBack asserts the emitted
+// TIME-OFFSET is the negative of the HOLD-BACK value to three decimals,
+// with PRECISE=YES — so every compliant client anchors to the same point.
+func TestRenderMediaPlaylist_StartOffset_MatchesHoldBack(t *testing.T) {
+	// target=2s, lookahead=6s. HOLD-BACK=6.000, TIME-OFFSET=-6.000.
+	_, s := setupStreamForPlaylistWithLookahead(t, 2, 6000)
+	mustCommitSlot(t, s, 0, []byte("d"), 2000, 2000)
+
+	s.mu.RLock()
+	playlist, _ := s.renderMediaPlaylist(10000, 12)
+	s.mu.RUnlock()
+
+	assert.Contains(t, playlist, "#EXT-X-SERVER-CONTROL:HOLD-BACK=6.000\n")
+	assert.Contains(t, playlist, "#EXT-X-START:TIME-OFFSET=-6.000,PRECISE=YES\n")
+}
+
+// TestRenderMediaPlaylist_StartOffset_ClampedToSpecMinimum asserts the
+// TIME-OFFSET tracks HOLD-BACK's spec-minimum clamp (3 × target-duration)
+// when the configured look-ahead is smaller. The two server hints must
+// always agree — otherwise clients that obey one but not the other land
+// at different live-edge positions.
+func TestRenderMediaPlaylist_StartOffset_ClampedToSpecMinimum(t *testing.T) {
+	// target=4s, lookahead=0 → HOLD-BACK=12.000, TIME-OFFSET=-12.000.
+	_, s := setupStreamForPlaylistWithLookahead(t, 4, 0)
+	mustCommitSlot(t, s, 0, []byte("d"), 2000, 4000)
+
+	s.mu.RLock()
+	playlist, _ := s.renderMediaPlaylist(10000, 12)
+	s.mu.RUnlock()
+
+	assert.Contains(t, playlist, "#EXT-X-SERVER-CONTROL:HOLD-BACK=12.000\n")
+	assert.Contains(t, playlist, "#EXT-X-START:TIME-OFFSET=-12.000,PRECISE=YES\n")
+}
+
+// TestRenderMediaPlaylist_StartOffset_HeaderOrder asserts EXT-X-START sits
+// between EXT-X-SERVER-CONTROL and EXT-X-TARGETDURATION. RFC 8216 §4.4.5.2
+// places EXT-X-START at the playlist scope (before any Media Segment tags).
+func TestRenderMediaPlaylist_StartOffset_HeaderOrder(t *testing.T) {
+	_, s := setupStreamForPlaylistWithLookahead(t, 2, 6000)
+	mustCommitSlot(t, s, 0, []byte("d"), 2000, 2000)
+
+	s.mu.RLock()
+	playlist, _ := s.renderMediaPlaylist(10000, 12)
+	s.mu.RUnlock()
+
+	sctrl := strings.Index(playlist, "#EXT-X-SERVER-CONTROL:")
+	start := strings.Index(playlist, "#EXT-X-START:")
+	target := strings.Index(playlist, "#EXT-X-TARGETDURATION:")
+	pdt := strings.Index(playlist, "#EXT-X-PROGRAM-DATE-TIME:")
+	require.Greater(t, sctrl, -1)
+	require.Greater(t, start, -1)
+	require.Greater(t, target, -1)
+	require.Greater(t, pdt, -1)
+	assert.Less(t, sctrl, start, "EXT-X-START must follow EXT-X-SERVER-CONTROL")
+	assert.Less(t, start, target, "EXT-X-START must precede EXT-X-TARGETDURATION")
+	assert.Less(t, start, pdt, "EXT-X-START must precede the per-segment PDT block")
+}
+
+// TestRenderMediaPlaylist_StartOffset_PreciseAttr guards against accidental
+// removal of the PRECISE=YES attribute. Without it, clients are free to
+// snap to the nearest segment boundary (RFC 8216 §4.4.5.2), which adds up
+// to one segment-duration of jitter between devices.
+func TestRenderMediaPlaylist_StartOffset_PreciseAttr(t *testing.T) {
+	_, s := setupStreamForPlaylistWithLookahead(t, 2, 6000)
+	mustCommitSlot(t, s, 0, []byte("d"), 2000, 2000)
+
+	s.mu.RLock()
+	playlist, _ := s.renderMediaPlaylist(10000, 12)
+	s.mu.RUnlock()
+
+	require.Equal(t, 1, strings.Count(playlist, "#EXT-X-START:"),
+		"exactly one EXT-X-START tag")
+	startLine := extractTagLine(t, playlist, "#EXT-X-START:")
+	assert.Contains(t, startLine, "PRECISE=YES")
+	assert.True(t, strings.HasPrefix(startLine, "#EXT-X-START:TIME-OFFSET=-"),
+		"TIME-OFFSET must be negative (from end of last segment); got %q", startLine)
+}
+
+// extractTagLine returns the single playlist line that begins with the
+// given tag prefix. Fails the test if zero or more than one match.
+func extractTagLine(t *testing.T, playlist, tagPrefix string) string {
+	t.Helper()
+	var found string
+	count := 0
+	for _, line := range strings.Split(playlist, "\n") {
+		if strings.HasPrefix(line, tagPrefix) {
+			found = line
+			count++
+		}
+	}
+	require.Equal(t, 1, count, "expected exactly one line starting with %q", tagPrefix)
+	return found
+}
+
 // --- Contiguity gate tests ---
 
 // TestRenderMediaPlaylist_ContiguityGate_TruncatesAtFirstGap asserts that a

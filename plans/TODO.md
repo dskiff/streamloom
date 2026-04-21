@@ -83,3 +83,25 @@ preserving HLS's append-only invariant under out-of-order ingest.
 - [ ] (Optional / follow-up) Metric or log line when the contiguity
       gate truncates the window, to surface ingest reordering rather
       than silently masking it.
+
+## Cross-device player synchronization
+
+Goal: two viewers on separate devices joining at different times should see
+the same content at the same wall-clock instant, with the active segment's
+PDT close to wall time.
+
+- [x] Emit `#EXT-X-START:TIME-OFFSET=-<holdBackSecs>,PRECISE=YES` after
+      `EXT-X-SERVER-CONTROL`, before `EXT-X-TARGETDURATION`. TIME-OFFSET is
+      tied to the existing `holdBackSecs` (clamped min `3 × target-
+      duration`) so the two server hints always agree. `PRECISE=YES`
+      eliminates segment-boundary snap jitter (RFC 8216 §4.4.5.2). New
+      tests: `TestRenderMediaPlaylist_StartOffset_{MatchesHoldBack,
+      ClampedToSpecMinimum, HeaderOrder, PreciseAttr}`. E2E coverage
+      extended in `TestE2E_LookaheadLiveEdge`.
+
+- [ ] (Future, larger effort) Low-Latency HLS: emit `EXT-X-PART-INF`,
+      per-part `EXT-X-PART`, `CAN-BLOCK-RELOAD=YES`, `PART-HOLD-BACK`,
+      and support `_HLS_msn` / `_HLS_part` blocking playlist reload.
+      Required for sub-second cross-device drift; spans ingest, storage,
+      renderer, and routes. Out of scope until PDT-anchor + hold-back
+      convergence proves insufficient in the field.
