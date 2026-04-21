@@ -11,31 +11,114 @@ import (
 // Prevents busy-looping when many segments have past timestamps.
 const minRenderInterval = 50 * time.Millisecond
 
-// renderMediaPlaylist builds the HLS media playlist string from the current
-// in-memory segments. Eligibility is bounded by the per-stream look-ahead
-// cap: a segment is eligible iff its Timestamp <= nowMs + s.maxLookaheadMs.
-// A sliding window of at most windowSize segments is then applied to the
-// tail of the eligible set. Publishing beyond wall clock lets PDT-sync'd
-// clients (RFC 8216 §6.3.3) align their start position with the buffering
-// heuristic instead of chasing two conflicting anchors.
+// PlaylistSnapshot is the renderer's cached output for one published window.
+// The body is stored split around the EXT-X-START line: the handler
+// synthesizes that single line per request from the current wall clock so
+// TIME-OFFSET stays anchored to now (not to the last commit). Everything
+// else — PDTs, segment URIs, MEDIA-SEQUENCE, HOLD-BACK — is baked into
+// Prefix/Suffix at render time and reused verbatim until the next commit.
 //
-// When s.mintToken is set, the renderer calls InitToken(nowMs) once and
-// SegmentToken(seg.Timestamp) per segment, and bakes each returned token
-// into its own URI as "?vt=<token>". Per-URI minting (rather than one
-// token shared across the playlist) lets implementations return tokens
-// that are a pure function of the URI's identity, so a segment's URL is
-// byte-identical across renders — required by HLS clients (RFC 8216
-// §6.2.2). An empty return degrades that single URI to bare; the
-// middleware then 401s the fetch (fail-closed). The base64url alphabet
-// produced by viewer.Mint is already URL-safe, so no escaping is required
-// at render time.
+// A nil *PlaylistSnapshot means "no eligible segments yet"; the handler
+// treats that the same as the pre-live-edge case and returns 503.
 //
-// Returns (playlist, nextEligibleMs) where nextEligibleMs is the timestamp
-// of the first segment beyond the look-ahead cap (0 if no such segment
-// exists). Returns ("", nextEligibleMs) when no segments are eligible.
+// Instances are shared immutably between the renderer goroutine and any
+// number of concurrent handler goroutines via an atomic pointer swap.
+// Callers must treat every field as read-only: a single in-place mutation
+// would race with every in-flight StartLine / Assemble call. The fields
+// are exported only to keep the HTTP handler allocation-free; prefer the
+// StartLine, Assemble, and CachedPlaylistSnapshot entry points in code
+// outside this package.
+type PlaylistSnapshot struct {
+	// Prefix is the playlist bytes from "#EXTM3U" through the trailing
+	// "\n" of the EXT-X-SERVER-CONTROL line (the line immediately
+	// preceding EXT-X-START).
+	Prefix string
+	// Suffix is the playlist bytes from EXT-X-TARGETDURATION through the
+	// last segment line (inclusive of its trailing "\n").
+	Suffix string
+
+	// EndMs is the PDT of the end of the last segment in the published
+	// window (Timestamp + DurationMs). StartLine uses it to compute how
+	// stale the cached body is relative to the request's wall clock.
+	EndMs int64
+
+	// HoldBackSecs is the intended client latency target in seconds —
+	// the value emitted as EXT-X-SERVER-CONTROL:HOLD-BACK and also the
+	// baseline magnitude of TIME-OFFSET when the cache is fresh.
+	HoldBackSecs float64
+	// MinHoldBackSecs is the spec floor (3 × target-duration) that
+	// TIME-OFFSET must not fall below; going tighter would advertise a
+	// shorter latency than the HOLD-BACK header promises.
+	MinHoldBackSecs float64
+}
+
+// StartLine formats the EXT-X-START tag for a request arriving at nowMs.
+// The offset magnitude shrinks by the amount of wall-clock time that has
+// passed since EndMs, which cancels the same amount of drift at the
+// client's start position. It is clamped from below at MinHoldBackSecs
+// so we never advertise a tighter latency than the HOLD-BACK header
+// promises.
+//
+// The shrink only produces a visible change when HoldBackSecs is strictly
+// greater than MinHoldBackSecs. At the default configuration
+// (maxLookaheadMs = 3 × targetDuration × 1000) the two are equal, the
+// clamp fires on any positive staleness, and the emitted offset is
+// always -HoldBackSecs — identical to the pre-split static behavior.
+// Operators who want cross-device convergence within a target-duration
+// must configure a larger X-SL-MAX-LOOKAHEAD-MS.
+//
+// Safe to call on a nil receiver (returns ""), mirroring Assemble.
+func (snap *PlaylistSnapshot) StartLine(nowMs int64) string {
+	if snap == nil {
+		return ""
+	}
+	staleSecs := float64(nowMs-snap.EndMs) / 1000.0
+	if staleSecs < 0 {
+		staleSecs = 0
+	}
+	offsetSecs := snap.HoldBackSecs - staleSecs
+	if offsetSecs < snap.MinHoldBackSecs {
+		offsetSecs = snap.MinHoldBackSecs
+	}
+
+	var b strings.Builder
+	var scratch [64]byte
+	b.Grow(48)
+	b.WriteString("#EXT-X-START:TIME-OFFSET=-")
+	b.Write(strconv.AppendFloat(scratch[:0], offsetSecs, 'f', 3, 64))
+	b.WriteString(",PRECISE=YES\n")
+	return b.String()
+}
+
+// Assemble returns the full playlist string for nowMs. Allocates the
+// concatenated body; the HTTP handler avoids this by writing Prefix,
+// StartLine(nowMs), and Suffix directly to the response.
+func (snap *PlaylistSnapshot) Assemble(nowMs int64) string {
+	if snap == nil {
+		return ""
+	}
+	startLine := snap.StartLine(nowMs)
+	var b strings.Builder
+	b.Grow(len(snap.Prefix) + len(startLine) + len(snap.Suffix))
+	b.WriteString(snap.Prefix)
+	b.WriteString(startLine)
+	b.WriteString(snap.Suffix)
+	return b.String()
+}
+
+// renderPlaylistCache builds a PlaylistSnapshot from the current in-memory
+// segments. Eligibility, sliding window, and contiguity rules match the
+// previous single-string renderer; the only shape change is that the
+// EXT-X-START line is omitted from the body and its ingredients
+// (EndMs, HoldBackSecs, MinHoldBackSecs) are captured on the snapshot
+// for per-request synthesis in StartLine.
+//
+// Returns (snapshot, nextEligibleMs). snapshot is nil when no segments are
+// eligible; nextEligibleMs is the timestamp of the first segment beyond
+// the look-ahead cap (0 if no such segment exists).
 //
 // Must be called with s.mu.RLock held.
-func (s *Stream) renderMediaPlaylist(nowMs int64, windowSize int) (string, int64) {
+func (s *Stream) renderPlaylistCache(nowMs int64, windowSize int) (*PlaylistSnapshot, int64) {
 	// Binary search: find the first segment past the look-ahead cap. All
 	// segments before that index are eligible. nowMs + maxLookaheadMs can
 	// exceed nowMs by up to an hour (per MaxLookaheadCeilingMs) but cannot
@@ -51,7 +134,7 @@ func (s *Stream) renderMediaPlaylist(nowMs int64, windowSize int) (string, int64
 	}
 
 	if eligible == 0 {
-		return "", nextEligibleMs
+		return nil, nextEligibleMs
 	}
 
 	// Apply sliding window: take the last windowSize eligible segments.
@@ -73,6 +156,19 @@ func (s *Stream) renderMediaPlaylist(nowMs int64, windowSize int) (string, int64
 		}
 	}
 
+	// HOLD-BACK, and the EXT-X-START magnitude when the snapshot is fresh.
+	// Clamp up so a smaller configured look-ahead still produces a
+	// spec-compliant playlist (draft-pantos-hls-rfc8216bis: HOLD-BACK MUST
+	// be at least 3 × target-duration).
+	holdBackSecs := float64(s.maxLookaheadMs) / 1000.0
+	minHoldBackSecs := 3.0 * float64(s.metadata.TargetDurationSecs)
+	if holdBackSecs < minHoldBackSecs {
+		holdBackSecs = minHoldBackSecs
+	}
+
+	last := window[len(window)-1]
+	endMs := last.Timestamp + int64(last.DurationMs)
+
 	var b strings.Builder
 	var scratch [64]byte
 
@@ -87,35 +183,16 @@ func (s *Stream) renderMediaPlaylist(nowMs int64, windowSize int) (string, int64
 	// EXT-X-SERVER-CONTROL:HOLD-BACK tells PDT-sync'd clients where the
 	// intended live edge sits relative to the playlist tail. Without it,
 	// clients fall back to the "3 × target-duration" heuristic (RFC 8216
-	// §6.3.3), which fights the shifted tail and causes rebuffering. The
-	// tag is defined in draft-pantos-hls-rfc8216bis (LL-HLS), which
-	// requires "HOLD-BACK ... MUST be at least three times the Target
-	// Duration." Clamp up so a smaller configured look-ahead still
-	// produces a spec-compliant playlist. The tag requires
-	// EXT-X-VERSION >= 6; we already emit version 7 above.
-	holdBackSecs := float64(s.maxLookaheadMs) / 1000.0
-	if minHoldBack := 3.0 * float64(s.metadata.TargetDurationSecs); holdBackSecs < minHoldBack {
-		holdBackSecs = minHoldBack
-	}
+	// §6.3.3), which fights the shifted tail and causes rebuffering.
 	b.WriteString("#EXT-X-SERVER-CONTROL:HOLD-BACK=")
 	b.Write(strconv.AppendFloat(scratch[:0], holdBackSecs, 'f', 3, 64))
 	b.WriteByte('\n')
 
-	// EXT-X-START anchors every compatible client to the same live-edge
-	// position. HOLD-BACK is only a hint; many players (hls.js, ExoPlayer,
-	// AVPlayer, Shaka) anchor primarily on EXT-X-START:TIME-OFFSET and fall
-	// back to vendor heuristics when it is absent — which causes two devices
-	// joining at different times to pick different starting positions and
-	// drift. Tying TIME-OFFSET to holdBackSecs (negative, "from the end of
-	// the Playlist" per RFC 8216 §4.3.5.2 — i.e. last-segment PDT + its
-	// duration) makes the two server-emitted hints agree, and PRECISE=YES
-	// tells clients to start at exactly that offset rather than snap to a
-	// segment boundary. Combined with per-segment PDT and the look-ahead
-	// cap, this brings the actively-playing segment's PDT to within one
-	// target-duration of wall clock across devices.
-	b.WriteString("#EXT-X-START:TIME-OFFSET=-")
-	b.Write(strconv.AppendFloat(scratch[:0], holdBackSecs, 'f', 3, 64))
-	b.WriteString(",PRECISE=YES\n")
+	// The EXT-X-START line itself is intentionally omitted from the cache
+	// body. Snap the byte offset here: Prefix is everything written so far;
+	// Suffix starts at whatever we write next. The handler synthesizes
+	// the missing line from the current wall clock per request.
+	splitAt := b.Len()
 
 	b.WriteString("#EXT-X-TARGETDURATION:")
 	b.Write(strconv.AppendInt(scratch[:0], int64(s.metadata.TargetDurationSecs), 10))
@@ -156,8 +233,29 @@ func (s *Stream) renderMediaPlaylist(nowMs int64, windowSize int) (string, int64
 		b.WriteByte('\n')
 	}
 
-	result := b.String()
-	return result, nextEligibleMs
+	full := b.String()
+	return &PlaylistSnapshot{
+		Prefix:          full[:splitAt],
+		Suffix:          full[splitAt:],
+		EndMs:           endMs,
+		HoldBackSecs:    holdBackSecs,
+		MinHoldBackSecs: minHoldBackSecs,
+	}, nextEligibleMs
+}
+
+// renderMediaPlaylist is a test and back-compat wrapper around
+// renderPlaylistCache. It assembles the snapshot at the same nowMs used
+// for rendering, reproducing the "fresh cache" output (TIME-OFFSET ==
+// -HoldBackSecs) that the pre-split renderer produced. Returns "" when
+// no segments are eligible.
+//
+// Must be called with s.mu.RLock held.
+func (s *Stream) renderMediaPlaylist(nowMs int64, windowSize int) (string, int64) {
+	snap, nextEligibleMs := s.renderPlaylistCache(nowMs, windowSize)
+	if snap == nil {
+		return "", nextEligibleMs
+	}
+	return snap.Assemble(nowMs), nextEligibleMs
 }
 
 // runPlaylistRenderer is the background goroutine that maintains the cached
@@ -177,13 +275,12 @@ func (s *Stream) runPlaylistRenderer(windowSize int) {
 		nowMs := s.clock.Now().UnixMilli()
 
 		s.mu.RLock()
-		playlist, nextEligibleMs := s.renderMediaPlaylist(nowMs, windowSize)
+		snap, nextEligibleMs := s.renderPlaylistCache(nowMs, windowSize)
 		s.mu.RUnlock()
 
-		p := playlist // allocate a distinct string per iteration for the atomic pointer
-		s.cachedPlaylist.Store(&p)
+		s.cachedPlaylist.Store(snap)
 
-		if playlist != "" {
+		if snap != nil {
 			s.hasPlaylistOnce.Do(func() { close(s.hasPlaylist) })
 		}
 

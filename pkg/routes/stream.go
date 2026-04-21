@@ -120,23 +120,48 @@ func mediaPlaylistHandler(logger *slog.Logger, store *stream.Store) http.Handler
 			return
 		}
 
-		playlist := s.CachedPlaylist()
-		if playlist == "" {
+		snap := s.CachedPlaylistSnapshot()
+		if snap == nil {
 			// All segments were evicted between the HasPlaylist gate
 			// and now.  Tell the player to retry rather than serving
 			// an empty body.
 			writeStreamUnavailable(w)
 			return
 		}
-		// The playlist is served verbatim. The renderer has already
-		// baked a short-lived, playlist-scoped viewer token into every
-		// emitted URI (or left URIs unadorned when no key is configured
-		// for the stream), so no per-request substitution is needed.
+		// Prefix and Suffix were baked at render time (with viewer
+		// tokens already embedded in segment URIs). StartLine is
+		// synthesized here from the current wall clock so TIME-OFFSET
+		// stays anchored to "now" instead of drifting away from the
+		// last commit — every viewer joining between commits gets the
+		// same absolute content start time.
+		nowMs := store.Clock().Now().UnixMilli()
+		startLine := snap.StartLine(nowMs)
+		total := len(snap.Prefix) + len(startLine) + len(snap.Suffix)
+
 		w.Header().Set("Content-Type", config.M3U8_MIME_TYPE)
 		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("Content-Length", strconv.Itoa(len(playlist)))
-		if _, err := io.WriteString(w, playlist); err != nil { // #nosec G705 -- playlist contains only numeric data from internal state, not user input
+		w.Header().Set("Content-Length", strconv.Itoa(total))
+		// #nosec G705 -- server-generated playlist body: HLS tags and
+		// numeric fields built in pkg/stream/playlist.go, segment URIs
+		// of the form "segment_<uint32>.m4s", and optional viewer
+		// tokens minted server-side (base64url of an HMAC over fixed
+		// server-controlled fields, see pkg/viewer/viewer.go). No path
+		// carries user-supplied request data into this body.
+		if _, err := io.WriteString(w, snap.Prefix); err != nil {
 			logger.Error("failed to write response", "error", err)
+			return
+		}
+		// #nosec G705 -- formatted from server-derived floats
+		// (TIME-OFFSET) via strconv.AppendFloat with a fixed "%.3f"
+		// layout; see PlaylistSnapshot.StartLine.
+		if _, err := io.WriteString(w, startLine); err != nil {
+			logger.Error("failed to write response", "error", err)
+			return
+		}
+		// #nosec G705 -- see Prefix justification; same renderer output.
+		if _, err := io.WriteString(w, snap.Suffix); err != nil {
+			logger.Error("failed to write response", "error", err)
+			return
 		}
 	}
 }

@@ -454,6 +454,131 @@ func TestRenderMediaPlaylist_StartOffset_PreciseAttr(t *testing.T) {
 		"TIME-OFFSET must be negative (from the end of the Playlist); got %q", startLine)
 }
 
+// --- PlaylistSnapshot (dynamic TIME-OFFSET) tests ---
+
+// TestPlaylistSnapshot_PrefixExcludesStartLine asserts the cached body is
+// split around EXT-X-START: neither Prefix nor Suffix contains that line.
+// The handler synthesizes it per request — baking it into the cache would
+// re-introduce the between-commit drift this feature exists to fix.
+func TestPlaylistSnapshot_PrefixExcludesStartLine(t *testing.T) {
+	_, s := setupStreamForPlaylistWithLookahead(t, 2, 6000)
+	mustCommitSlot(t, s, 0, []byte("d"), 2000, 2000)
+
+	s.mu.RLock()
+	snap, _ := s.renderPlaylistCache(10000, 12)
+	s.mu.RUnlock()
+
+	require.NotNil(t, snap)
+	assert.NotContains(t, snap.Prefix, "#EXT-X-START:", "EXT-X-START must not be in Prefix")
+	assert.NotContains(t, snap.Suffix, "#EXT-X-START:", "EXT-X-START must not be in Suffix")
+	// Prefix terminates right after HOLD-BACK, suffix begins at TARGETDURATION.
+	assert.True(t, strings.HasSuffix(snap.Prefix, "\n"), "Prefix ends at line boundary")
+	assert.Contains(t, snap.Prefix, "#EXT-X-SERVER-CONTROL:HOLD-BACK=")
+	assert.True(t, strings.HasPrefix(snap.Suffix, "#EXT-X-TARGETDURATION:"),
+		"Suffix starts at EXT-X-TARGETDURATION; got %q", snap.Suffix[:min(80, len(snap.Suffix))])
+}
+
+// TestPlaylistSnapshot_StartLineFresh asserts that when the request arrives
+// at EndMs (no staleness), TIME-OFFSET equals -HoldBackSecs — matching the
+// pre-split renderer's output exactly.
+func TestPlaylistSnapshot_StartLineFresh(t *testing.T) {
+	_, s := setupStreamForPlaylistWithLookahead(t, 2, 6000)
+	mustCommitSlot(t, s, 0, []byte("d"), 2000, 2000) // endMs = 4000
+
+	s.mu.RLock()
+	snap, _ := s.renderPlaylistCache(10000, 12)
+	s.mu.RUnlock()
+
+	require.NotNil(t, snap)
+	assert.Equal(t, int64(4000), snap.EndMs)
+	assert.Equal(t, 6.0, snap.HoldBackSecs)
+
+	// Fresh request: nowMs == EndMs → offset = -HoldBack.
+	assert.Equal(t, "#EXT-X-START:TIME-OFFSET=-6.000,PRECISE=YES\n",
+		snap.StartLine(snap.EndMs))
+}
+
+// TestPlaylistSnapshot_StartLineStaleShrinks asserts the offset magnitude
+// shrinks linearly with how far past EndMs the request arrives. Within one
+// target-duration the formula gives back-to-back viewers the same absolute
+// content start time instead of letting them drift by up to the cached-body
+// staleness.
+func TestPlaylistSnapshot_StartLineStaleShrinks(t *testing.T) {
+	// target=2s, lookahead=10s → HoldBack=10, MinHoldBack=6. Room to shrink
+	// without tripping the spec-minimum clamp.
+	_, s := setupStreamForPlaylistWithLookahead(t, 2, 10000)
+	mustCommitSlot(t, s, 0, []byte("d"), 2000, 2000) // endMs = 4000
+
+	s.mu.RLock()
+	snap, _ := s.renderPlaylistCache(4000, 12)
+	s.mu.RUnlock()
+	require.NotNil(t, snap)
+
+	// 1.5s stale → offset = 10 - 1.5 = 8.5.
+	assert.Equal(t, "#EXT-X-START:TIME-OFFSET=-8.500,PRECISE=YES\n",
+		snap.StartLine(snap.EndMs+1500))
+	// 3.0s stale → offset = 10 - 3 = 7.0.
+	assert.Equal(t, "#EXT-X-START:TIME-OFFSET=-7.000,PRECISE=YES\n",
+		snap.StartLine(snap.EndMs+3000))
+}
+
+// TestPlaylistSnapshot_StartLineClampedToMinHoldBack asserts that no matter
+// how stale the cache, TIME-OFFSET never exceeds the spec-minimum latency
+// HOLD-BACK advertises — otherwise the two server hints disagree and
+// PDT-sync'd clients pick the tighter one, reintroducing stutter.
+func TestPlaylistSnapshot_StartLineClampedToMinHoldBack(t *testing.T) {
+	_, s := setupStreamForPlaylistWithLookahead(t, 2, 10000)
+	mustCommitSlot(t, s, 0, []byte("d"), 2000, 2000) // endMs = 4000
+
+	s.mu.RLock()
+	snap, _ := s.renderPlaylistCache(4000, 12)
+	s.mu.RUnlock()
+	require.NotNil(t, snap)
+
+	// Very stale (100s past endMs) — would compute to -(10 - 100) = +90,
+	// but clamps at MinHoldBack=6.
+	assert.Equal(t, "#EXT-X-START:TIME-OFFSET=-6.000,PRECISE=YES\n",
+		snap.StartLine(snap.EndMs+100_000))
+}
+
+// TestPlaylistSnapshot_StartLineNowBeforeEndTreatedAsFresh asserts that a
+// request arriving before EndMs (e.g. the transcoder pushed ahead of wall
+// clock and the request came in between) does not give a bigger-than-fresh
+// offset. The staleSecs clamp at zero keeps the value at -HoldBack.
+func TestPlaylistSnapshot_StartLineNowBeforeEndTreatedAsFresh(t *testing.T) {
+	_, s := setupStreamForPlaylistWithLookahead(t, 2, 6000)
+	mustCommitSlot(t, s, 0, []byte("d"), 2000, 2000) // endMs = 4000
+
+	s.mu.RLock()
+	snap, _ := s.renderPlaylistCache(3000, 12)
+	s.mu.RUnlock()
+	require.NotNil(t, snap)
+
+	assert.Equal(t, "#EXT-X-START:TIME-OFFSET=-6.000,PRECISE=YES\n",
+		snap.StartLine(snap.EndMs-500))
+}
+
+// TestPlaylistSnapshot_AssembleEqualsRenderMediaPlaylist guarantees the
+// wrapper and the snapshot produce identical bytes when evaluated at the
+// same nowMs. Protects against subtle format drift between the internal
+// cache build and the wrapper callers (tests, CachedPlaylist()).
+func TestPlaylistSnapshot_AssembleEqualsRenderMediaPlaylist(t *testing.T) {
+	_, s := setupStreamForPlaylistWithLookahead(t, 2, 6000)
+	for i := range uint32(3) {
+		mustCommitSlot(t, s, i, []byte("d"), int64(i+1)*2000, 2000)
+	}
+
+	const nowMs = 20000
+
+	s.mu.RLock()
+	snap, _ := s.renderPlaylistCache(nowMs, 12)
+	body, _ := s.renderMediaPlaylist(nowMs, 12)
+	s.mu.RUnlock()
+
+	require.NotNil(t, snap)
+	assert.Equal(t, body, snap.Assemble(nowMs))
+}
+
 // extractTagLine returns the single playlist line that begins with the
 // given tag prefix. Fails the test if zero or more than one match.
 func extractTagLine(t *testing.T, playlist, tagPrefix string) string {

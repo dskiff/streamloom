@@ -177,6 +177,67 @@ func TestE2E_LookaheadLiveEdge(t *testing.T) {
 	assert.NotContains(t, body, "segment_4.m4s")
 }
 
+// TestE2E_StartOffsetTracksWallClock exercises the dynamic TIME-OFFSET
+// end-to-end: push segments via the API, fetch the playlist at EndMs, then
+// fetch it again 1.2s later without any new commit. The second response's
+// TIME-OFFSET must shrink by that 1.2s of staleness, so both responses
+// resolve to the same absolute start content time — the guarantee that
+// cross-device viewers don't drift within a target-duration window.
+func TestE2E_StartOffsetTracksWallClock(t *testing.T) {
+	clk := clock.NewMock(time.UnixMilli(0))
+	streamRouter, apiRouter, store, _ := testBothRoutersWithToken(t, clk)
+
+	// Target-duration=2s, default look-ahead=6s → HoldBack=6, MinHoldBack=6.
+	// With HoldBack at the floor there's no room to shrink, so override the
+	// look-ahead to 10s to exercise the staleness formula.
+	hdrs := initHeaders()
+	hdrs["X-SL-MAX-LOOKAHEAD-MS"] = "10000"
+	rec := postInit(apiRouter, "1", "test-token", hdrs, []byte("init-data"))
+	require.Equal(t, http.StatusCreated, rec.Code)
+	t.Cleanup(func() { store.Delete("1") })
+
+	s := store.Get("1")
+	require.NotNil(t, s)
+
+	// Push one segment ending at PDT=4000.
+	clk.Set(time.UnixMilli(1000))
+	rec = postSegment(apiRouter, "1", "test-token", "0", "2000", "2000", []byte("seg"))
+	require.Equal(t, http.StatusCreated, rec.Code)
+
+	require.Eventually(t, func() bool {
+		return strings.Contains(s.CachedPlaylist(), "segment_0.m4s")
+	}, 2*time.Second, 10*time.Millisecond)
+
+	const endMs = 4000
+
+	// Fetch at EndMs: fresh cache → TIME-OFFSET = -HoldBack = -10.000.
+	clk.Set(time.UnixMilli(endMs))
+	reqA := httptest.NewRequest(http.MethodGet, "/stream/1/media.m3u8", nil)
+	recA := httptest.NewRecorder()
+	streamRouter.ServeHTTP(recA, reqA)
+	require.Equal(t, http.StatusOK, recA.Code)
+	offA := extractStartOffsetSecs(t, recA.Body.String())
+	assert.InDelta(t, 10.0, offA, 0.001)
+
+	// 1200ms later, no new commit: TIME-OFFSET shrinks by 1.2 to -8.800.
+	clk.Set(time.UnixMilli(endMs + 1200))
+	reqB := httptest.NewRequest(http.MethodGet, "/stream/1/media.m3u8", nil)
+	recB := httptest.NewRecorder()
+	streamRouter.ServeHTTP(recB, reqB)
+	require.Equal(t, http.StatusOK, recB.Code)
+	offB := extractStartOffsetSecs(t, recB.Body.String())
+	assert.InDelta(t, 8.8, offB, 0.001)
+
+	// Drift-cancellation invariant: at any shared wall time, both viewers
+	// are at the same content PDT. A's content position at wallB equals
+	// startA + (wallB − wallA), which must equal B's startB. Equivalently,
+	// startB − startA == wallB − wallA = 1200ms.
+	startA := int64(endMs) - int64(offA*1000)
+	startB := int64(endMs) - int64(offB*1000)
+	assert.InDelta(t, 1200, startB-startA, 1,
+		"staggered viewers diverge in content start by exactly their wall-clock gap; got %d", startB-startA)
+}
+
 func TestE2E_LookaheadContiguityUnderReordering(t *testing.T) {
 	clk := clock.NewMock(time.UnixMilli(0))
 	streamRouter, apiRouter, store, _ := testBothRoutersWithToken(t, clk)
