@@ -376,11 +376,14 @@ func TestRenderMediaPlaylist_HoldBackHeaderOrder(t *testing.T) {
 
 // --- EXT-X-START tests ---
 
-// TestRenderMediaPlaylist_StartOffset_MatchesHoldBack asserts the emitted
-// TIME-OFFSET is the negative of the HOLD-BACK value to three decimals,
-// with PRECISE=YES — so every compliant client anchors to the same point.
-func TestRenderMediaPlaylist_StartOffset_MatchesHoldBack(t *testing.T) {
-	// target=2s, lookahead=6s. HOLD-BACK=6.000, TIME-OFFSET=-6.000.
+// TestRenderMediaPlaylist_StartOffset_TailBehindNowHitsFloor asserts that
+// when the tail sits behind wall-clock now (the degenerate case: render
+// was run with a large nowMs relative to committed timestamps), the
+// emitted TIME-OFFSET clamps to -MinHoldBack rather than going positive
+// or sub-spec.
+func TestRenderMediaPlaylist_StartOffset_TailBehindNowHitsFloor(t *testing.T) {
+	// target=2s, lookahead=6s → MinHoldBack=6s. nowMs=10000, EndMs=4000 →
+	// gap = -6s → clamped to -6.000.
 	_, s := setupStreamForPlaylistWithLookahead(t, 2, 6000)
 	mustCommitSlot(t, s, 0, []byte("d"), 2000, 2000)
 
@@ -393,12 +396,13 @@ func TestRenderMediaPlaylist_StartOffset_MatchesHoldBack(t *testing.T) {
 }
 
 // TestRenderMediaPlaylist_StartOffset_ClampedToSpecMinimum asserts the
-// TIME-OFFSET tracks HOLD-BACK's spec-minimum clamp (3 × target-duration)
-// when the configured look-ahead is smaller. The two server hints must
-// always agree — otherwise clients that obey one but not the other land
-// at different live-edge positions.
+// TIME-OFFSET floor matches HOLD-BACK's spec-minimum (3 × target-duration)
+// when the gap between tail and now is below the floor. The two server
+// hints must agree in that case — otherwise clients that obey one but not
+// the other land at different live-edge positions.
 func TestRenderMediaPlaylist_StartOffset_ClampedToSpecMinimum(t *testing.T) {
-	// target=4s, lookahead=0 → HOLD-BACK=12.000, TIME-OFFSET=-12.000.
+	// target=4s, lookahead=0 → HOLD-BACK=12.000. nowMs=10000 with
+	// EndMs=6000 → gap = -4s → clamped to MinHoldBack = 12.000.
 	_, s := setupStreamForPlaylistWithLookahead(t, 4, 0)
 	mustCommitSlot(t, s, 0, []byte("d"), 2000, 4000)
 
@@ -478,10 +482,11 @@ func TestPlaylistSnapshot_PrefixExcludesStartLine(t *testing.T) {
 		"Suffix starts at EXT-X-TARGETDURATION; got %q", snap.Suffix[:min(80, len(snap.Suffix))])
 }
 
-// TestPlaylistSnapshot_StartLineFresh asserts that when the request arrives
-// at EndMs (no staleness), TIME-OFFSET equals -HoldBackSecs — matching the
-// pre-split renderer's output exactly.
-func TestPlaylistSnapshot_StartLineFresh(t *testing.T) {
+// TestPlaylistSnapshot_StartLineTailAtNowHitsFloor asserts that when the
+// request arrives with nowMs == EndMs (tail exactly at now), the
+// zero-gap would emit a positive TIME-OFFSET, so the floor kicks in and
+// pins the magnitude at MinHoldBack.
+func TestPlaylistSnapshot_StartLineTailAtNowHitsFloor(t *testing.T) {
 	_, s := setupStreamForPlaylistWithLookahead(t, 2, 6000)
 	mustCommitSlot(t, s, 0, []byte("d"), 2000, 2000) // endMs = 4000
 
@@ -491,42 +496,45 @@ func TestPlaylistSnapshot_StartLineFresh(t *testing.T) {
 
 	require.NotNil(t, snap)
 	assert.Equal(t, int64(4000), snap.EndMs)
-	assert.Equal(t, 6.0, snap.HoldBackSecs)
+	assert.Equal(t, 6.0, snap.MinHoldBackSecs)
 
-	// Fresh request: nowMs == EndMs → offset = -HoldBack.
 	assert.Equal(t, "#EXT-X-START:TIME-OFFSET=-6.000,PRECISE=YES\n",
 		snap.StartLine(snap.EndMs))
 }
 
-// TestPlaylistSnapshot_StartLineStaleShrinks asserts the offset magnitude
-// shrinks linearly with how far past EndMs the request arrives. Within one
-// target-duration the formula gives back-to-back viewers the same absolute
-// content start time instead of letting them drift by up to the cached-body
-// staleness.
-func TestPlaylistSnapshot_StartLineStaleShrinks(t *testing.T) {
-	// target=2s, lookahead=10s → HoldBack=10, MinHoldBack=6. Room to shrink
-	// without tripping the spec-minimum clamp.
+// TestPlaylistSnapshot_StartLineTailAheadGap asserts the emitted
+// TIME-OFFSET is exactly -(EndMs - nowMs)/1000 when the tail is far
+// enough ahead of now to beat the MinHoldBack floor. This is the
+// normal lookahead case: the player starts at wall-clock now inside
+// the playlist, so two viewers on the same cached body resolve their
+// respective nows as start content PDT.
+func TestPlaylistSnapshot_StartLineTailAheadGap(t *testing.T) {
+	// target=2s, lookahead=10s, MinHoldBack=6s. Commit endMs=12000;
+	// fetch at nowMs values that keep the gap above the floor.
 	_, s := setupStreamForPlaylistWithLookahead(t, 2, 10000)
-	mustCommitSlot(t, s, 0, []byte("d"), 2000, 2000) // endMs = 4000
+	mustCommitSlot(t, s, 0, []byte("d"), 10000, 2000) // endMs = 12000
 
 	s.mu.RLock()
-	snap, _ := s.renderPlaylistCache(4000, 12)
+	snap, _ := s.renderPlaylistCache(2000, 12)
 	s.mu.RUnlock()
 	require.NotNil(t, snap)
+	require.Equal(t, int64(12000), snap.EndMs)
 
-	// 1.5s stale → offset = 10 - 1.5 = 8.5.
+	// nowMs=2000 → gap=10.000s.
+	assert.Equal(t, "#EXT-X-START:TIME-OFFSET=-10.000,PRECISE=YES\n",
+		snap.StartLine(2000))
+	// nowMs=3500 → gap=8.500s (same snapshot, later viewer).
 	assert.Equal(t, "#EXT-X-START:TIME-OFFSET=-8.500,PRECISE=YES\n",
-		snap.StartLine(snap.EndMs+1500))
-	// 3.0s stale → offset = 10 - 3 = 7.0.
+		snap.StartLine(3500))
+	// nowMs=5000 → gap=7.000s.
 	assert.Equal(t, "#EXT-X-START:TIME-OFFSET=-7.000,PRECISE=YES\n",
-		snap.StartLine(snap.EndMs+3000))
+		snap.StartLine(5000))
 }
 
-// TestPlaylistSnapshot_StartLineClampedToMinHoldBack asserts that no matter
-// how stale the cache, TIME-OFFSET never exceeds the spec-minimum latency
-// HOLD-BACK advertises — otherwise the two server hints disagree and
-// PDT-sync'd clients pick the tighter one, reintroducing stutter.
-func TestPlaylistSnapshot_StartLineClampedToMinHoldBack(t *testing.T) {
+// TestPlaylistSnapshot_StartLineTailBehindNowClampsToFloor asserts the
+// degenerate case (tail far behind now, e.g. renderer fell behind): the
+// gap would be negative so TIME-OFFSET clamps at -MinHoldBack.
+func TestPlaylistSnapshot_StartLineTailBehindNowClampsToFloor(t *testing.T) {
 	_, s := setupStreamForPlaylistWithLookahead(t, 2, 10000)
 	mustCommitSlot(t, s, 0, []byte("d"), 2000, 2000) // endMs = 4000
 
@@ -535,27 +543,40 @@ func TestPlaylistSnapshot_StartLineClampedToMinHoldBack(t *testing.T) {
 	s.mu.RUnlock()
 	require.NotNil(t, snap)
 
-	// Very stale (100s past endMs) — would compute to -(10 - 100) = +90,
-	// but clamps at MinHoldBack=6.
+	// 100s past endMs — gap = -100s → clamps to MinHoldBack=6.
 	assert.Equal(t, "#EXT-X-START:TIME-OFFSET=-6.000,PRECISE=YES\n",
 		snap.StartLine(snap.EndMs+100_000))
 }
 
-// TestPlaylistSnapshot_StartLineNowBeforeEndTreatedAsFresh asserts that a
-// request arriving before EndMs (e.g. the transcoder pushed ahead of wall
-// clock and the request came in between) does not give a bigger-than-fresh
-// offset. The staleSecs clamp at zero keeps the value at -HoldBack.
-func TestPlaylistSnapshot_StartLineNowBeforeEndTreatedAsFresh(t *testing.T) {
+// TestPlaylistSnapshot_StartLineDefaultConfigCancelsDrift is the
+// regression test for the production bug: at the default
+// X-SL-MAX-LOOKAHEAD-MS (3 × target-duration), two viewers on the same
+// cached snapshot must resolve start content PDT to their respective
+// wall-clock nows — differing by exactly their wall-clock gap.
+// Pre-fix, every viewer got TIME-OFFSET = -HoldBack and all of them
+// started at the same content PDT, breaking cross-device sync.
+func TestPlaylistSnapshot_StartLineDefaultConfigCancelsDrift(t *testing.T) {
+	// target=2s, lookahead=6s (default) → MinHoldBack=6s. Push a
+	// segment at the lookahead edge (ts=7000, at nowMs+maxLookahead)
+	// so endMs=9000 sits 8s ahead of nowMs=1000 — beating the floor
+	// with 2s of room to exercise the gap formula.
 	_, s := setupStreamForPlaylistWithLookahead(t, 2, 6000)
-	mustCommitSlot(t, s, 0, []byte("d"), 2000, 2000) // endMs = 4000
+	mustCommitSlot(t, s, 0, []byte("d"), 7000, 2000) // endMs = 9000
 
 	s.mu.RLock()
-	snap, _ := s.renderPlaylistCache(3000, 12)
+	snap, _ := s.renderPlaylistCache(1000, 12)
 	s.mu.RUnlock()
 	require.NotNil(t, snap)
+	require.Equal(t, int64(9000), snap.EndMs)
 
-	assert.Equal(t, "#EXT-X-START:TIME-OFFSET=-6.000,PRECISE=YES\n",
-		snap.StartLine(snap.EndMs-500))
+	// Viewer A at nowMs=1000: gap=8s → offset 8.000 → start PDT 1000.
+	assert.Equal(t, "#EXT-X-START:TIME-OFFSET=-8.000,PRECISE=YES\n",
+		snap.StartLine(1000))
+	// Viewer B at nowMs=2500: gap=6.5s → offset 6.500 → start PDT 2500.
+	// (EndMs − offset*1000) gives each viewer's own nowMs — so start
+	// PDTs differ by exactly the 1500ms wall-clock gap.
+	assert.Equal(t, "#EXT-X-START:TIME-OFFSET=-6.500,PRECISE=YES\n",
+		snap.StartLine(2500))
 }
 
 // TestPlaylistSnapshot_AssembleEqualsRenderMediaPlaylist guarantees the
