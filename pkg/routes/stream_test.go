@@ -324,9 +324,9 @@ func TestMediaPlaylist_Returns503WhenPlaylistBecomesEmpty(t *testing.T) {
 }
 
 // initStreamWithLookahead is like initStream but lets the test pick the
-// look-ahead cap — needed by the dynamic-TIME-OFFSET tests, which require
-// HoldBack > MinHoldBack so the offset can shrink below the spec-minimum
-// clamp and actually exercise staleness compensation.
+// look-ahead cap — needed by the dynamic-TIME-OFFSET tests so they can
+// put the tail far enough ahead of wall clock to exercise the offset
+// formula without tripping the MinHoldBack floor.
 func initStreamWithLookahead(t *testing.T, store *stream.Store, id string, targetSecs int, lookaheadMs int64) {
 	t.Helper()
 	meta := stream.Metadata{
@@ -345,20 +345,20 @@ func initStreamWithLookahead(t *testing.T, store *stream.Store, id string, targe
 
 // --- Dynamic TIME-OFFSET tests ---
 
-// TestMediaPlaylist_StartOffset_FreshMatchesHoldBack asserts that when the
-// request arrives at the last segment's end PDT (no staleness), the handler
-// emits the unchanged -HoldBack offset — preserving today's behavior on a
-// hot cache.
-func TestMediaPlaylist_StartOffset_FreshMatchesHoldBack(t *testing.T) {
+// TestMediaPlaylist_StartOffset_TailAtNowClampsToMinHoldBack asserts that
+// when the request clock lands at the tail PDT exactly (gap = 0), the
+// emitted TIME-OFFSET clamps to -MinHoldBack rather than going to zero
+// or positive.
+func TestMediaPlaylist_StartOffset_TailAtNowClampsToMinHoldBack(t *testing.T) {
 	clk := clock.NewMock(time.UnixMilli(0))
 	router, store, _ := testStreamRouter(t, clk)
-	initStreamWithLookahead(t, store, "1", 2, 10000) // HoldBack=10, MinHoldBack=6
+	initStreamWithLookahead(t, store, "1", 2, 10000) // MinHoldBack=6
 
 	s := store.Get("1")
 	require.NotNil(t, s)
 
 	commitSegment(t, s, 0, []byte("seg0"), 2000) // ends at 4000
-	clk.Set(time.UnixMilli(4000))                // request is fresh: now == endMs
+	clk.Set(time.UnixMilli(4000))                // nowMs == endMs → gap = 0
 
 	require.Eventually(t, func() bool {
 		return s.CachedPlaylist() != ""
@@ -370,50 +370,49 @@ func TestMediaPlaylist_StartOffset_FreshMatchesHoldBack(t *testing.T) {
 
 	assert.Equal(t, http.StatusOK, rec.Code)
 	body := rec.Body.String()
-	assert.Contains(t, body, "#EXT-X-START:TIME-OFFSET=-10.000,PRECISE=YES\n")
+	assert.Contains(t, body, "#EXT-X-START:TIME-OFFSET=-6.000,PRECISE=YES\n")
 }
 
-// TestMediaPlaylist_StartOffset_StaleShrinks asserts that when the request
-// arrives after EndMs (no new commit between renders), the offset shrinks
-// by the staleness. Two viewers fetching the same cached body at staggered
-// times then compute the same absolute start content time — cancelling the
-// within-segment drift.
-func TestMediaPlaylist_StartOffset_StaleShrinks(t *testing.T) {
+// TestMediaPlaylist_StartOffset_TailAheadMatchesGap asserts that in the
+// normal lookahead case (tail PDT ahead of nowMs), the emitted
+// TIME-OFFSET magnitude is the tail-to-now gap to three decimals. Two
+// viewers on the same cached body resolve their respective nows as
+// start content PDT — the cross-device sync guarantee.
+func TestMediaPlaylist_StartOffset_TailAheadMatchesGap(t *testing.T) {
 	clk := clock.NewMock(time.UnixMilli(0))
 	router, store, _ := testStreamRouter(t, clk)
-	initStreamWithLookahead(t, store, "1", 2, 10000) // HoldBack=10, MinHoldBack=6
+	initStreamWithLookahead(t, store, "1", 2, 10000) // MinHoldBack=6
 
 	s := store.Get("1")
 	require.NotNil(t, s)
 
-	commitSegment(t, s, 0, []byte("seg0"), 2000) // ends at 4000
+	// Push a segment ending 10s ahead of the render clock so the gap
+	// comfortably beats the floor across the fetch clocks below.
+	commitSegment(t, s, 0, []byte("seg0"), 8000) // dur=2000 → endMs=10000
 
-	// Fresh render at clock=4000.
-	clk.Set(time.UnixMilli(4000))
 	require.Eventually(t, func() bool {
 		return s.CachedPlaylist() != ""
 	}, 2*time.Second, 10*time.Millisecond)
 
-	// Viewer arrives 1.5s later, no new commit.
-	clk.Set(time.UnixMilli(5500))
-
+	// Fetch at clock=1500: gap = (10000−1500)/1000 = 8.500s.
+	clk.Set(time.UnixMilli(1500))
 	req := httptest.NewRequest(http.MethodGet, "/stream/1/media.m3u8", nil)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
-
 	assert.Equal(t, http.StatusOK, rec.Code)
-	// 1.5s stale → offset = 10.0 - 1.5 = 8.5.
 	assert.Contains(t, rec.Body.String(), "#EXT-X-START:TIME-OFFSET=-8.500,PRECISE=YES\n")
 }
 
-// TestMediaPlaylist_StartOffset_ClampedToMinHoldBack asserts that very stale
-// responses never advertise a tighter latency than the HOLD-BACK header
-// promises. Otherwise clients that obey TIME-OFFSET but not HOLD-BACK would
-// try to play closer to live than the server intends and stutter.
+// TestMediaPlaylist_StartOffset_ClampedToMinHoldBack asserts that when
+// the tail sits far behind wall-clock now the emitted TIME-OFFSET
+// clamps at -MinHoldBack, keeping the tag negative and at least the
+// spec floor (3 × target-duration) instead of emitting a zero or
+// positive offset that would effectively seek the player past the
+// playlist tail.
 func TestMediaPlaylist_StartOffset_ClampedToMinHoldBack(t *testing.T) {
 	clk := clock.NewMock(time.UnixMilli(0))
 	router, store, _ := testStreamRouter(t, clk)
-	initStreamWithLookahead(t, store, "1", 2, 10000) // HoldBack=10, MinHoldBack=6
+	initStreamWithLookahead(t, store, "1", 2, 10000) // MinHoldBack=6
 
 	s := store.Get("1")
 	require.NotNil(t, s)
@@ -425,8 +424,7 @@ func TestMediaPlaylist_StartOffset_ClampedToMinHoldBack(t *testing.T) {
 		return s.CachedPlaylist() != ""
 	}, 2*time.Second, 10*time.Millisecond)
 
-	// 100s past endMs — formula gives offset = 10-100 = -90 (i.e. positive
-	// start position past end); must clamp to MinHoldBack = 6.
+	// 100s past endMs — gap = -100s → clamp to MinHoldBack = 6.
 	clk.Set(time.UnixMilli(104_000))
 
 	req := httptest.NewRequest(http.MethodGet, "/stream/1/media.m3u8", nil)
@@ -437,51 +435,53 @@ func TestMediaPlaylist_StartOffset_ClampedToMinHoldBack(t *testing.T) {
 	assert.Contains(t, rec.Body.String(), "#EXT-X-START:TIME-OFFSET=-6.000,PRECISE=YES\n")
 }
 
-// TestMediaPlaylist_StartOffset_TwoStaggeredRequestsAgreeOnStartTime is the
-// cross-check: given the same underlying playlist body, two requests at
-// different clocks must resolve to the same absolute start content time
-// (endMs − offsetSecs × 1000). That's the invariant this whole feature
-// exists to preserve.
+// TestMediaPlaylist_StartOffset_TwoStaggeredRequestsAgreeOnStartTime is
+// the cross-check: given the same underlying playlist body, two requests
+// at different clocks must each resolve their start content PDT to
+// their own wall-clock now — so the two viewers play the same content
+// at every shared wall time.
 func TestMediaPlaylist_StartOffset_TwoStaggeredRequestsAgreeOnStartTime(t *testing.T) {
 	clk := clock.NewMock(time.UnixMilli(0))
 	router, store, _ := testStreamRouter(t, clk)
-	initStreamWithLookahead(t, store, "1", 2, 10000)
+	initStreamWithLookahead(t, store, "1", 2, 10000) // MinHoldBack=6
 
 	s := store.Get("1")
 	require.NotNil(t, s)
 
-	commitSegment(t, s, 0, []byte("seg0"), 2000) // endMs = 4000
+	// Tail 10s ahead of the render clock; gaps at both viewer clocks
+	// below stay above the floor.
+	commitSegment(t, s, 0, []byte("seg0"), 8000) // endMs = 10000
 
-	clk.Set(time.UnixMilli(4000))
 	require.Eventually(t, func() bool {
 		return s.CachedPlaylist() != ""
 	}, 2*time.Second, 10*time.Millisecond)
 
-	// Viewer A at clock = endMs + 200ms.
-	clk.Set(time.UnixMilli(4200))
+	// Viewer A at clock=1000.
+	clk.Set(time.UnixMilli(1000))
 	reqA := httptest.NewRequest(http.MethodGet, "/stream/1/media.m3u8", nil)
 	recA := httptest.NewRecorder()
 	router.ServeHTTP(recA, reqA)
 	offA := extractStartOffsetSecs(t, recA.Body.String())
-	startA := 4000 - int64(offA*1000) // endMs − offset → absolute start ms
-	wallA := int64(4200)              // A's wall clock at the moment of request
+	startA := 10000 - int64(offA*1000) // endMs − offset → start content PDT
+	wallA := int64(1000)
 
-	// Viewer B at clock = endMs + 1900ms (same cached body, no new commit).
-	clk.Set(time.UnixMilli(5900))
+	// Viewer B at clock=2500 (same cached body, no new commit).
+	clk.Set(time.UnixMilli(2500))
 	reqB := httptest.NewRequest(http.MethodGet, "/stream/1/media.m3u8", nil)
 	recB := httptest.NewRecorder()
 	router.ServeHTTP(recB, reqB)
 	offB := extractStartOffsetSecs(t, recB.Body.String())
-	startB := 4000 - int64(offB*1000)
-	wallB := int64(5900)
+	startB := 10000 - int64(offB*1000)
+	wallB := int64(2500)
 
-	// Both viewers' (wall − start) should match: they would arrive at the
-	// same content time after the same elapsed playback. Allow 1ms slack
-	// for integer-ms float rounding.
-	elapsedA := wallA - startA
-	elapsedB := wallB - startB
-	assert.InDelta(t, elapsedA, elapsedB, 1,
-		"staggered viewers must agree on (wall−start); A=%d B=%d", elapsedA, elapsedB)
+	// Each viewer's start content PDT equals their own wall clock.
+	assert.InDelta(t, wallA, startA, 1,
+		"viewer A start PDT must match wallA; offA=%v startA=%d", offA, startA)
+	assert.InDelta(t, wallB, startB, 1,
+		"viewer B start PDT must match wallB; offB=%v startB=%d", offB, startB)
+	// And therefore their start PDTs differ by exactly the wall gap.
+	assert.InDelta(t, wallB-wallA, startB-startA, 1,
+		"staggered viewers must diverge in start PDT by their wall-clock gap")
 }
 
 // TestMediaPlaylist_StartOffset_ContentLengthMatchesBody guards against
@@ -507,8 +507,8 @@ func TestMediaPlaylist_StartOffset_ContentLengthMatchesBody(t *testing.T) {
 	}, 2*time.Second, 10*time.Millisecond)
 
 	// Exercise a few request clocks that produce different StartLine
-	// widths (fresh vs stale vs clamped), to make sure the invariant
-	// holds across the range of offset magnitudes the handler emits.
+	// widths across the range of offset magnitudes the handler emits,
+	// to make sure the invariant holds.
 	for _, wall := range []int64{4000, 4200, 5500, 104_000} {
 		clk.Set(time.UnixMilli(wall))
 		req := httptest.NewRequest(http.MethodGet, "/stream/1/media.m3u8", nil)

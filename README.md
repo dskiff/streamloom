@@ -111,7 +111,7 @@ Optional headers:
 
 | Header | Format | Example | Description |
 |--------|--------|---------|-------------|
-| `X-SL-MAX-LOOKAHEAD-MS` | Integer (ms, >=0) | `6000` | How far ahead of wall clock the media playlist tail may sit. Defaults to `3 × X-SL-TARGET-DURATION × 1000`. If set, must be `0` (pin tail at wall clock; legacy behavior) or `>= X-SL-TARGET-DURATION × 1000` and at most `3600000` (1 hour). Emitted to clients as `EXT-X-SERVER-CONTROL:HOLD-BACK` and as `EXT-X-START:TIME-OFFSET=-<HOLD-BACK>,PRECISE=YES` so PDT-sync'd players across separate devices anchor to the same live-edge position. The actively-playing segment's `EXT-X-PROGRAM-DATE-TIME` tracks wall clock within one target-duration, which is what enables two viewers (e.g. talking on the phone) to see the same content at the same instant. |
+| `X-SL-MAX-LOOKAHEAD-MS` | Integer (ms, >=0) | `6000` | How far ahead of wall clock the media playlist tail may sit. Defaults to `3 × X-SL-TARGET-DURATION × 1000`. If set, must be `0` (pin tail at wall clock; legacy behavior) or `>= X-SL-TARGET-DURATION × 1000` and at most `3600000` (1 hour). Emitted to clients as `EXT-X-SERVER-CONTROL:HOLD-BACK`. Each request also gets an `EXT-X-START:TIME-OFFSET=-<gap>,PRECISE=YES` where `<gap>` is the seconds between the playlist tail's PDT and the request's wall clock (floored at `3 × X-SL-TARGET-DURATION` for spec compliance). That places the starting segment's `EXT-X-PROGRAM-DATE-TIME` at the viewer's wall clock, so two viewers on separate devices (e.g. talking on the phone) see the same content at the same instant. |
 
 The request body should contain the raw init segment data. This endpoint must be called at least once per stream before pushing segments.
 

@@ -14,7 +14,7 @@ const minRenderInterval = 50 * time.Millisecond
 // PlaylistSnapshot is the renderer's cached output for one published window.
 // The body is stored split around the EXT-X-START line: the handler
 // synthesizes that single line per request from the current wall clock so
-// TIME-OFFSET stays anchored to now (not to the last commit). Everything
+// TIME-OFFSET points at wall-clock now (not at the last commit). Everything
 // else — PDTs, segment URIs, MEDIA-SEQUENCE, HOLD-BACK — is baked into
 // Prefix/Suffix at render time and reused verbatim until the next commit.
 //
@@ -38,45 +38,42 @@ type PlaylistSnapshot struct {
 	Suffix string
 
 	// EndMs is the PDT of the end of the last segment in the published
-	// window (Timestamp + DurationMs). StartLine uses it to compute how
-	// stale the cached body is relative to the request's wall clock.
+	// window (Timestamp + DurationMs). StartLine uses it to compute the
+	// gap between nowMs and the tail of the published window.
 	EndMs int64
 
-	// HoldBackSecs is the intended client latency target in seconds —
-	// the value emitted as EXT-X-SERVER-CONTROL:HOLD-BACK and also the
-	// baseline magnitude of TIME-OFFSET when the cache is fresh.
-	HoldBackSecs float64
-	// MinHoldBackSecs is the spec floor (3 × target-duration) that
-	// TIME-OFFSET must not fall below; going tighter would advertise a
-	// shorter latency than the HOLD-BACK header promises.
+	// MinHoldBackSecs is the spec floor (3 × target-duration) the
+	// emitted TIME-OFFSET magnitude is clamped to. It keeps the emitted
+	// tag negative and spec-compliant when the tail-to-now gap is small
+	// or negative (tail ahead of now by less than the floor; tail at
+	// now; or tail behind now because the renderer fell behind).
 	MinHoldBackSecs float64
 }
 
 // StartLine formats the EXT-X-START tag for a request arriving at nowMs.
-// The offset magnitude shrinks by the amount of wall-clock time that has
-// passed since EndMs, which cancels the same amount of drift at the
-// client's start position. It is clamped from below at MinHoldBackSecs
-// so we never advertise a tighter latency than the HOLD-BACK header
-// promises.
+// TIME-OFFSET magnitude is (EndMs − nowMs)/1000 — the gap, in seconds,
+// from the request's wall clock to the tail PDT — clamped from below
+// at MinHoldBackSecs. With the lookahead feature the tail sits ahead
+// of now in normal operation, so the gap is positive and the clamp
+// does not fire: the player starts at wall-clock nowMs inside the
+// playlist. Two viewers on the same cached body get different offsets
+// that each resolve start content PDT to their own wall clock, so
+// they play the same content at every shared wall time.
 //
-// The shrink only produces a visible change when HoldBackSecs is strictly
-// greater than MinHoldBackSecs. At the default configuration
-// (maxLookaheadMs = 3 × targetDuration × 1000) the two are equal, the
-// clamp fires on any positive staleness, and the emitted offset is
-// always -HoldBackSecs — identical to the pre-split static behavior.
-// Operators who want cross-device convergence within a target-duration
-// must configure a larger X-SL-MAX-LOOKAHEAD-MS.
+// Once (EndMs − nowMs)/1000 drops below MinHoldBackSecs — either
+// because nowMs has advanced to within MinHoldBackSecs of a stale
+// EndMs (tail still ahead of now, but inside the floor), or because
+// nowMs has reached or passed EndMs (tail at or behind now; renderer
+// fell behind) — the clamp fires and viewers in that regime all get
+// the same -MinHoldBackSecs value; drift cancellation pauses until a
+// fresh render moves the tail farther ahead again.
 //
 // Safe to call on a nil receiver (returns ""), mirroring Assemble.
 func (snap *PlaylistSnapshot) StartLine(nowMs int64) string {
 	if snap == nil {
 		return ""
 	}
-	staleSecs := float64(nowMs-snap.EndMs) / 1000.0
-	if staleSecs < 0 {
-		staleSecs = 0
-	}
-	offsetSecs := snap.HoldBackSecs - staleSecs
+	offsetSecs := float64(snap.EndMs-nowMs) / 1000.0
 	if offsetSecs < snap.MinHoldBackSecs {
 		offsetSecs = snap.MinHoldBackSecs
 	}
@@ -110,8 +107,8 @@ func (snap *PlaylistSnapshot) Assemble(nowMs int64) string {
 // segments. Eligibility, sliding window, and contiguity rules match the
 // previous single-string renderer; the only shape change is that the
 // EXT-X-START line is omitted from the body and its ingredients
-// (EndMs, HoldBackSecs, MinHoldBackSecs) are captured on the snapshot
-// for per-request synthesis in StartLine.
+// (EndMs, MinHoldBackSecs) are captured on the snapshot for per-request
+// synthesis in StartLine.
 //
 // Returns (snapshot, nextEligibleMs). snapshot is nil when no segments are
 // eligible; nextEligibleMs is the timestamp of the first segment beyond
@@ -156,10 +153,11 @@ func (s *Stream) renderPlaylistCache(nowMs int64, windowSize int) (*PlaylistSnap
 		}
 	}
 
-	// HOLD-BACK, and the EXT-X-START magnitude when the snapshot is fresh.
-	// Clamp up so a smaller configured look-ahead still produces a
-	// spec-compliant playlist (draft-pantos-hls-rfc8216bis: HOLD-BACK MUST
-	// be at least 3 × target-duration).
+	// HOLD-BACK tracks the configured look-ahead, clamped up to the
+	// spec minimum (draft-pantos-hls-rfc8216bis: HOLD-BACK MUST be at
+	// least 3 × target-duration). EXT-X-START uses the same floor via
+	// minHoldBackSecs captured on the snapshot, but its magnitude is
+	// the per-request tail-to-now gap — independent of holdBackSecs.
 	holdBackSecs := float64(s.maxLookaheadMs) / 1000.0
 	minHoldBackSecs := 3.0 * float64(s.metadata.TargetDurationSecs)
 	if holdBackSecs < minHoldBackSecs {
@@ -238,16 +236,14 @@ func (s *Stream) renderPlaylistCache(nowMs int64, windowSize int) (*PlaylistSnap
 		Prefix:          full[:splitAt],
 		Suffix:          full[splitAt:],
 		EndMs:           endMs,
-		HoldBackSecs:    holdBackSecs,
 		MinHoldBackSecs: minHoldBackSecs,
 	}, nextEligibleMs
 }
 
 // renderMediaPlaylist is a test and back-compat wrapper around
 // renderPlaylistCache. It assembles the snapshot at the same nowMs used
-// for rendering, reproducing the "fresh cache" output (TIME-OFFSET ==
-// -HoldBackSecs) that the pre-split renderer produced. Returns "" when
-// no segments are eligible.
+// for rendering; TIME-OFFSET comes out of StartLine evaluated at that
+// nowMs. Returns "" when no segments are eligible.
 //
 // Must be called with s.mu.RLock held.
 func (s *Stream) renderMediaPlaylist(nowMs int64, windowSize int) (string, int64) {

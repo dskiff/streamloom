@@ -131,9 +131,10 @@ func mediaPlaylistHandler(logger *slog.Logger, store *stream.Store) http.Handler
 		// Prefix and Suffix were baked at render time (with viewer
 		// tokens already embedded in segment URIs). StartLine is
 		// synthesized here from the current wall clock so TIME-OFFSET
-		// stays anchored to "now" instead of drifting away from the
-		// last commit — every viewer joining between commits gets the
-		// same absolute content start time.
+		// is the tail-to-now gap for THIS request — each viewer's
+		// starting segment PDT resolves to their own wall clock, and
+		// two viewers on the same cached body play the same content
+		// at every shared wall time.
 		nowMs := store.Clock().Now().UnixMilli()
 		startLine := snap.StartLine(nowMs)
 		total := len(snap.Prefix) + len(startLine) + len(snap.Suffix)

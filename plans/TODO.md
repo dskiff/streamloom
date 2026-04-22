@@ -101,21 +101,21 @@ PDT close to wall time.
 
 - [x] Dynamic `EXT-X-START` per request. Static `TIME-OFFSET` left up to
       one target-duration of within-segment drift between viewers joining
-      during the same cached playlist. The renderer now stores a
+      during the same cached playlist. The renderer stores a
       `PlaylistSnapshot` with body split around the EXT-X-START line; the
-      HTTP handler synthesizes `TIME-OFFSET = -(HoldBack − staleSecs)`
-      per request (clamped at `MinHoldBack` = 3 × target-duration). The
-      invariant: two staggered viewers diverge in start PDT by exactly
-      their wall-clock gap, so they play the same content at every shared
-      wall time. Drift cancellation only engages when `HoldBack >
-      MinHoldBack`; at the default `maxLookaheadMs = 3 × targetDuration`
-      the two are equal and the clamp pins the offset at `-HoldBack`
-      every render (same as the pre-split behavior). Operators who want
-      convergence within a target-duration must set
-      `X-SL-MAX-LOOKAHEAD-MS` above the default. New types:
-      `PlaylistSnapshot` in `pkg/stream/playlist.go`. New tests:
-      `TestPlaylistSnapshot_*`, `TestMediaPlaylist_StartOffset_*`,
-      `TestE2E_StartOffsetTracksWallClock`.
+      HTTP handler synthesizes `TIME-OFFSET = -(EndMs − nowMs)/1000` per
+      request, clamped at `MinHoldBack` = 3 × target-duration to keep the
+      tag negative and spec-compliant in the degenerate case where the
+      tail sits at or behind wall-clock now. The invariant: each viewer's
+      start content PDT equals their own wall-clock now, so two staggered
+      viewers diverge in start PDT by exactly their wall-clock gap and
+      play the same content at every shared wall time. Drift cancellation
+      engages whenever the tail-to-now gap beats the floor, which is the
+      normal case at any configured `maxLookaheadMs` (default
+      `3 × targetDuration` keeps roughly one target-duration of room
+      above the floor at render time). New types: `PlaylistSnapshot` in
+      `pkg/stream/playlist.go`. New tests: `TestPlaylistSnapshot_*`,
+      `TestMediaPlaylist_StartOffset_*`, `TestE2E_StartOffsetTracksWallClock`.
 
 - [ ] (Future, larger effort) Low-Latency HLS: emit `EXT-X-PART-INF`,
       per-part `EXT-X-PART`, `CAN-BLOCK-RELOAD=YES`, `PART-HOLD-BACK`,

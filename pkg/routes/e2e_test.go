@@ -157,13 +157,11 @@ func TestE2E_LookaheadLiveEdge(t *testing.T) {
 	// HOLD-BACK reflects the configured look-ahead cap (6000ms = 6.000s).
 	assert.Contains(t, body, "#EXT-X-SERVER-CONTROL:HOLD-BACK=6.000\n")
 
-	// EXT-X-START anchors clients to the same live-edge across devices.
-	// TIME-OFFSET must mirror HOLD-BACK so the two server hints agree;
-	// PRECISE=YES eliminates segment-boundary snap jitter. Playlist end
-	// (tail PDT 6.000s + its duration 2.000s = 8.000s) minus |TIME-OFFSET|
-	// 6.000s lands the active-segment start at PDT 2.000s — within one
-	// target-duration of wall clock 1.000s.
-	assert.Contains(t, body, "#EXT-X-START:TIME-OFFSET=-6.000,PRECISE=YES\n")
+	// EXT-X-START places the player at wall-clock now inside the
+	// playlist: TIME-OFFSET magnitude = tail PDT (8.000s) − wall clock
+	// (1.000s) = 7.000s. PRECISE=YES eliminates segment-boundary snap.
+	// Start content PDT = 8.000 − 7.000 = 1.000s, exactly wall clock.
+	assert.Contains(t, body, "#EXT-X-START:TIME-OFFSET=-7.000,PRECISE=YES\n")
 
 	// Tail PDT ≈ 1970-01-01T00:00:06.000Z (now + 6s).
 	assert.Contains(t, body, "#EXT-X-PROGRAM-DATE-TIME:1970-01-01T00:00:06.000Z")
@@ -178,18 +176,18 @@ func TestE2E_LookaheadLiveEdge(t *testing.T) {
 }
 
 // TestE2E_StartOffsetTracksWallClock exercises the dynamic TIME-OFFSET
-// end-to-end: push segments via the API, fetch the playlist at EndMs, then
-// fetch it again 1.2s later without any new commit. The second response's
-// TIME-OFFSET must shrink by that 1.2s of staleness, so both responses
-// resolve to the same absolute start content time — the guarantee that
-// cross-device viewers don't drift within a target-duration window.
+// end-to-end: push a segment whose tail PDT sits well ahead of wall
+// clock, then fetch the playlist at two different clocks on the same
+// cached body. Each response's TIME-OFFSET must equal the tail-to-now
+// gap, so each viewer's start content PDT resolves to their own wall
+// clock — the cross-device-sync guarantee.
 func TestE2E_StartOffsetTracksWallClock(t *testing.T) {
 	clk := clock.NewMock(time.UnixMilli(0))
 	streamRouter, apiRouter, store, _ := testBothRoutersWithToken(t, clk)
 
-	// Target-duration=2s, default look-ahead=6s → HoldBack=6, MinHoldBack=6.
-	// With HoldBack at the floor there's no room to shrink, so override the
-	// look-ahead to 10s to exercise the staleness formula.
+	// Target-duration=2s, look-ahead=10s → MinHoldBack=6. The tail
+	// needs to be far enough ahead of both fetch clocks to beat the
+	// floor.
 	hdrs := initHeaders()
 	hdrs["X-SL-MAX-LOOKAHEAD-MS"] = "10000"
 	rec := postInit(apiRouter, "1", "test-token", hdrs, []byte("init-data"))
@@ -199,41 +197,41 @@ func TestE2E_StartOffsetTracksWallClock(t *testing.T) {
 	s := store.Get("1")
 	require.NotNil(t, s)
 
-	// Push one segment ending at PDT=4000.
-	clk.Set(time.UnixMilli(1000))
-	rec = postSegment(apiRouter, "1", "test-token", "0", "2000", "2000", []byte("seg"))
+	// Push one segment ending at PDT=10000. Render clock at 0 keeps
+	// ts=8000 within the lookahead cap (cutoff=10000).
+	rec = postSegment(apiRouter, "1", "test-token", "0", "8000", "2000", []byte("seg"))
 	require.Equal(t, http.StatusCreated, rec.Code)
 
 	require.Eventually(t, func() bool {
 		return strings.Contains(s.CachedPlaylist(), "segment_0.m4s")
 	}, 2*time.Second, 10*time.Millisecond)
 
-	const endMs = 4000
+	const endMs = 10000
 
-	// Fetch at EndMs: fresh cache → TIME-OFFSET = -HoldBack = -10.000.
-	clk.Set(time.UnixMilli(endMs))
+	// Viewer A at clock=1000: gap = (10000−1000)/1000 = 9.000s.
+	clk.Set(time.UnixMilli(1000))
 	reqA := httptest.NewRequest(http.MethodGet, "/stream/1/media.m3u8", nil)
 	recA := httptest.NewRecorder()
 	streamRouter.ServeHTTP(recA, reqA)
 	require.Equal(t, http.StatusOK, recA.Code)
 	offA := extractStartOffsetSecs(t, recA.Body.String())
-	assert.InDelta(t, 10.0, offA, 0.001)
+	assert.InDelta(t, 9.0, offA, 0.001)
 
-	// 1200ms later, no new commit: TIME-OFFSET shrinks by 1.2 to -8.800.
-	clk.Set(time.UnixMilli(endMs + 1200))
+	// Viewer B at clock=2200 (same cached body): gap = 7.800s.
+	clk.Set(time.UnixMilli(2200))
 	reqB := httptest.NewRequest(http.MethodGet, "/stream/1/media.m3u8", nil)
 	recB := httptest.NewRecorder()
 	streamRouter.ServeHTTP(recB, reqB)
 	require.Equal(t, http.StatusOK, recB.Code)
 	offB := extractStartOffsetSecs(t, recB.Body.String())
-	assert.InDelta(t, 8.8, offB, 0.001)
+	assert.InDelta(t, 7.8, offB, 0.001)
 
-	// Drift-cancellation invariant: at any shared wall time, both viewers
-	// are at the same content PDT. A's content position at wallB equals
-	// startA + (wallB − wallA), which must equal B's startB. Equivalently,
-	// startB − startA == wallB − wallA = 1200ms.
+	// Each viewer's start content PDT equals their own wall clock, so
+	// the two start PDTs differ by exactly their wall-clock gap.
 	startA := int64(endMs) - int64(offA*1000)
 	startB := int64(endMs) - int64(offB*1000)
+	assert.InDelta(t, 1000, startA, 1, "viewer A start PDT must match wallA=1000")
+	assert.InDelta(t, 2200, startB, 1, "viewer B start PDT must match wallB=2200")
 	assert.InDelta(t, 1200, startB-startA, 1,
 		"staggered viewers diverge in content start by exactly their wall-clock gap; got %d", startB-startA)
 }
