@@ -60,12 +60,13 @@ type PlaylistSnapshot struct {
 // that each resolve start content PDT to their own wall clock, so
 // they play the same content at every shared wall time.
 //
-// Once the gap drops below MinHoldBackSecs — either because the cache
-// is old enough that nowMs has caught up to within the floor of
-// EndMs, or because the tail is at or behind now (renderer fell
-// behind) — the clamp fires and viewers in that regime all get the
-// same -MinHoldBackSecs value; drift cancellation pauses until a
-// fresh render moves the tail ahead again.
+// Once (EndMs − nowMs)/1000 drops below MinHoldBackSecs — either
+// because nowMs has advanced to within MinHoldBackSecs of a stale
+// EndMs (tail still ahead of now, but inside the floor), or because
+// nowMs has reached or passed EndMs (tail at or behind now; renderer
+// fell behind) — the clamp fires and viewers in that regime all get
+// the same -MinHoldBackSecs value; drift cancellation pauses until a
+// fresh render moves the tail farther ahead again.
 //
 // Safe to call on a nil receiver (returns ""), mirroring Assemble.
 func (snap *PlaylistSnapshot) StartLine(nowMs int64) string {

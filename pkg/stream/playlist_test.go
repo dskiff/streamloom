@@ -483,9 +483,10 @@ func TestPlaylistSnapshot_PrefixExcludesStartLine(t *testing.T) {
 }
 
 // TestPlaylistSnapshot_StartLineTailAtNowHitsFloor asserts that when the
-// request arrives with nowMs == EndMs (tail exactly at now), the
-// zero-gap would emit a positive TIME-OFFSET, so the floor kicks in and
-// pins the magnitude at MinHoldBack.
+// request arrives with nowMs == EndMs, the unclamped output would be
+// -0.000 (start at the tail — effectively live edge, and below the
+// spec floor of 3 × target-duration), so the clamp kicks in and pins
+// the magnitude at MinHoldBack.
 func TestPlaylistSnapshot_StartLineTailAtNowHitsFloor(t *testing.T) {
 	_, s := setupStreamForPlaylistWithLookahead(t, 2, 6000)
 	mustCommitSlot(t, s, 0, []byte("d"), 2000, 2000) // endMs = 4000

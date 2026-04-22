@@ -405,8 +405,10 @@ func TestMediaPlaylist_StartOffset_TailAheadMatchesGap(t *testing.T) {
 
 // TestMediaPlaylist_StartOffset_ClampedToMinHoldBack asserts that when
 // the tail sits far behind wall-clock now the emitted TIME-OFFSET
-// clamps at -MinHoldBack rather than advertising a tighter latency than
-// the HOLD-BACK header promises.
+// clamps at -MinHoldBack, keeping the tag negative and at least the
+// spec floor (3 × target-duration) instead of emitting a zero or
+// positive offset that would effectively seek the player past the
+// playlist tail.
 func TestMediaPlaylist_StartOffset_ClampedToMinHoldBack(t *testing.T) {
 	clk := clock.NewMock(time.UnixMilli(0))
 	router, store, _ := testStreamRouter(t, clk)
