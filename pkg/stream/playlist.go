@@ -39,29 +39,33 @@ type PlaylistSnapshot struct {
 
 	// EndMs is the PDT of the end of the last segment in the published
 	// window (Timestamp + DurationMs). StartLine uses it to compute the
-	// gap between now and the tail of the published window.
+	// gap between nowMs and the tail of the published window.
 	EndMs int64
 
 	// MinHoldBackSecs is the spec floor (3 × target-duration) the
-	// emitted TIME-OFFSET magnitude is clamped to. It prevents a
-	// positive or sub-spec value in the degenerate cases where the
-	// tail is at or behind wall-clock now (renderer fell behind, or
-	// lookahead is configured tight enough that the gap is smaller
-	// than the floor).
+	// emitted TIME-OFFSET magnitude is clamped to. It keeps the emitted
+	// tag negative and spec-compliant when the tail-to-now gap is small
+	// or negative (tail ahead of now by less than the floor; tail at
+	// now; or tail behind now because the renderer fell behind).
 	MinHoldBackSecs float64
 }
 
 // StartLine formats the EXT-X-START tag for a request arriving at nowMs.
-// TIME-OFFSET magnitude is the gap from nowMs to EndMs (the PDT of the
-// tail of the published window), so the player starts at wall-clock
-// now inside the playlist. In the normal lookahead case EndMs is ahead
-// of nowMs, the gap is positive, and two viewers on the same cached
-// body diverge in start PDT by exactly their wall-clock gap — they
-// play the same content at every shared wall time.
+// TIME-OFFSET magnitude is (EndMs − nowMs)/1000 — the gap, in seconds,
+// from the request's wall clock to the tail PDT — clamped from below
+// at MinHoldBackSecs. With the lookahead feature the tail sits ahead
+// of now in normal operation, so the gap is positive and the clamp
+// does not fire: the player starts at wall-clock nowMs inside the
+// playlist. Two viewers on the same cached body get different offsets
+// that each resolve start content PDT to their own wall clock, so
+// they play the same content at every shared wall time.
 //
-// When the gap is below MinHoldBackSecs (tail at or behind now), the
-// result clamps to MinHoldBackSecs so the emitted tag stays negative
-// and spec-compliant.
+// Once the gap drops below MinHoldBackSecs — either because the cache
+// is old enough that nowMs has caught up to within the floor of
+// EndMs, or because the tail is at or behind now (renderer fell
+// behind) — the clamp fires and viewers in that regime all get the
+// same -MinHoldBackSecs value; drift cancellation pauses until a
+// fresh render moves the tail ahead again.
 //
 // Safe to call on a nil receiver (returns ""), mirroring Assemble.
 func (snap *PlaylistSnapshot) StartLine(nowMs int64) string {
@@ -148,10 +152,11 @@ func (s *Stream) renderPlaylistCache(nowMs int64, windowSize int) (*PlaylistSnap
 		}
 	}
 
-	// HOLD-BACK, and the EXT-X-START magnitude when the snapshot is fresh.
-	// Clamp up so a smaller configured look-ahead still produces a
-	// spec-compliant playlist (draft-pantos-hls-rfc8216bis: HOLD-BACK MUST
-	// be at least 3 × target-duration).
+	// HOLD-BACK tracks the configured look-ahead, clamped up to the
+	// spec minimum (draft-pantos-hls-rfc8216bis: HOLD-BACK MUST be at
+	// least 3 × target-duration). EXT-X-START uses the same floor via
+	// minHoldBackSecs captured on the snapshot, but its magnitude is
+	// the per-request tail-to-now gap — independent of holdBackSecs.
 	holdBackSecs := float64(s.maxLookaheadMs) / 1000.0
 	minHoldBackSecs := 3.0 * float64(s.metadata.TargetDurationSecs)
 	if holdBackSecs < minHoldBackSecs {

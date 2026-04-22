@@ -579,6 +579,37 @@ func TestPlaylistSnapshot_StartLineDefaultConfigCancelsDrift(t *testing.T) {
 		snap.StartLine(2500))
 }
 
+// TestPlaylistSnapshot_StartLineGapAcrossFloor walks a single snapshot
+// across the MinHoldBack floor: above the floor the emitted magnitude
+// tracks the gap exactly; at or below the floor the clamp pins it at
+// -MinHoldBack. Guards the boundary transition against off-by-one /
+// ≤-vs-< regressions in the clamp.
+func TestPlaylistSnapshot_StartLineGapAcrossFloor(t *testing.T) {
+	// target=2s, lookahead=6s (default) → MinHoldBack=6s. Tail endMs
+	// sits 8s ahead of the render clock; walking nowMs from 1000 up
+	// takes the gap from 8.000 down across 6.000 and into the clamp.
+	_, s := setupStreamForPlaylistWithLookahead(t, 2, 6000)
+	mustCommitSlot(t, s, 0, []byte("d"), 7000, 2000) // endMs = 9000
+
+	s.mu.RLock()
+	snap, _ := s.renderPlaylistCache(1000, 12)
+	s.mu.RUnlock()
+	require.NotNil(t, snap)
+
+	// Above the floor: gap > 6 → emitted value equals the gap.
+	assert.Equal(t, "#EXT-X-START:TIME-OFFSET=-7.000,PRECISE=YES\n",
+		snap.StartLine(2000)) // gap = 7.000
+	// Exactly at the floor: gap == 6 → not clamped (strict <), still 6.
+	assert.Equal(t, "#EXT-X-START:TIME-OFFSET=-6.000,PRECISE=YES\n",
+		snap.StartLine(3000)) // gap = 6.000
+	// Just below the floor: gap = 5.999 → clamp → 6.000.
+	assert.Equal(t, "#EXT-X-START:TIME-OFFSET=-6.000,PRECISE=YES\n",
+		snap.StartLine(3001)) // gap = 5.999
+	// Well below the floor: gap = 4 → clamp → 6.000.
+	assert.Equal(t, "#EXT-X-START:TIME-OFFSET=-6.000,PRECISE=YES\n",
+		snap.StartLine(5000)) // gap = 4.000
+}
+
 // TestPlaylistSnapshot_AssembleEqualsRenderMediaPlaylist guarantees the
 // wrapper and the snapshot produce identical bytes when evaluated at the
 // same nowMs. Protects against subtle format drift between the internal
