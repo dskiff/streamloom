@@ -179,6 +179,10 @@ func testBothRoutersWithToken(t *testing.T, clk clock.Clock) (streamRouter http.
 
 // initStream initializes a test stream in the store with a known init segment.
 // Registers a cleanup to delete the stream and stop its renderer goroutine.
+//
+// segCap and backwardBufferSize are sized so the default playlist window
+// (DefaultMediaWindowSize = 12) fits inside the new
+// playlistWindowSize <= backwardBufferSize bound.
 func initStream(t *testing.T, store *stream.Store, id string) {
 	t.Helper()
 	meta := stream.Metadata{
@@ -189,7 +193,7 @@ func initStream(t *testing.T, store *stream.Store, id string) {
 		FrameRate:          23.976,
 		TargetDurationSecs: 2,
 	}
-	err := store.Init(id, meta, []byte("init-data"), 10, 1024, 5, 2, config.DefaultMediaWindowSize,
+	err := store.Init(id, meta, []byte("init-data"), 20, 1024, 12, 2, config.DefaultMediaWindowSize,
 		int64(config.DefaultMaxLookaheadMultiplier)*int64(meta.TargetDurationSecs)*1000)
 	require.NoError(t, err)
 	t.Cleanup(func() { store.Delete(id) })
@@ -224,7 +228,10 @@ func commitSegmentGen(t *testing.T, s *stream.Stream, index uint32, data []byte,
 	require.NoError(t, err)
 }
 
-// initHeaders returns the minimum set of valid init headers.
+// initHeaders returns the minimum set of valid init headers. SEGMENT-CAP
+// and BACKWARD-BUFFER-SIZE are sized so the default playlist window
+// (DefaultMediaWindowSize = 12) fits inside the
+// playlistWindowSize <= backwardBufferSize bound the API enforces.
 func initHeaders() map[string]string {
 	return map[string]string{
 		"X-SL-BANDWIDTH":            "4000000",
@@ -232,9 +239,9 @@ func initHeaders() map[string]string {
 		"X-SL-RESOLUTION":           "1920x1080",
 		"X-SL-FRAMERATE":            "23.976",
 		"X-SL-TARGET-DURATION":      "2",
-		"X-SL-SEGMENT-CAP":          "10",
+		"X-SL-SEGMENT-CAP":          "20",
 		"X-SL-SEGMENT-BYTES":        "1024",
-		"X-SL-BACKWARD-BUFFER-SIZE": "5",
+		"X-SL-BACKWARD-BUFFER-SIZE": "12",
 	}
 }
 

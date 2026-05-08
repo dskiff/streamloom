@@ -18,7 +18,7 @@ curl -X POST http://localhost:8081/api/v1/stream/1/init \
   -H "X-SL-TARGET-DURATION: 3" \
   -H "X-SL-SEGMENT-CAP: 30" \
   -H "X-SL-SEGMENT-BYTES: 524288" \
-  -H "X-SL-BACKWARD-BUFFER-SIZE: 6" \
+  -H "X-SL-BACKWARD-BUFFER-SIZE: 12" \
   --data-binary @init.mp4
 
 # Push segments for stream 1...
@@ -105,13 +105,14 @@ Required headers:
 | `X-SL-TARGET-DURATION` | Integer (seconds, >0) | `3` | HLS `EXT-X-TARGETDURATION` value |
 | `X-SL-SEGMENT-CAP` | Integer (count, >0) | `30` | Buffer capacity (max segments held) |
 | `X-SL-SEGMENT-BYTES` | Integer (bytes, >0) | `524288` | Pre-allocated byte capacity per segment slot |
-| `X-SL-BACKWARD-BUFFER-SIZE` | Integer (>0, < segment cap) | `6` | Max past segments to retain; oldest are evicted on each push |
+| `X-SL-BACKWARD-BUFFER-SIZE` | Integer (>0, < segment cap) | `12` | Max past segments to retain; oldest are evicted on each push. Must be `>= X-SL-PLAYLIST-WINDOW-SIZE` (or the default `12`). |
 
 Optional headers:
 
 | Header | Format | Example | Description |
 |--------|--------|---------|-------------|
 | `X-SL-MAX-LOOKAHEAD-MS` | Integer (ms, >=0) | `6000` | How far ahead of wall clock the media playlist tail may sit. Defaults to `3 × X-SL-TARGET-DURATION × 1000`. If set, must be `0` (pin tail at wall clock; legacy behavior) or `>= X-SL-TARGET-DURATION × 1000` and at most `3600000` (1 hour). Emitted to clients as `EXT-X-SERVER-CONTROL:HOLD-BACK`. Each request also gets an `EXT-X-START:TIME-OFFSET=-<gap>,PRECISE=YES` where `<gap>` is the seconds between the playlist tail's PDT and the request's wall clock (floored at `3 × X-SL-TARGET-DURATION` for spec compliance). That places the starting segment's `EXT-X-PROGRAM-DATE-TIME` at the viewer's wall clock, so two viewers on separate devices (e.g. talking on the phone) see the same content at the same instant. |
+| `X-SL-PLAYLIST-WINDOW-SIZE` | Integer (count, >0) | `8` | Maximum number of segments listed in the media playlist. Defaults to `12`. Must be `<= X-SL-BACKWARD-BUFFER-SIZE` so the published window stays inside the retained-backward eviction guarantee — a longer window would advertise positions older than eviction is obligated to keep. |
 
 The request body should contain the raw init segment data. This endpoint must be called at least once per stream before pushing segments.
 

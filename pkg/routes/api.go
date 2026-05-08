@@ -559,6 +559,32 @@ func API(logger *slog.Logger, env config.Env, store *stream.Store, requestLogger
 				return
 			}
 
+			// Playlist window: number of segments listed in the media
+			// playlist. Defaults to DefaultMediaWindowSize. Overridable via
+			// X-SL-PLAYLIST-WINDOW-SIZE; bounded above by
+			// backwardBufferSize so the published window never advertises a
+			// position that eviction is not obligated to keep. The same
+			// bound is enforced in stream.Init; we surface it here for a
+			// clearer 400 with header context.
+			playlistWindowSize := config.DefaultMediaWindowSize
+			if v := r.Header.Get("X-SL-PLAYLIST-WINDOW-SIZE"); v != "" {
+				parsed, perr := strconv.Atoi(v)
+				if perr != nil || parsed <= 0 {
+					logger.Warn("invalid playlist-window-size header", "value", v, "error", perr)
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				playlistWindowSize = parsed
+			}
+			if playlistWindowSize > backwardBufferSize {
+				logger.Warn("playlist-window-size exceeds backward-buffer-size",
+					"playlist_window_size", playlistWindowSize,
+					"backward_buffer_size", backwardBufferSize,
+				)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+
 			// Playlist look-ahead cap: how far ahead of wall clock the
 			// media-playlist tail may sit. Defaults to
 			// DefaultMaxLookaheadMultiplier × target-duration so PDT-sync'd
@@ -609,7 +635,7 @@ func API(logger *slog.Logger, env config.Env, store *stream.Store, requestLogger
 				initOpts = append(initOpts, stream.WithMintToken(minter))
 			}
 
-			if err := store.Init(streamID, meta, initData, segmentCap, meta.SegmentByteCount, backwardBufferSize, env.BUFFER_WORKING_SPACE, config.DefaultMediaWindowSize, maxLookaheadMs, initOpts...); err != nil {
+			if err := store.Init(streamID, meta, initData, segmentCap, meta.SegmentByteCount, backwardBufferSize, env.BUFFER_WORKING_SPACE, playlistWindowSize, maxLookaheadMs, initOpts...); err != nil {
 				if errors.Is(err, stream.ErrStreamExists) {
 					logger.Warn("stream already exists", "streamID", streamID)
 					w.WriteHeader(http.StatusConflict)
@@ -628,6 +654,7 @@ func API(logger *slog.Logger, env config.Env, store *stream.Store, requestLogger
 				"segmentCap", segmentCap,
 				"segmentBytes", meta.SegmentByteCount,
 				"backwardBufferSize", backwardBufferSize,
+				"playlistWindowSize", playlistWindowSize,
 			)
 
 			w.WriteHeader(http.StatusCreated)

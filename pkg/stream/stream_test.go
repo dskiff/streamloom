@@ -19,7 +19,11 @@ const testSegmentBytes = 1024
 const testCap = 100
 const testBackwardBufferSize = 99
 
-const testPlaylistWindowSize = 12
+// testPlaylistWindowSize is small enough to satisfy the
+// playlistWindowSize <= backwardBufferSize bound for every Init call site
+// in this file (the tightest is backwardBufferSize=1). Tests that assert
+// on a specific window are in playlist_test.go and pass literal values.
+const testPlaylistWindowSize = 1
 
 // testMaxLookaheadMs is the look-ahead cap used by default in unit tests. Zero
 // pins the playlist tail at wall clock, matching pre-look-ahead behavior so
@@ -1269,6 +1273,31 @@ func TestInitRejectsZeroPlaylistWindowSize(t *testing.T) {
 	err = store.Init("1", Metadata{TargetDurationSecs: 2}, []byte{0x00}, 10, testSegmentBytes, 9, 0, 5, testMaxLookaheadMs)
 	assert.NoError(t, err, "valid")
 	t.Cleanup(func() { store.Delete("1") })
+}
+
+func TestInitRejectsPlaylistWindowSizeAboveBackwardBuffer(t *testing.T) {
+	store := NewStore(clock.Real{})
+
+	// playlistWindowSize > backwardBufferSize should fail: the published
+	// window must fit inside the retained-backward eviction guarantee.
+	err := store.Init("1", Metadata{TargetDurationSecs: 2}, []byte{0x00}, 10, testSegmentBytes, 5, 0, 6, testMaxLookaheadMs)
+	assert.ErrorIs(t, err, ErrInvalidPlaylistWindowSize, "window > backward")
+
+	// Equal is the tight limit and must succeed.
+	err = store.Init("1", Metadata{TargetDurationSecs: 2}, []byte{0x00}, 10, testSegmentBytes, 5, 0, 5, testMaxLookaheadMs)
+	assert.NoError(t, err, "window == backward")
+	t.Cleanup(func() { store.Delete("1") })
+}
+
+func TestInitStoresPlaylistWindowSize(t *testing.T) {
+	store := NewStore(clock.Real{})
+	require.NoError(t, store.Init("1", Metadata{TargetDurationSecs: 2}, []byte{0x00},
+		10, testSegmentBytes, 9, 0, 7, testMaxLookaheadMs))
+	t.Cleanup(func() { store.Delete("1") })
+
+	s := store.Get("1")
+	require.NotNil(t, s)
+	assert.Equal(t, 7, s.PlaylistWindowSize())
 }
 
 func TestInitRejectsNegativeMaxLookahead(t *testing.T) {

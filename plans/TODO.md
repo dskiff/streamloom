@@ -123,3 +123,22 @@ PDT close to wall time.
       Required for sub-second cross-device drift; spans ingest, storage,
       renderer, and routes. Out of scope until PDT-anchor + hold-back
       convergence proves insufficient in the field.
+
+## Per-stream playlist window size
+
+- [x] Make playlist window size configurable per stream. New
+      `X-SL-PLAYLIST-WINDOW-SIZE` header on `/init`, optional, defaults
+      to `DefaultMediaWindowSize` (12). Bound: `0 < windowSize <=
+      backwardBufferSize` so the published window stays inside the
+      retained-backward eviction guarantee. Enforced both at the API
+      boundary (clear 400 with header context) and in `Store.Init`
+      (`ErrInvalidPlaylistWindowSize`). Field stored on `*Stream` and
+      exposed via `PlaylistWindowSize()` to mirror `MaxLookaheadMs()`;
+      renderer reads from the struct rather than receiving it as a
+      goroutine arg. Tests:
+      `TestPostInit_PlaylistWindowSize{Default,Override,
+      ZeroRejected,NegativeRejected,UnparseableRejected,
+      AboveBackwardBufferRejected,DefaultExceedsBackwardBufferRejected}`,
+      `TestInitRejectsPlaylistWindowSizeAboveBackwardBuffer`,
+      `TestInitStoresPlaylistWindowSize`. README updated with the
+      header and the `X-SL-BACKWARD-BUFFER-SIZE` interaction.

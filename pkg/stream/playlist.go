@@ -260,8 +260,10 @@ func (s *Stream) renderMediaPlaylist(nowMs int64, windowSize int) (string, int64
 //   - the next future segment becomes eligible (timed sleep)
 //
 // It exits when the done channel is closed (stream deletion).
-func (s *Stream) runPlaylistRenderer(windowSize int) {
+func (s *Stream) runPlaylistRenderer() {
 	defer close(s.stopped)
+
+	windowSize := s.playlistWindowSize
 
 	timer := s.clock.NewTimer(0)
 	// Drain the initial fire so the timer starts in a stopped state.

@@ -140,6 +140,13 @@ type Stream struct {
 	// so the renderer reads it without locking.
 	maxLookaheadMs int64
 
+	// playlistWindowSize is the maximum number of segments the renderer
+	// emits in the media playlist. Set once during Init and never mutated,
+	// so the renderer reads it without locking. Bound:
+	// 0 < playlistWindowSize <= backwardBufferSize, enforced in
+	// Store.Init.
+	playlistWindowSize int
+
 	// totalSegmentCount is the total number of segments ever added to this stream.
 	// Useful for deriving EXT-X-MEDIA-SEQUENCE in playlist generation.
 	totalSegmentCount int64
@@ -192,6 +199,13 @@ func (s *Stream) TotalSegmentCount() int64 {
 // required.
 func (s *Stream) MaxLookaheadMs() int64 {
 	return s.maxLookaheadMs
+}
+
+// PlaylistWindowSize returns the per-stream maximum number of segments
+// emitted in the media playlist. The field is set once at Init and
+// immutable, so no lock is required.
+func (s *Stream) PlaylistWindowSize() int {
+	return s.playlistWindowSize
 }
 
 // SegmentLoad returns the current number of buffered segments and the capacity.
@@ -491,8 +505,11 @@ func NewStore(clk clock.Clock) *Store {
 // ErrInvalidTargetDuration is returned when TargetDurationSecs is not positive.
 var ErrInvalidTargetDuration = errors.New("metadata.TargetDurationSecs must be > 0")
 
-// ErrInvalidPlaylistWindowSize is returned when playlistWindowSize is not positive.
-var ErrInvalidPlaylistWindowSize = errors.New("playlistWindowSize must be > 0")
+// ErrInvalidPlaylistWindowSize is returned when playlistWindowSize is not
+// positive or exceeds backwardBufferSize. The upper bound matches the
+// retention contract: the playlist must not list segments older than what
+// the backward-buffer eviction policy guarantees to keep.
+var ErrInvalidPlaylistWindowSize = errors.New("playlistWindowSize must be > 0 and <= backwardBufferSize")
 
 // ErrInvalidBackwardBufferSize is returned when backwardBufferSize is less than 1
 // or not less than the segment capacity.
@@ -566,7 +583,9 @@ func WithMintToken(m PlaylistTokenMinter) InitOption {
 // allow concurrent handlers to hold buffers before committing.
 // backwardBufferSize controls how many past segments are retained during eviction;
 // it must be >= 1 and < segmentCapacity.
-// playlistWindowSize is the maximum number of segments in the media playlist.
+// playlistWindowSize is the maximum number of segments in the media playlist;
+// must be > 0 and <= backwardBufferSize so the published window stays inside
+// the retained-backward eviction guarantee.
 // maxLookaheadMs is how far ahead of wall-clock the playlist tail may sit;
 // must be >= 0. A value of 0 pins the tail at wall clock (legacy behavior).
 // Optional InitOptions configure per-stream features (e.g. viewer-token minting).
@@ -577,11 +596,16 @@ func (s *Store) Init(id string, meta Metadata, initData []byte, segmentCapacity,
 	if meta.TargetDurationSecs <= 0 {
 		return ErrInvalidTargetDuration
 	}
-	if playlistWindowSize <= 0 {
-		return ErrInvalidPlaylistWindowSize
-	}
 	if backwardBufferSize < 1 || backwardBufferSize >= segmentCapacity {
 		return ErrInvalidBackwardBufferSize
+	}
+	// playlistWindowSize must fit inside the retained-backward window.
+	// The renderer takes the last N eligible segments; with N >
+	// backwardBufferSize the playlist would advertise positions older
+	// than eviction guarantees to keep, so a published index could
+	// vanish on the next commit.
+	if playlistWindowSize <= 0 || playlistWindowSize > backwardBufferSize {
+		return ErrInvalidPlaylistWindowSize
 	}
 	if workingSpace < 0 || segmentCapacity > math.MaxInt-workingSpace {
 		return ErrInvalidWorkingSpace
@@ -611,6 +635,7 @@ func (s *Store) Init(id string, meta Metadata, initData []byte, segmentCapacity,
 		bufPool:            pool.NewBufferPool(segmentCapacity+workingSpace, segmentBytes),
 		backwardBufferSize: backwardBufferSize,
 		maxLookaheadMs:     maxLookaheadMs,
+		playlistWindowSize: playlistWindowSize,
 		notifyCh:           make(chan struct{}, 1),
 		done:               make(chan struct{}),
 		stopped:            make(chan struct{}),
@@ -625,7 +650,7 @@ func (s *Store) Init(id string, meta Metadata, initData []byte, segmentCapacity,
 	s.streams[id] = st
 	s.mu.Unlock()
 
-	go st.runPlaylistRenderer(playlistWindowSize)
+	go st.runPlaylistRenderer()
 
 	return nil
 }
