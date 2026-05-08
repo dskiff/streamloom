@@ -798,7 +798,7 @@ func TestRunPlaylistRenderer_WakesAtCapCrossing(t *testing.T) {
 		FrameRate:          23.976,
 		TargetDurationSecs: 2,
 	}
-	require.NoError(t, store.Init("1", meta, []byte("init"), 20, testSegmentBytes, 10, 2, 12, lookaheadMs))
+	require.NoError(t, store.Init("1", meta, []byte("init"), 20, testSegmentBytes, 10, 2, 10, lookaheadMs))
 	t.Cleanup(func() { store.Delete("1") })
 
 	s := store.Get("1")
@@ -855,7 +855,7 @@ func TestRunPlaylistRenderer_NotifyDuringMinRenderInterval(t *testing.T) {
 		FrameRate:          23.976,
 		TargetDurationSecs: 2,
 	}
-	err := store.Init("1", meta, []byte("init"), 20, testSegmentBytes, 10, 2, 12, testMaxLookaheadMs)
+	err := store.Init("1", meta, []byte("init"), 20, testSegmentBytes, 10, 2, 10, testMaxLookaheadMs)
 	require.NoError(t, err)
 	t.Cleanup(func() { store.Delete("1") })
 
@@ -935,7 +935,7 @@ func TestRunPlaylistRenderer_NotifyRacesWithTimer(t *testing.T) {
 		FrameRate:          23.976,
 		TargetDurationSecs: 2,
 	}
-	err := store.Init("1", meta, []byte("init"), 20, testSegmentBytes, 10, 2, 12, testMaxLookaheadMs)
+	err := store.Init("1", meta, []byte("init"), 20, testSegmentBytes, 10, 2, 10, testMaxLookaheadMs)
 	require.NoError(t, err)
 	t.Cleanup(func() { store.Delete("1") })
 

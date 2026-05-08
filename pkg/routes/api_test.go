@@ -293,6 +293,84 @@ func TestPostInit_MaxLookaheadAboveCeilingRejected(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
 }
 
+func TestPostInit_PlaylistWindowSizeDefault(t *testing.T) {
+	// Header absent → default applies (DefaultMediaWindowSize).
+	router, store, _, _ := testAPIRouterWithToken(t, clock.Real{})
+	t.Cleanup(func() { store.Delete("1") })
+
+	hdrs := initHeaders() // backward-buffer-size=12, large enough for default
+	rec := postInit(router, "1", "test-token", hdrs, []byte("init-data"))
+	require.Equal(t, http.StatusCreated, rec.Code)
+
+	s := store.Get("1")
+	require.NotNil(t, s)
+	assert.Equal(t, config.DefaultMediaWindowSize, s.PlaylistWindowSize())
+}
+
+func TestPostInit_PlaylistWindowSizeOverride(t *testing.T) {
+	router, store, _, _ := testAPIRouterWithToken(t, clock.Real{})
+	t.Cleanup(func() { store.Delete("1") })
+
+	hdrs := initHeaders()
+	hdrs["X-SL-PLAYLIST-WINDOW-SIZE"] = "5"
+	rec := postInit(router, "1", "test-token", hdrs, []byte("init-data"))
+	require.Equal(t, http.StatusCreated, rec.Code)
+
+	s := store.Get("1")
+	require.NotNil(t, s)
+	assert.Equal(t, 5, s.PlaylistWindowSize())
+}
+
+func TestPostInit_PlaylistWindowSizeZeroRejected(t *testing.T) {
+	router, _, _, _ := testAPIRouterWithToken(t, clock.Real{})
+
+	hdrs := initHeaders()
+	hdrs["X-SL-PLAYLIST-WINDOW-SIZE"] = "0"
+	rec := postInit(router, "1", "test-token", hdrs, []byte("init-data"))
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+func TestPostInit_PlaylistWindowSizeNegativeRejected(t *testing.T) {
+	router, _, _, _ := testAPIRouterWithToken(t, clock.Real{})
+
+	hdrs := initHeaders()
+	hdrs["X-SL-PLAYLIST-WINDOW-SIZE"] = "-1"
+	rec := postInit(router, "1", "test-token", hdrs, []byte("init-data"))
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+func TestPostInit_PlaylistWindowSizeUnparseableRejected(t *testing.T) {
+	router, _, _, _ := testAPIRouterWithToken(t, clock.Real{})
+
+	hdrs := initHeaders()
+	hdrs["X-SL-PLAYLIST-WINDOW-SIZE"] = "abc"
+	rec := postInit(router, "1", "test-token", hdrs, []byte("init-data"))
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+func TestPostInit_PlaylistWindowSizeAboveBackwardBufferRejected(t *testing.T) {
+	// backward-buffer-size=12 in initHeaders; a window of 13 violates the
+	// playlistWindowSize <= backwardBufferSize bound.
+	router, _, _, _ := testAPIRouterWithToken(t, clock.Real{})
+
+	hdrs := initHeaders()
+	hdrs["X-SL-PLAYLIST-WINDOW-SIZE"] = "13"
+	rec := postInit(router, "1", "test-token", hdrs, []byte("init-data"))
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+func TestPostInit_PlaylistWindowSizeDefaultExceedsBackwardBufferRejected(t *testing.T) {
+	// With backward-buffer-size=5, the default playlist window (12)
+	// exceeds the bound; the request must be rejected even when the
+	// caller did not set X-SL-PLAYLIST-WINDOW-SIZE explicitly.
+	router, _, _, _ := testAPIRouterWithToken(t, clock.Real{})
+
+	hdrs := initHeaders()
+	hdrs["X-SL-BACKWARD-BUFFER-SIZE"] = "5"
+	rec := postInit(router, "1", "test-token", hdrs, []byte("init-data"))
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
 func TestPostInit_ExceedsMaxBufferBytes(t *testing.T) {
 	// With STREAM_MAX_BUFFER_BYTES=1024 and (segmentCap + workingSpace) * segmentBytes
 	// far exceeding that, the request should be rejected.

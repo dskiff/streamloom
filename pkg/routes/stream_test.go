@@ -337,7 +337,7 @@ func initStreamWithLookahead(t *testing.T, store *stream.Store, id string, targe
 		FrameRate:          23.976,
 		TargetDurationSecs: targetSecs,
 	}
-	err := store.Init(id, meta, []byte("init-data"), 10, 1024, 5, 2,
+	err := store.Init(id, meta, []byte("init-data"), 20, 1024, 12, 2,
 		config.DefaultMediaWindowSize, lookaheadMs)
 	require.NoError(t, err)
 	t.Cleanup(func() { store.Delete(id) })
