@@ -34,7 +34,10 @@ func TestMasterPlaylist_Success(t *testing.T) {
 
 	assert.Equal(t, http.StatusOK, rec.Code)
 	assert.Equal(t, config.M3U8_MIME_TYPE, rec.Header().Get("Content-Type"))
-	assert.Equal(t, "no-cache", rec.Header().Get("Cache-Control"))
+	// no-store on master: each session needs its own master fetch to
+	// capture a fresh wall-clock-aligned `?to=`. A CDN caching master
+	// would lock multiple sessions to one offset.
+	assert.Equal(t, "no-store", rec.Header().Get("Cache-Control"))
 	assert.NotEmpty(t, rec.Header().Get("Content-Length"))
 
 	body := rec.Body.String()
@@ -44,7 +47,76 @@ func TestMasterPlaylist_Success(t *testing.T) {
 	assert.Contains(t, body, "RESOLUTION=1920x1080")
 	assert.Contains(t, body, `CODECS="avc1.64001f"`)
 	assert.Contains(t, body, "FRAME-RATE=23.976")
-	assert.Contains(t, body, "media.m3u8")
+	// Pre-live-edge (no segments yet): master emits a bare `media.m3u8`
+	// URI; once segments arrive subsequent master fetches will bake the
+	// fresh `?to=` (covered by TestMasterPlaylist_BakesStickyOffset).
+	assert.Contains(t, body, "\nmedia.m3u8\n")
+}
+
+// TestMasterPlaylist_BakesStickyOffset asserts the master playlist
+// bakes a fresh `?to=<magnitude>` into the media URI once a snapshot
+// is available. This is what gives the iOS-stable property: the
+// player parses the URL once and reloads it every cycle, so the
+// rendered EXT-X-START stays byte-identical for the session.
+func TestMasterPlaylist_BakesStickyOffset(t *testing.T) {
+	clk := clock.NewMock(time.UnixMilli(0))
+	streamRouter, apiRouter, store, _ := testBothRoutersWithToken(t, clk)
+
+	hdrs := initHeaders()
+	hdrs["X-SL-MAX-LOOKAHEAD-MS"] = "10000"
+	rec := postInit(apiRouter, "1", "test-token", hdrs, []byte("init-data"))
+	require.Equal(t, http.StatusCreated, rec.Code)
+	t.Cleanup(func() { store.Delete("1") })
+
+	rec = postSegment(apiRouter, "1", "test-token", "0", "8000", "2000", []byte("seg"))
+	require.Equal(t, http.StatusCreated, rec.Code)
+
+	s := store.Get("1")
+	require.NotNil(t, s)
+	require.Eventually(t, func() bool {
+		return strings.Contains(s.CachedPlaylist(), "segment_0.m4s")
+	}, 2*time.Second, 10*time.Millisecond)
+
+	// At clock=1500: tail=10000, gap=(10000-1500)/1000=8.500.
+	clk.Set(time.UnixMilli(1500))
+	req := httptest.NewRequest(http.MethodGet, "/stream/1/stream.m3u8", nil)
+	rec = httptest.NewRecorder()
+	streamRouter.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.Contains(t, rec.Body.String(), "\nmedia.m3u8?to=8.500\n",
+		"master must bake the fresh tail-to-now offset into the media URI")
+}
+
+// TestMasterPlaylist_BakesStickyOffsetClampsToFloor mirrors the
+// sticky-floor invariant at the master level: when the tail sits at
+// or behind wall clock the baked magnitude clamps to MinHoldBackSecs
+// rather than going zero / positive.
+func TestMasterPlaylist_BakesStickyOffsetClampsToFloor(t *testing.T) {
+	clk := clock.NewMock(time.UnixMilli(0))
+	streamRouter, apiRouter, store, _ := testBothRoutersWithToken(t, clk)
+
+	hdrs := initHeaders()
+	hdrs["X-SL-MAX-LOOKAHEAD-MS"] = "10000" // MinHoldBack=6 (3 × target=2)
+	rec := postInit(apiRouter, "1", "test-token", hdrs, []byte("init-data"))
+	require.Equal(t, http.StatusCreated, rec.Code)
+	t.Cleanup(func() { store.Delete("1") })
+
+	rec = postSegment(apiRouter, "1", "test-token", "0", "2000", "2000", []byte("seg")) // endMs=4000
+	require.Equal(t, http.StatusCreated, rec.Code)
+
+	s := store.Get("1")
+	require.NotNil(t, s)
+	require.Eventually(t, func() bool {
+		return strings.Contains(s.CachedPlaylist(), "segment_0.m4s")
+	}, 2*time.Second, 10*time.Millisecond)
+
+	// 100s past endMs — raw gap = -100s → clamp to MinHoldBack=6.
+	clk.Set(time.UnixMilli(104_000))
+	req := httptest.NewRequest(http.MethodGet, "/stream/1/stream.m3u8", nil)
+	rec = httptest.NewRecorder()
+	streamRouter.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.Contains(t, rec.Body.String(), "\nmedia.m3u8?to=6.000\n")
 }
 
 func TestMasterPlaylist_StreamNotFound(t *testing.T) {
@@ -105,7 +177,7 @@ func TestE2E_InitPushRetrieve(t *testing.T) {
 		return p != "" && strings.Contains(p, "segment_0.m4s")
 	}, 2*time.Second, 10*time.Millisecond)
 
-	rec, _ = fetchMediaPlaylist(t, streamRouter, "/stream/1/media.m3u8")
+	rec, _ = fetchMediaViaMaster(t, streamRouter, "/stream/1/stream.m3u8")
 	assert.Equal(t, http.StatusOK, rec.Code)
 	assert.Contains(t, rec.Body.String(), "segment_0.m4s")
 }
@@ -145,7 +217,7 @@ func TestE2E_LookaheadLiveEdge(t *testing.T) {
 		return p != "" && strings.Contains(p, "segment_2.m4s")
 	}, 2*time.Second, 10*time.Millisecond)
 
-	rec, _ = fetchMediaPlaylist(t, streamRouter, "/stream/1/media.m3u8")
+	rec, _ = fetchMediaViaMaster(t, streamRouter, "/stream/1/stream.m3u8")
 	require.Equal(t, http.StatusOK, rec.Code)
 
 	body := rec.Body.String()
@@ -153,12 +225,13 @@ func TestE2E_LookaheadLiveEdge(t *testing.T) {
 	// HOLD-BACK reflects the configured look-ahead cap (6000ms = 6.000s).
 	assert.Contains(t, body, "#EXT-X-SERVER-CONTROL:HOLD-BACK=6.000\n")
 
-	// The bare-fetch redirect captured a fresh offset against the
-	// current snapshot: tail PDT (8.000s) − wall clock (1.000s) =
-	// 7.000s. The sticky URL bakes this magnitude and renders it
-	// verbatim. PRECISE=YES eliminates segment-boundary snap.
-	// Start content PDT = 8.000 − 7.000 = 1.000s, exactly wall clock
-	// at session start.
+	// The master baked a fresh offset against the current snapshot:
+	// tail PDT (8.000s) − wall clock (1.000s) = 7.000s. The sticky
+	// URL the master emits carries this magnitude as `?to=7.000` and
+	// the media handler renders it verbatim into EXT-X-START.
+	// PRECISE=YES eliminates segment-boundary snap. Start content
+	// PDT = 8.000 − 7.000 = 1.000s, exactly wall clock at session
+	// start.
 	assert.Contains(t, body, "#EXT-X-START:TIME-OFFSET=-7.000,PRECISE=YES\n")
 
 	// Tail PDT ≈ 1970-01-01T00:00:06.000Z (now + 6s).
@@ -174,14 +247,13 @@ func TestE2E_LookaheadLiveEdge(t *testing.T) {
 }
 
 // TestE2E_StartOffsetTracksWallClock exercises cross-device sync
-// end-to-end through the sticky-offset redirect: push a segment whose
-// tail PDT sits well ahead of wall clock, then fetch the bare media
-// playlist as two viewers at different walls. Each viewer's redirect
-// bakes a different `?to=` magnitude, and the rendered playlist
-// each follows places each viewer's start content PDT at their own
-// wall clock — preserving the cross-device-sync guarantee while
-// keeping the EXT-X-START line stable across reloads within each
-// session (the iOS compat property).
+// end-to-end through the master-bake flow: two viewers fetch
+// stream.m3u8 at different walls, each one's master bakes a different
+// `?to=` magnitude into the media URI, and the rendered playlist each
+// fetches via that URI places each viewer's start content PDT at
+// their own wall clock. The sticky URL is reused on every reload, so
+// EXT-X-START stays byte-identical within each session — the iOS
+// compat property.
 func TestE2E_StartOffsetTracksWallClock(t *testing.T) {
 	clk := clock.NewMock(time.UnixMilli(0))
 	streamRouter, apiRouter, store, _ := testBothRoutersWithToken(t, clk)
@@ -209,19 +281,20 @@ func TestE2E_StartOffsetTracksWallClock(t *testing.T) {
 
 	const endMs = 10000
 
-	// Viewer A at clock=1000: bare fetch → 302 → followed playlist.
-	// Redirect captures fresh gap = (10000-1000)/1000 = 9.000s.
+	// Viewer A: master fetch at wall=1000 bakes ?to=9.000 (tail-to-now
+	// gap = (10000-1000)/1000). Following the URL renders EXT-X-START
+	// with that magnitude verbatim.
 	clk.Set(time.UnixMilli(1000))
-	recA, urlA := fetchMediaPlaylist(t, streamRouter, "/stream/1/media.m3u8")
+	recA, urlA := fetchMediaViaMaster(t, streamRouter, "/stream/1/stream.m3u8")
 	require.Equal(t, http.StatusOK, recA.Code)
 	assert.Contains(t, urlA, "to=9.000", "A's sticky URL must bake 9.000s")
 	offA := extractStartOffsetSecs(t, recA.Body.String())
 	assert.InDelta(t, 9.0, offA, 0.001)
 
-	// Viewer B at clock=2200 (same cached body, new session).
-	// Redirect captures fresh gap = (10000-2200)/1000 = 7.800s.
+	// Viewer B: master fetch at wall=2200 (same cached body, new
+	// session) bakes ?to=7.800.
 	clk.Set(time.UnixMilli(2200))
-	recB, urlB := fetchMediaPlaylist(t, streamRouter, "/stream/1/media.m3u8")
+	recB, urlB := fetchMediaViaMaster(t, streamRouter, "/stream/1/stream.m3u8")
 	require.Equal(t, http.StatusOK, recB.Code)
 	assert.Contains(t, urlB, "to=7.800", "B's sticky URL must bake 7.800s")
 	offB := extractStartOffsetSecs(t, recB.Body.String())
@@ -238,7 +311,8 @@ func TestE2E_StartOffsetTracksWallClock(t *testing.T) {
 
 	// Sticky invariant: A reloading their own sticky URL at a much
 	// later wall clock still gets a byte-identical EXT-X-START. This
-	// is what current iOS/macOS clients require.
+	// is what current iOS/macOS clients require — the player parses
+	// the URL once from the master and reloads it every cycle.
 	clk.Set(time.UnixMilli(8000))
 	reqAReload := httptest.NewRequest(http.MethodGet, urlA, nil)
 	recAReload := httptest.NewRecorder()
@@ -286,7 +360,7 @@ func TestE2E_LookaheadContiguityUnderReordering(t *testing.T) {
 		return strings.Contains(s.CachedPlaylist(), "segment_2.m4s")
 	}, 2*time.Second, 10*time.Millisecond)
 
-	rec, _ = fetchMediaPlaylist(t, streamRouter, "/stream/1/media.m3u8")
+	rec, _ = fetchMediaViaMaster(t, streamRouter, "/stream/1/stream.m3u8")
 	require.Equal(t, http.StatusOK, rec.Code)
 	body := rec.Body.String()
 	assert.Contains(t, body, "segment_2.m4s")
@@ -353,7 +427,7 @@ func TestE2E_StringStreamID(t *testing.T) {
 		return p != "" && strings.Contains(p, "segment_0.m4s")
 	}, 2*time.Second, 10*time.Millisecond)
 
-	rec, _ = fetchMediaPlaylist(t, streamRouter, "/stream/myStream/media.m3u8")
+	rec, _ = fetchMediaViaMaster(t, streamRouter, "/stream/myStream/stream.m3u8")
 	assert.Equal(t, http.StatusOK, rec.Code)
 	assert.Contains(t, rec.Body.String(), "segment_0.m4s")
 }
