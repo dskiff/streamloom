@@ -50,31 +50,33 @@ type PlaylistSnapshot struct {
 	MinHoldBackSecs float64
 }
 
-// StartLine formats the EXT-X-START tag for a request arriving at nowMs.
-// TIME-OFFSET magnitude is (EndMs − nowMs)/1000 — the gap, in seconds,
-// from the request's wall clock to the tail PDT — clamped from below
-// at MinHoldBackSecs. With the lookahead feature the tail sits ahead
-// of now in normal operation, so the gap is positive and the clamp
-// does not fire: the player starts at wall-clock nowMs inside the
-// playlist. Two viewers on the same cached body get different offsets
-// that each resolve start content PDT to their own wall clock, so
-// they play the same content at every shared wall time.
+// StartLineFromOffset formats the EXT-X-START tag for a pre-computed
+// offset magnitude (in seconds). The HTTP handler uses this to render
+// a playlist with an offset value supplied by the client via a sticky
+// URL param: a session captures the offset once (on its first bare
+// media fetch, via a 302) and re-uses the same value on every
+// subsequent reload, so the emitted EXT-X-START is byte-identical
+// across reloads. Stability is required by current iOS/macOS clients
+// which stall completely when TIME-OFFSET mutates between reloads.
 //
-// Once (EndMs − nowMs)/1000 drops below MinHoldBackSecs — either
-// because nowMs has advanced to within MinHoldBackSecs of a stale
-// EndMs (tail still ahead of now, but inside the floor), or because
-// nowMs has reached or passed EndMs (tail at or behind now; renderer
-// fell behind) — the clamp fires and viewers in that regime all get
-// the same -MinHoldBackSecs value; drift cancellation pauses until a
-// fresh render moves the tail farther ahead again.
+// offsetSecs is treated as a magnitude (the emitted value always has
+// a leading "-"; the tag is from the end of the Playlist). The value
+// is clamped from below at MinHoldBackSecs so a long-lived sticky URL
+// that has rolled past the floor still emits a spec-compliant tag.
+// The comparison handles NaN/Inf as "below floor" via NaN's
+// always-false comparison semantics, so even a degenerate caller
+// produces a valid tag.
 //
-// Safe to call on a nil receiver (returns ""), mirroring Assemble.
-func (snap *PlaylistSnapshot) StartLine(nowMs int64) string {
+// Upper-bound validation belongs in the HTTP handler (where the URL
+// surface that produced the value lives) and is intentionally not
+// duplicated here.
+//
+// Safe to call on a nil receiver (returns "").
+func (snap *PlaylistSnapshot) StartLineFromOffset(offsetSecs float64) string {
 	if snap == nil {
 		return ""
 	}
-	offsetSecs := float64(snap.EndMs-nowMs) / 1000.0
-	if offsetSecs < snap.MinHoldBackSecs {
+	if !(offsetSecs >= snap.MinHoldBackSecs) {
 		offsetSecs = snap.MinHoldBackSecs
 	}
 
@@ -85,6 +87,45 @@ func (snap *PlaylistSnapshot) StartLine(nowMs int64) string {
 	b.Write(strconv.AppendFloat(scratch[:0], offsetSecs, 'f', 3, 64))
 	b.WriteString(",PRECISE=YES\n")
 	return b.String()
+}
+
+// FreshOffsetSecs returns the tail-to-now gap (in seconds, positive
+// magnitude), clamped from below at MinHoldBackSecs. Used by the HTTP
+// redirect path to bake a fresh sticky offset into a `media.m3u8?to=`
+// URL — and by StartLine to derive the per-request value the body
+// renderer uses.
+//
+// Returns 0 on a nil receiver (we can't read MinHoldBackSecs without a
+// snapshot). All in-tree callers either nil-check the snapshot before
+// calling or feed the result back into StartLineFromOffset, which is
+// itself nil-safe — so the sentinel never surfaces to clients.
+func (snap *PlaylistSnapshot) FreshOffsetSecs(nowMs int64) float64 {
+	if snap == nil {
+		return 0
+	}
+	offsetSecs := float64(snap.EndMs-nowMs) / 1000.0
+	if !(offsetSecs >= snap.MinHoldBackSecs) {
+		offsetSecs = snap.MinHoldBackSecs
+	}
+	return offsetSecs
+}
+
+// StartLine formats the EXT-X-START tag for a request arriving at
+// nowMs. TIME-OFFSET magnitude is (EndMs − nowMs)/1000 — the gap, in
+// seconds, from the request's wall clock to the tail PDT — clamped
+// from below at MinHoldBackSecs. Used by Assemble for one-shot
+// rendering at a given clock.
+//
+// The HTTP handler does NOT call StartLine; it parses a sticky `?to=`
+// magnitude off the URL and calls StartLineFromOffset directly so the
+// emitted tag is byte-identical across reloads of the same URL.
+//
+// Safe to call on a nil receiver (returns ""), mirroring Assemble.
+func (snap *PlaylistSnapshot) StartLine(nowMs int64) string {
+	if snap == nil {
+		return ""
+	}
+	return snap.StartLineFromOffset(snap.FreshOffsetSecs(nowMs))
 }
 
 // Assemble returns the full playlist string for nowMs. Allocates the

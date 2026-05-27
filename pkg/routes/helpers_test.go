@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 
 	"github.com/dskiff/streamloom/pkg/clock"
@@ -15,6 +16,33 @@ import (
 	"github.com/dskiff/streamloom/pkg/watcher"
 	"github.com/stretchr/testify/require"
 )
+
+// fetchMediaPlaylist mimics an HLS player fetching media.m3u8: send the
+// initial request and, if the server responds 302 (the sticky-offset
+// redirect for a bare fetch), follow it once. Returns the final
+// (post-redirect) recorder and the final URL. Tests that want to assert
+// on the 302 itself should call router.ServeHTTP directly.
+func fetchMediaPlaylist(t *testing.T, router http.Handler, path string) (*httptest.ResponseRecorder, string) {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, path, nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusFound {
+		return rec, path
+	}
+	loc := rec.Header().Get("Location")
+	require.NotEmpty(t, loc, "302 response must include Location")
+	base, err := url.Parse(path)
+	require.NoError(t, err)
+	locURL, err := url.Parse(loc)
+	require.NoError(t, err)
+	resolved := base.ResolveReference(locURL).String()
+
+	req = httptest.NewRequest(http.MethodGet, resolved, nil)
+	rec = httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	return rec, resolved
+}
 
 // testStreamRouter creates a stream router with a pre-populated store.
 // The returned store can be used to initialize streams before making requests.
