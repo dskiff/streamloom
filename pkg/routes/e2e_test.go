@@ -105,9 +105,7 @@ func TestE2E_InitPushRetrieve(t *testing.T) {
 		return p != "" && strings.Contains(p, "segment_0.m4s")
 	}, 2*time.Second, 10*time.Millisecond)
 
-	req = httptest.NewRequest(http.MethodGet, "/stream/1/media.m3u8", nil)
-	rec = httptest.NewRecorder()
-	streamRouter.ServeHTTP(rec, req)
+	rec, _ = fetchMediaPlaylist(t, streamRouter, "/stream/1/media.m3u8")
 	assert.Equal(t, http.StatusOK, rec.Code)
 	assert.Contains(t, rec.Body.String(), "segment_0.m4s")
 }
@@ -147,9 +145,7 @@ func TestE2E_LookaheadLiveEdge(t *testing.T) {
 		return p != "" && strings.Contains(p, "segment_2.m4s")
 	}, 2*time.Second, 10*time.Millisecond)
 
-	req := httptest.NewRequest(http.MethodGet, "/stream/1/media.m3u8", nil)
-	rec = httptest.NewRecorder()
-	streamRouter.ServeHTTP(rec, req)
+	rec, _ = fetchMediaPlaylist(t, streamRouter, "/stream/1/media.m3u8")
 	require.Equal(t, http.StatusOK, rec.Code)
 
 	body := rec.Body.String()
@@ -157,10 +153,12 @@ func TestE2E_LookaheadLiveEdge(t *testing.T) {
 	// HOLD-BACK reflects the configured look-ahead cap (6000ms = 6.000s).
 	assert.Contains(t, body, "#EXT-X-SERVER-CONTROL:HOLD-BACK=6.000\n")
 
-	// EXT-X-START places the player at wall-clock now inside the
-	// playlist: TIME-OFFSET magnitude = tail PDT (8.000s) − wall clock
-	// (1.000s) = 7.000s. PRECISE=YES eliminates segment-boundary snap.
-	// Start content PDT = 8.000 − 7.000 = 1.000s, exactly wall clock.
+	// The bare-fetch redirect captured a fresh offset against the
+	// current snapshot: tail PDT (8.000s) − wall clock (1.000s) =
+	// 7.000s. The sticky URL bakes this magnitude and renders it
+	// verbatim. PRECISE=YES eliminates segment-boundary snap.
+	// Start content PDT = 8.000 − 7.000 = 1.000s, exactly wall clock
+	// at session start.
 	assert.Contains(t, body, "#EXT-X-START:TIME-OFFSET=-7.000,PRECISE=YES\n")
 
 	// Tail PDT ≈ 1970-01-01T00:00:06.000Z (now + 6s).
@@ -175,12 +173,15 @@ func TestE2E_LookaheadLiveEdge(t *testing.T) {
 	assert.NotContains(t, body, "segment_4.m4s")
 }
 
-// TestE2E_StartOffsetTracksWallClock exercises the dynamic TIME-OFFSET
-// end-to-end: push a segment whose tail PDT sits well ahead of wall
-// clock, then fetch the playlist at two different clocks on the same
-// cached body. Each response's TIME-OFFSET must equal the tail-to-now
-// gap, so each viewer's start content PDT resolves to their own wall
-// clock — the cross-device-sync guarantee.
+// TestE2E_StartOffsetTracksWallClock exercises cross-device sync
+// end-to-end through the sticky-offset redirect: push a segment whose
+// tail PDT sits well ahead of wall clock, then fetch the bare media
+// playlist as two viewers at different walls. Each viewer's redirect
+// bakes a different `?to=` magnitude, and the rendered playlist
+// each follows places each viewer's start content PDT at their own
+// wall clock — preserving the cross-device-sync guarantee while
+// keeping the EXT-X-START line stable across reloads within each
+// session (the iOS compat property).
 func TestE2E_StartOffsetTracksWallClock(t *testing.T) {
 	clk := clock.NewMock(time.UnixMilli(0))
 	streamRouter, apiRouter, store, _ := testBothRoutersWithToken(t, clk)
@@ -208,21 +209,21 @@ func TestE2E_StartOffsetTracksWallClock(t *testing.T) {
 
 	const endMs = 10000
 
-	// Viewer A at clock=1000: gap = (10000−1000)/1000 = 9.000s.
+	// Viewer A at clock=1000: bare fetch → 302 → followed playlist.
+	// Redirect captures fresh gap = (10000-1000)/1000 = 9.000s.
 	clk.Set(time.UnixMilli(1000))
-	reqA := httptest.NewRequest(http.MethodGet, "/stream/1/media.m3u8", nil)
-	recA := httptest.NewRecorder()
-	streamRouter.ServeHTTP(recA, reqA)
+	recA, urlA := fetchMediaPlaylist(t, streamRouter, "/stream/1/media.m3u8")
 	require.Equal(t, http.StatusOK, recA.Code)
+	assert.Contains(t, urlA, "to=9.000", "A's sticky URL must bake 9.000s")
 	offA := extractStartOffsetSecs(t, recA.Body.String())
 	assert.InDelta(t, 9.0, offA, 0.001)
 
-	// Viewer B at clock=2200 (same cached body): gap = 7.800s.
+	// Viewer B at clock=2200 (same cached body, new session).
+	// Redirect captures fresh gap = (10000-2200)/1000 = 7.800s.
 	clk.Set(time.UnixMilli(2200))
-	reqB := httptest.NewRequest(http.MethodGet, "/stream/1/media.m3u8", nil)
-	recB := httptest.NewRecorder()
-	streamRouter.ServeHTTP(recB, reqB)
+	recB, urlB := fetchMediaPlaylist(t, streamRouter, "/stream/1/media.m3u8")
 	require.Equal(t, http.StatusOK, recB.Code)
+	assert.Contains(t, urlB, "to=7.800", "B's sticky URL must bake 7.800s")
 	offB := extractStartOffsetSecs(t, recB.Body.String())
 	assert.InDelta(t, 7.8, offB, 0.001)
 
@@ -234,6 +235,18 @@ func TestE2E_StartOffsetTracksWallClock(t *testing.T) {
 	assert.InDelta(t, 2200, startB, 1, "viewer B start PDT must match wallB=2200")
 	assert.InDelta(t, 1200, startB-startA, 1,
 		"staggered viewers diverge in content start by exactly their wall-clock gap; got %d", startB-startA)
+
+	// Sticky invariant: A reloading their own sticky URL at a much
+	// later wall clock still gets a byte-identical EXT-X-START. This
+	// is what current iOS/macOS clients require.
+	clk.Set(time.UnixMilli(8000))
+	reqAReload := httptest.NewRequest(http.MethodGet, urlA, nil)
+	recAReload := httptest.NewRecorder()
+	streamRouter.ServeHTTP(recAReload, reqAReload)
+	require.Equal(t, http.StatusOK, recAReload.Code)
+	assert.Equal(t, extractStartOffsetSecs(t, recA.Body.String()),
+		extractStartOffsetSecs(t, recAReload.Body.String()),
+		"reload of A's sticky URL must echo the same EXT-X-START across walls")
 }
 
 func TestE2E_LookaheadContiguityUnderReordering(t *testing.T) {
@@ -273,9 +286,7 @@ func TestE2E_LookaheadContiguityUnderReordering(t *testing.T) {
 		return strings.Contains(s.CachedPlaylist(), "segment_2.m4s")
 	}, 2*time.Second, 10*time.Millisecond)
 
-	req := httptest.NewRequest(http.MethodGet, "/stream/1/media.m3u8", nil)
-	rec = httptest.NewRecorder()
-	streamRouter.ServeHTTP(rec, req)
+	rec, _ = fetchMediaPlaylist(t, streamRouter, "/stream/1/media.m3u8")
 	require.Equal(t, http.StatusOK, rec.Code)
 	body := rec.Body.String()
 	assert.Contains(t, body, "segment_2.m4s")
@@ -342,9 +353,7 @@ func TestE2E_StringStreamID(t *testing.T) {
 		return p != "" && strings.Contains(p, "segment_0.m4s")
 	}, 2*time.Second, 10*time.Millisecond)
 
-	req = httptest.NewRequest(http.MethodGet, "/stream/myStream/media.m3u8", nil)
-	rec = httptest.NewRecorder()
-	streamRouter.ServeHTTP(rec, req)
+	rec, _ = fetchMediaPlaylist(t, streamRouter, "/stream/myStream/media.m3u8")
 	assert.Equal(t, http.StatusOK, rec.Code)
 	assert.Contains(t, rec.Body.String(), "segment_0.m4s")
 }

@@ -3,6 +3,7 @@ package stream
 import (
 	"bytes"
 	"fmt"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -609,6 +610,95 @@ func TestPlaylistSnapshot_StartLineGapAcrossFloor(t *testing.T) {
 	// Well below the floor: gap = 4 → clamp → 6.000.
 	assert.Equal(t, "#EXT-X-START:TIME-OFFSET=-6.000,PRECISE=YES\n",
 		snap.StartLine(5000)) // gap = 4.000
+}
+
+// --- StartLineFromOffset tests (sticky URL render path) ---
+
+// TestPlaylistSnapshot_StartLineFromOffset_FormatsMagnitude is the
+// happy-path formatter: a magnitude well above the floor renders as a
+// literal "-X.XXX" value, exactly as supplied. The HTTP handler uses
+// this to echo a client-supplied sticky `?to=` verbatim, which is
+// what makes EXT-X-START byte-identical across reloads.
+func TestPlaylistSnapshot_StartLineFromOffset_FormatsMagnitude(t *testing.T) {
+	_, s := setupStreamForPlaylistWithLookahead(t, 2, 10000)
+	mustCommitSlot(t, s, 0, []byte("d"), 10000, 2000) // endMs = 12000
+
+	s.mu.RLock()
+	snap, _ := s.renderPlaylistCache(2000, 12)
+	s.mu.RUnlock()
+	require.NotNil(t, snap)
+
+	assert.Equal(t, "#EXT-X-START:TIME-OFFSET=-8.500,PRECISE=YES\n",
+		snap.StartLineFromOffset(8.5))
+	assert.Equal(t, "#EXT-X-START:TIME-OFFSET=-12.345,PRECISE=YES\n",
+		snap.StartLineFromOffset(12.345))
+}
+
+// TestPlaylistSnapshot_StartLineFromOffset_ClampsBelowFloor asserts the
+// formatter floors the magnitude at MinHoldBackSecs (3 × target-duration,
+// RFC 8216 §4.4.3.8). A sticky URL captured at a later wall clock that
+// has aged past the floor still emits a spec-compliant tag rather than
+// a sub-floor value.
+func TestPlaylistSnapshot_StartLineFromOffset_ClampsBelowFloor(t *testing.T) {
+	// target=2s → MinHoldBack=6s.
+	_, s := setupStreamForPlaylistWithLookahead(t, 2, 6000)
+	mustCommitSlot(t, s, 0, []byte("d"), 2000, 2000)
+
+	s.mu.RLock()
+	snap, _ := s.renderPlaylistCache(1000, 12)
+	s.mu.RUnlock()
+	require.NotNil(t, snap)
+	require.Equal(t, 6.0, snap.MinHoldBackSecs)
+
+	// Sub-floor: clamps to 6.000.
+	assert.Equal(t, "#EXT-X-START:TIME-OFFSET=-6.000,PRECISE=YES\n",
+		snap.StartLineFromOffset(0.5))
+	assert.Equal(t, "#EXT-X-START:TIME-OFFSET=-6.000,PRECISE=YES\n",
+		snap.StartLineFromOffset(0))
+	// Negative inputs would mean a positive TIME-OFFSET; clamp to floor.
+	assert.Equal(t, "#EXT-X-START:TIME-OFFSET=-6.000,PRECISE=YES\n",
+		snap.StartLineFromOffset(-3.0))
+	// NaN: comparison vs MinHoldBack is always false → clamp engages.
+	assert.Equal(t, "#EXT-X-START:TIME-OFFSET=-6.000,PRECISE=YES\n",
+		snap.StartLineFromOffset(math.NaN()))
+}
+
+// TestPlaylistSnapshot_StartLineFromOffset_NilReceiver mirrors StartLine
+// and Assemble: safe to call on nil, returns "".
+func TestPlaylistSnapshot_StartLineFromOffset_NilReceiver(t *testing.T) {
+	var snap *PlaylistSnapshot
+	assert.Equal(t, "", snap.StartLineFromOffset(7.5))
+}
+
+// TestPlaylistSnapshot_StartLineFromOffset_AcrossSnapshotUpdates asserts
+// the sticky semantic from the formatter's point of view: the same
+// offset magnitude renders identically across two different snapshots
+// (different EndMs values from successive renders). This is what gives
+// the iOS-stable property — the EXT-X-START line is a pure function of
+// the supplied offset and the snapshot's MinHoldBackSecs floor, NOT of
+// EndMs or wall clock.
+func TestPlaylistSnapshot_StartLineFromOffset_AcrossSnapshotUpdates(t *testing.T) {
+	_, s := setupStreamForPlaylistWithLookahead(t, 2, 10000)
+	mustCommitSlot(t, s, 0, []byte("d"), 10000, 2000) // endMs = 12000
+
+	s.mu.RLock()
+	snap1, _ := s.renderPlaylistCache(2000, 12)
+	s.mu.RUnlock()
+	require.NotNil(t, snap1)
+
+	// Commit a later segment; a new render produces a snapshot with a
+	// different EndMs.
+	mustCommitSlot(t, s, 1, []byte("d"), 12000, 2000) // endMs = 14000
+
+	s.mu.RLock()
+	snap2, _ := s.renderPlaylistCache(2000, 12)
+	s.mu.RUnlock()
+	require.NotNil(t, snap2)
+	require.NotEqual(t, snap1.EndMs, snap2.EndMs, "snapshots must differ in EndMs")
+
+	const sticky = 8.5
+	assert.Equal(t, snap1.StartLineFromOffset(sticky), snap2.StartLineFromOffset(sticky),
+		"a sticky offset must render byte-identically across snapshots with different EndMs")
 }
 
 // TestPlaylistSnapshot_AssembleEqualsRenderMediaPlaylist guarantees the

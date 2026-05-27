@@ -176,3 +176,17 @@ http://localhost:8080/stream/1/stream.m3u8?vt=<vt>
 ```
 
 When `SL_STREAM_<id>_VIEWER_TOKEN_KEY` is configured, the server automatically rewrites playlist URIs so that `?vt=<token>` propagates from `stream.m3u8` (using the viewer's own playlist-class token) to `media.m3u8` and from `media.m3u8` (using the server-minted short-lived segment-class token) to every init / segment URI. HLS players do not carry parent query strings across relative URIs, so this rewrite is required for standard-compliant playback.
+
+## Sticky `EXT-X-START:TIME-OFFSET`
+
+`media.m3u8` carries a `?to=<magnitude>` query parameter that locks the emitted `#EXT-X-START:TIME-OFFSET=-<magnitude>,PRECISE=YES` tag for the life of a viewer session. A bare `GET /stream/{id}/media.m3u8` (no `?to=`) responds with `302 Found` to `media.m3u8?to=<fresh>`, where `<fresh>` is the tail-to-now gap captured against the current playlist snapshot. The HLS player follows the redirect once and reuses the redirected URL on every subsequent reload, so the `TIME-OFFSET` value stays byte-identical for that viewer's session.
+
+Why: recent iOS/macOS clients stall completely when `TIME-OFFSET` mutates between consecutive playlist reloads. The sticky URL gives each session a stable value while still letting two viewers joining at different walls capture different offsets (each viewer's starting content PDT lands at their own wall clock — the cross-device-sync property).
+
+The master playlist (`stream.m3u8`) intentionally emits a bare `media.m3u8` URI (with `?vt=` propagation only). Keeping the master URI body identical for every viewer preserves CDN cacheability for `stream.m3u8`; the per-session sticky value is captured at the redirect on the next hop.
+
+Operational notes:
+- The 302 response sets `Cache-Control: no-store` so a CDN doesn't lock multiple viewers behind one captured offset.
+- An inbound `?vt=<token>` is preserved through the redirect alongside the new `?to=`.
+- A `?to=` that's malformed, negative, NaN/Inf, or out of range falls back to the same 302 behavior (rather than 4xx-ing), so a stale or hand-edited URL self-heals on next fetch.
+- At render time the supplied magnitude is clamped from below at `3 × X-SL-TARGET-DURATION` (the RFC 8216 §4.4.3.8 floor), so a sticky URL aged past the floor still emits a spec-compliant tag.
