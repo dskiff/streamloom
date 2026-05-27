@@ -195,7 +195,9 @@ func TestMediaPlaylist_WithSegments(t *testing.T) {
 		return strings.Contains(s.CachedPlaylist(), "segment_2.m4s")
 	}, 2*time.Second, 10*time.Millisecond)
 
-	rec, _ := fetchMediaPlaylist(t, router, "/stream/1/media.m3u8")
+	req := httptest.NewRequest(http.MethodGet, "/stream/1/media.m3u8", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
 
 	assert.Equal(t, http.StatusOK, rec.Code)
 	assert.Equal(t, config.M3U8_MIME_TYPE, rec.Header().Get("Content-Type"))
@@ -240,7 +242,9 @@ func TestMediaPlaylist_WallClockFiltering(t *testing.T) {
 		return strings.Contains(s.CachedPlaylist(), "segment_2.m4s")
 	}, 2*time.Second, 10*time.Millisecond)
 
-	rec, _ := fetchMediaPlaylist(t, router, "/stream/1/media.m3u8")
+	req := httptest.NewRequest(http.MethodGet, "/stream/1/media.m3u8", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
 
 	assert.Equal(t, http.StatusOK, rec.Code)
 	body := rec.Body.String()
@@ -342,76 +346,14 @@ func initStreamWithLookahead(t *testing.T, store *stream.Store, id string, targe
 
 // --- Sticky TIME-OFFSET tests ---
 //
-// A bare `media.m3u8` fetch redirects to `media.m3u8?to=<magnitude>`
-// where <magnitude> is the fresh tail-to-now gap (clamped at
-// MinHoldBackSecs from below). The redirected URL renders the playlist
-// with EXT-X-START:TIME-OFFSET=-<magnitude>. On every subsequent
-// fetch of the same URL the EXT-X-START line is byte-identical, which
-// current iOS/macOS clients require — they stall when the value
-// mutates between reloads.
-
-// TestMediaPlaylist_Sticky_BareFetchRedirects asserts the redirect
-// produces a valid sticky URL (relative `media.m3u8?to=<float>`) with
-// Cache-Control: no-store. no-store is critical: a CDN caching the
-// redirect would lock every viewer behind it to one session's offset,
-// re-introducing the cross-device-sync regression the redirect exists
-// to avoid.
-func TestMediaPlaylist_Sticky_BareFetchRedirects(t *testing.T) {
-	clk := clock.NewMock(time.UnixMilli(0))
-	router, store, _ := testStreamRouter(t, clk)
-	initStreamWithLookahead(t, store, "1", 2, 10000) // MinHoldBack=6
-
-	s := store.Get("1")
-	require.NotNil(t, s)
-	commitSegment(t, s, 0, []byte("seg0"), 8000) // endMs = 10000
-	require.Eventually(t, func() bool {
-		return s.CachedPlaylist() != ""
-	}, 2*time.Second, 10*time.Millisecond)
-
-	clk.Set(time.UnixMilli(2000)) // gap = 8.000s
-
-	req := httptest.NewRequest(http.MethodGet, "/stream/1/media.m3u8", nil)
-	rec := httptest.NewRecorder()
-	router.ServeHTTP(rec, req)
-
-	require.Equal(t, http.StatusFound, rec.Code)
-	assert.Equal(t, "no-store", rec.Header().Get("Cache-Control"))
-	loc := rec.Header().Get("Location")
-	assert.Equal(t, "media.m3u8?to=8.000", loc,
-		"redirect target must bake the fresh offset; relative URL preserves the existing playlist path")
-}
-
-// TestMediaPlaylist_Sticky_BareFetchClampsToMinHoldBack asserts the
-// redirect target's `to=` is floored at MinHoldBackSecs when the tail
-// sits at or behind wall-clock now (renderer fell behind / clock
-// caught up to a stale endMs). Without the floor the redirect would
-// produce a positive or zero `to=`, which a subsequent fetch would
-// either reject or clamp anyway — surfacing the clamp at the
-// redirect keeps the sticky URL itself spec-compliant.
-func TestMediaPlaylist_Sticky_BareFetchClampsToMinHoldBack(t *testing.T) {
-	clk := clock.NewMock(time.UnixMilli(0))
-	router, store, _ := testStreamRouter(t, clk)
-	initStreamWithLookahead(t, store, "1", 2, 10000) // MinHoldBack=6
-
-	s := store.Get("1")
-	require.NotNil(t, s)
-	commitSegment(t, s, 0, []byte("seg0"), 2000) // endMs = 4000
-
-	clk.Set(time.UnixMilli(4000))
-	require.Eventually(t, func() bool {
-		return s.CachedPlaylist() != ""
-	}, 2*time.Second, 10*time.Millisecond)
-
-	// 100s past endMs — raw gap = -100s → clamp to MinHoldBack = 6.
-	clk.Set(time.UnixMilli(104_000))
-
-	req := httptest.NewRequest(http.MethodGet, "/stream/1/media.m3u8", nil)
-	rec := httptest.NewRecorder()
-	router.ServeHTTP(rec, req)
-
-	require.Equal(t, http.StatusFound, rec.Code)
-	assert.Equal(t, "media.m3u8?to=6.000", rec.Header().Get("Location"))
-}
+// The master playlist bakes a fresh `?to=<magnitude>` (the tail-to-now
+// offset) into the media URI. The player parses that URL once from
+// the master and reuses it on every reload. The media handler echoes
+// `?to=` verbatim into EXT-X-START, so the rendered tag is
+// byte-identical across reloads — current iOS/macOS clients stall
+// when the value mutates between reloads. A request without `?to=`
+// (or with a malformed value) falls back to rendering WITHOUT
+// EXT-X-START; HOLD-BACK still positions the player at the live edge.
 
 // TestMediaPlaylist_Sticky_RendersClientSuppliedOffset asserts the
 // happy path on the sticky URL: a request with `?to=` renders the
@@ -480,12 +422,13 @@ func TestMediaPlaylist_Sticky_RenderedOffsetIsFlooredAtMinHoldBack(t *testing.T)
 	assert.Contains(t, rec.Body.String(), "#EXT-X-START:TIME-OFFSET=-6.000,PRECISE=YES\n")
 }
 
-// TestMediaPlaylist_Sticky_MalformedRedirectsRatherThanRender asserts
-// that a malformed/out-of-range `to=` falls back to the same 302
-// behavior as a missing one (rather than 400-ing). A benign client
-// mistake or stale URL should self-heal via the redirect rather than
-// surface a new failure mode to viewers.
-func TestMediaPlaylist_Sticky_MalformedRedirectsRatherThanRender(t *testing.T) {
+// TestMediaPlaylist_NoTo_OmitsStartTag asserts the fallback: a media
+// fetch without `?to=` renders the playlist body WITHOUT an
+// EXT-X-START tag. Clients fall back to HOLD-BACK alone — cross-device
+// sync precision is lost on this path but iOS doesn't stall (no tag
+// = nothing to mutate). The common flow comes through stream.m3u8
+// which bakes `?to=` for sync.
+func TestMediaPlaylist_NoTo_OmitsStartTag(t *testing.T) {
 	clk := clock.NewMock(time.UnixMilli(0))
 	router, store, _ := testStreamRouter(t, clk)
 	initStreamWithLookahead(t, store, "1", 2, 10000)
@@ -497,7 +440,33 @@ func TestMediaPlaylist_Sticky_MalformedRedirectsRatherThanRender(t *testing.T) {
 		return s.CachedPlaylist() != ""
 	}, 2*time.Second, 10*time.Millisecond)
 
-	clk.Set(time.UnixMilli(2000))
+	req := httptest.NewRequest(http.MethodGet, "/stream/1/media.m3u8", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	body := rec.Body.String()
+	assert.NotContains(t, body, "#EXT-X-START:",
+		"media.m3u8 without ?to= must omit EXT-X-START to avoid mutating it across reloads")
+	// HOLD-BACK is still there — clients position by that alone.
+	assert.Contains(t, body, "#EXT-X-SERVER-CONTROL:HOLD-BACK=")
+}
+
+// TestMediaPlaylist_MalformedTo_OmitsStartTag asserts the same
+// fallback applies to a malformed/out-of-range `?to=`. A benign client
+// mistake or stale URL falls through to the no-tag path rather than
+// hitting a new 4xx surface.
+func TestMediaPlaylist_MalformedTo_OmitsStartTag(t *testing.T) {
+	clk := clock.NewMock(time.UnixMilli(0))
+	router, store, _ := testStreamRouter(t, clk)
+	initStreamWithLookahead(t, store, "1", 2, 10000)
+
+	s := store.Get("1")
+	require.NotNil(t, s)
+	commitSegment(t, s, 0, []byte("seg0"), 8000)
+	require.Eventually(t, func() bool {
+		return s.CachedPlaylist() != ""
+	}, 2*time.Second, 10*time.Millisecond)
 
 	for _, badTo := range []string{
 		"not-a-number",
@@ -510,92 +479,18 @@ func TestMediaPlaylist_Sticky_MalformedRedirectsRatherThanRender(t *testing.T) {
 			req := httptest.NewRequest(http.MethodGet, "/stream/1/media.m3u8?to="+url.QueryEscape(badTo), nil)
 			rec := httptest.NewRecorder()
 			router.ServeHTTP(rec, req)
-			require.Equal(t, http.StatusFound, rec.Code,
-				"malformed/out-of-range ?to= must 302 to a fresh value, got %d", rec.Code)
-			loc := rec.Header().Get("Location")
-			assert.True(t, strings.HasPrefix(loc, "media.m3u8?to="),
-				"redirect target must be a fresh sticky URL; got %q", loc)
+			require.Equal(t, http.StatusOK, rec.Code,
+				"malformed ?to= must render normally without EXT-X-START, got %d", rec.Code)
+			assert.NotContains(t, rec.Body.String(), "#EXT-X-START:",
+				"malformed ?to= must omit EXT-X-START")
 		})
 	}
 }
 
-// TestMediaPlaylist_Sticky_VTPreservedAcrossRedirect asserts the
-// redirect target propagates an inbound `?vt=` so the player's
-// existing viewer-token authorization carries through to the
-// redirected URL. Without this, a viewer with a valid token would
-// follow the redirect into a 401.
-func TestMediaPlaylist_Sticky_VTPreservedAcrossRedirect(t *testing.T) {
-	clk := clock.NewMock(time.UnixMilli(0))
-	router, store, _ := testStreamRouterWithViewerKey(t, clk)
-	initStream(t, store, "1") // target=2, default lookahead=6000
-
-	s := store.Get("1")
-	require.NotNil(t, s)
-	commitSegment(t, s, 0, []byte("seg0"), 2000) // within default lookahead
-	require.Eventually(t, func() bool {
-		return s.CachedPlaylist() != ""
-	}, 2*time.Second, 10*time.Millisecond)
-
-	vt := mintPlaylistVT(t, clk)
-	req := httptest.NewRequest(http.MethodGet, "/stream/1/media.m3u8?vt="+vt, nil)
-	rec := httptest.NewRecorder()
-	router.ServeHTTP(rec, req)
-
-	require.Equal(t, http.StatusFound, rec.Code)
-	loc := rec.Header().Get("Location")
-	assert.Contains(t, loc, "to=", "redirect must bake the sticky offset")
-	assert.Contains(t, loc, "vt="+url.QueryEscape(vt),
-		"redirect must propagate the inbound vt= so the player stays authorized")
-}
-
-// TestMediaPlaylist_Sticky_TwoStaggeredSessionsAgreeOnStartTime asserts
-// the cross-device-sync invariant under the sticky-offset design: two
-// viewers performing the bare fetch at different walls each get a
-// redirect whose baked offset places their own start content PDT at
-// their own wall clock. The redirect URLs differ; the implied start
-// PDTs match each viewer's wall.
-func TestMediaPlaylist_Sticky_TwoStaggeredSessionsAgreeOnStartTime(t *testing.T) {
-	clk := clock.NewMock(time.UnixMilli(0))
-	router, store, _ := testStreamRouter(t, clk)
-	initStreamWithLookahead(t, store, "1", 2, 10000) // MinHoldBack=6
-
-	s := store.Get("1")
-	require.NotNil(t, s)
-	commitSegment(t, s, 0, []byte("seg0"), 8000) // endMs = 10000
-	require.Eventually(t, func() bool {
-		return s.CachedPlaylist() != ""
-	}, 2*time.Second, 10*time.Millisecond)
-
-	const endMs = int64(10000)
-
-	// Viewer A: bare fetch at wall=1000 → 302 to media.m3u8?to=9.000.
-	clk.Set(time.UnixMilli(1000))
-	recA, _ := fetchMediaPlaylist(t, router, "/stream/1/media.m3u8")
-	require.Equal(t, http.StatusOK, recA.Code)
-	offA := extractStartOffsetSecs(t, recA.Body.String())
-	startA := endMs - int64(offA*1000)
-	wallA := int64(1000)
-
-	// Viewer B: bare fetch at wall=2500 (same cached body, new session).
-	clk.Set(time.UnixMilli(2500))
-	recB, _ := fetchMediaPlaylist(t, router, "/stream/1/media.m3u8")
-	require.Equal(t, http.StatusOK, recB.Code)
-	offB := extractStartOffsetSecs(t, recB.Body.String())
-	startB := endMs - int64(offB*1000)
-	wallB := int64(2500)
-
-	// Each viewer's start content PDT equals their own wall clock.
-	assert.InDelta(t, wallA, startA, 1,
-		"viewer A start PDT must match wallA; offA=%v startA=%d", offA, startA)
-	assert.InDelta(t, wallB, startB, 1,
-		"viewer B start PDT must match wallB; offB=%v startB=%d", offB, startB)
-	assert.InDelta(t, wallB-wallA, startB-startA, 1,
-		"staggered viewers must diverge in start PDT by their wall-clock gap")
-}
-
 // TestMediaPlaylist_Sticky_ContentLengthMatchesBody guards against the
 // three-part write drifting out of sync with the Content-Length header
-// across the range of magnitudes the sticky URL can carry.
+// across the range of magnitudes the sticky URL can carry, including
+// the no-tag fallback.
 func TestMediaPlaylist_Sticky_ContentLengthMatchesBody(t *testing.T) {
 	clk := clock.NewMock(time.UnixMilli(0))
 	router, store, _ := testStreamRouter(t, clk)
@@ -608,38 +503,45 @@ func TestMediaPlaylist_Sticky_ContentLengthMatchesBody(t *testing.T) {
 		return s.CachedPlaylist() != ""
 	}, 2*time.Second, 10*time.Millisecond)
 
-	// Different magnitudes produce different StartLine widths; the
-	// handler's Content-Length must follow the rendered body.
-	for _, to := range []string{"6.000", "8.500", "1234.567"} {
-		req := httptest.NewRequest(http.MethodGet, "/stream/1/media.m3u8?to="+to, nil)
+	// Different paths through the handler produce different total
+	// widths; Content-Length must follow the rendered body in each.
+	for _, path := range []string{
+		"/stream/1/media.m3u8?to=6.000",
+		"/stream/1/media.m3u8?to=8.500",
+		"/stream/1/media.m3u8?to=1234.567",
+		"/stream/1/media.m3u8", // no-tag fallback
+	} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
 		rec := httptest.NewRecorder()
 		router.ServeHTTP(rec, req)
-		require.Equal(t, http.StatusOK, rec.Code, "to=%s", to)
+		require.Equal(t, http.StatusOK, rec.Code, "path=%s", path)
 		cl, err := strconv.Atoi(rec.Header().Get("Content-Length"))
-		require.NoError(t, err, "to=%s: Content-Length must parse", to)
+		require.NoError(t, err, "path=%s: Content-Length must parse", path)
 		assert.Equal(t, cl, rec.Body.Len(),
-			"to=%s: Content-Length header (%d) must match body length (%d)",
-			to, cl, rec.Body.Len())
+			"path=%s: Content-Length header (%d) must match body length (%d)",
+			path, cl, rec.Body.Len())
 	}
 }
 
-// TestMediaPlaylist_Sticky_PreLiveEdgeBareFetchReturns503 asserts that
-// a bare fetch before any playlist is renderable returns 503 (the
-// existing pre-live-edge response) rather than 302-ing to a URL whose
-// offset was computed against a nil snapshot.
-func TestMediaPlaylist_Sticky_PreLiveEdgeBareFetchReturns503(t *testing.T) {
+// TestMediaPlaylist_PreLiveEdgeReturns503 asserts that a fetch before
+// any playlist is renderable returns 503 — both for the no-tag path
+// and the sticky-URL path — so a player follows the existing retry
+// loop until a snapshot is available.
+func TestMediaPlaylist_PreLiveEdgeReturns503(t *testing.T) {
 	clk := clock.NewMock(time.UnixMilli(0))
 	router, store, _ := testStreamRouter(t, clk)
 	initStream(t, store, "1")
 	// No commits — handler will block on HasPlaylist, then the
 	// request context cancellation surfaces as 503.
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-	defer cancel()
-	req := httptest.NewRequest(http.MethodGet, "/stream/1/media.m3u8", nil).WithContext(ctx)
-	rec := httptest.NewRecorder()
-	router.ServeHTTP(rec, req)
-	assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
-	assert.Equal(t, "2", rec.Header().Get("Retry-After"))
+	for _, path := range []string{"/stream/1/media.m3u8", "/stream/1/media.m3u8?to=6.000"} {
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		req := httptest.NewRequest(http.MethodGet, path, nil).WithContext(ctx)
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		cancel()
+		assert.Equal(t, http.StatusServiceUnavailable, rec.Code, "path=%s", path)
+		assert.Equal(t, "2", rec.Header().Get("Retry-After"), "path=%s", path)
+	}
 }
 
 // extractStartOffsetSecs parses the TIME-OFFSET value (a positive magnitude)

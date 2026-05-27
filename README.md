@@ -179,14 +179,12 @@ When `SL_STREAM_<id>_VIEWER_TOKEN_KEY` is configured, the server automatically r
 
 ## Sticky `EXT-X-START:TIME-OFFSET`
 
-`media.m3u8` carries a `?to=<magnitude>` query parameter that locks the emitted `#EXT-X-START:TIME-OFFSET=-<magnitude>,PRECISE=YES` tag for the life of a viewer session. A bare `GET /stream/{id}/media.m3u8` (no `?to=`) responds with `302 Found` to `media.m3u8?to=<fresh>`, where `<fresh>` is the tail-to-now gap captured against the current playlist snapshot. The HLS player follows the redirect once and reuses the redirected URL on every subsequent reload, so the `TIME-OFFSET` value stays byte-identical for that viewer's session.
+The master playlist (`stream.m3u8`) bakes a fresh `?to=<magnitude>` query parameter into the emitted `media.m3u8` URI. `<magnitude>` is the tail-to-now offset (in seconds) captured against the current playlist snapshot at the moment the master is fetched. The HLS player parses that URL once from the master and reuses it on every media playlist reload. The media handler echoes `?to=` verbatim into `#EXT-X-START:TIME-OFFSET=-<magnitude>,PRECISE=YES`, so the tag stays byte-identical for the life of the session.
 
-Why: recent iOS/macOS clients stall completely when `TIME-OFFSET` mutates between consecutive playlist reloads. The sticky URL gives each session a stable value while still letting two viewers joining at different walls capture different offsets (each viewer's starting content PDT lands at their own wall clock — the cross-device-sync property).
-
-The master playlist (`stream.m3u8`) intentionally emits a bare `media.m3u8` URI (with `?vt=` propagation only). Keeping the master URI body identical for every viewer preserves CDN cacheability for `stream.m3u8`; the per-session sticky value is captured at the redirect on the next hop.
+Why: recent iOS/macOS clients stall completely when `TIME-OFFSET` mutates between consecutive playlist reloads. The master-baked sticky URL gives each session a stable value while still letting two viewers joining at different walls capture different offsets (each viewer's starting content PDT lands at their own wall clock — the cross-device-sync property).
 
 Operational notes:
-- The 302 response sets `Cache-Control: no-store` so a CDN doesn't lock multiple viewers behind one captured offset.
-- An inbound `?vt=<token>` is preserved through the redirect alongside the new `?to=`.
-- A `?to=` that's malformed, negative, NaN/Inf, or out of range falls back to the same 302 behavior (rather than 4xx-ing), so a stale or hand-edited URL self-heals on next fetch.
-- At render time the supplied magnitude is clamped from below at `3 × X-SL-TARGET-DURATION` (the RFC 8216 §4.4.3.8 floor), so a sticky URL aged past the floor still emits a spec-compliant tag.
+- `stream.m3u8` is served with `Cache-Control: no-store` so each session captures its own wall-clock-aligned offset. Operators who want CDN caching of the master can override this in their proxy and accept the cross-device-sync drift bounded by the cache TTL.
+- An inbound `?vt=<token>` is preserved into the baked media URI alongside `?to=`.
+- A `media.m3u8` fetch *without* `?to=` (direct fetch bypassing master, or a malformed/out-of-range value) renders the playlist **without** an `EXT-X-START` tag. Clients fall back to `EXT-X-SERVER-CONTROL:HOLD-BACK` for live-edge positioning — sync precision is lost on that path but the player doesn't stall.
+- At render time the magnitude is clamped from below at `3 × X-SL-TARGET-DURATION` (the RFC 8216 §4.4.3.8 floor), so a sticky URL aged past the floor still emits a spec-compliant tag.

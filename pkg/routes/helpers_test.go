@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 
 	"github.com/dskiff/streamloom/pkg/clock"
@@ -17,29 +18,45 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// fetchMediaPlaylist mimics an HLS player fetching media.m3u8: send the
-// initial request and, if the server responds 302 (the sticky-offset
-// redirect for a bare fetch), follow it once. Returns the final
-// (post-redirect) recorder and the final URL. Tests that want to assert
-// on the 302 itself should call router.ServeHTTP directly.
-func fetchMediaPlaylist(t *testing.T, router http.Handler, path string) (*httptest.ResponseRecorder, string) {
+// extractMediaURI pulls the (single) media playlist URI out of a master
+// playlist body. The URI is the only non-tag, non-blank line in the
+// body — anything starting with `#` is a tag, blanks are separators.
+func extractMediaURI(t *testing.T, masterBody string) string {
 	t.Helper()
-	req := httptest.NewRequest(http.MethodGet, path, nil)
-	rec := httptest.NewRecorder()
-	router.ServeHTTP(rec, req)
-	if rec.Code != http.StatusFound {
-		return rec, path
+	for _, line := range strings.Split(masterBody, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		return line
 	}
-	loc := rec.Header().Get("Location")
-	require.NotEmpty(t, loc, "302 response must include Location")
-	base, err := url.Parse(path)
+	t.Fatalf("master playlist contains no media URI; body=%q", masterBody)
+	return ""
+}
+
+// fetchMediaViaMaster simulates an HLS player session start: fetch
+// stream.m3u8, parse the media URI from it (carrying any baked `?to=`
+// and `?vt=`), and fetch that URI. Returns the media playlist
+// response and the resolved media URL. The master fetch must return
+// 200; the caller asserts on the media response.
+func fetchMediaViaMaster(t *testing.T, router http.Handler, masterPath string) (*httptest.ResponseRecorder, string) {
+	t.Helper()
+	masterReq := httptest.NewRequest(http.MethodGet, masterPath, nil)
+	masterRec := httptest.NewRecorder()
+	router.ServeHTTP(masterRec, masterReq)
+	require.Equal(t, http.StatusOK, masterRec.Code,
+		"master playlist must return OK; got %d", masterRec.Code)
+
+	mediaURI := extractMediaURI(t, masterRec.Body.String())
+
+	base, err := url.Parse(masterPath)
 	require.NoError(t, err)
-	locURL, err := url.Parse(loc)
+	locURL, err := url.Parse(mediaURI)
 	require.NoError(t, err)
 	resolved := base.ResolveReference(locURL).String()
 
-	req = httptest.NewRequest(http.MethodGet, resolved, nil)
-	rec = httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, resolved, nil)
+	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 	return rec, resolved
 }

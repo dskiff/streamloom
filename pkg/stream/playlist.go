@@ -90,10 +90,10 @@ func (snap *PlaylistSnapshot) StartLineFromOffset(offsetSecs float64) string {
 }
 
 // FreshOffsetSecs returns the tail-to-now gap (in seconds, positive
-// magnitude), clamped from below at MinHoldBackSecs. Used by the HTTP
-// redirect path to bake a fresh sticky offset into a `media.m3u8?to=`
-// URL — and by StartLine to derive the per-request value the body
-// renderer uses.
+// magnitude), clamped from below at MinHoldBackSecs. Used by the
+// master-playlist handler to bake a fresh sticky offset into the
+// emitted `media.m3u8?to=` URI, and by StartLine to derive the
+// per-request value the body renderer uses.
 //
 // Returns 0 on a nil receiver (we can't read MinHoldBackSecs without a
 // snapshot). All in-tree callers either nil-check the snapshot before
@@ -117,8 +117,9 @@ func (snap *PlaylistSnapshot) FreshOffsetSecs(nowMs int64) float64 {
 // rendering at a given clock.
 //
 // The HTTP handler does NOT call StartLine; it parses a sticky `?to=`
-// magnitude off the URL and calls StartLineFromOffset directly so the
-// emitted tag is byte-identical across reloads of the same URL.
+// magnitude off the URL (baked into the media URI by the master
+// handler) and calls StartLineFromOffset directly, so the emitted tag
+// is byte-identical across reloads of the same URL.
 //
 // Safe to call on a nil receiver (returns ""), mirroring Assemble.
 func (snap *PlaylistSnapshot) StartLine(nowMs int64) string {

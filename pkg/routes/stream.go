@@ -94,18 +94,18 @@ func Stream(logger *slog.Logger, env config.Env, store *stream.Store, requestLog
 }
 
 // maxStickyOffsetSecs is the upper bound on a client-supplied ?to=
-// magnitude. Anything beyond this is treated as malformed and triggers
-// a redirect to a fresh value rather than a render. The bound is the
-// configured maximum look-ahead cap (1 hour; config.MaxLookaheadCeilingMs)
-// converted to seconds — the largest tail-to-now gap any stream can
-// emit — with a small slack so legitimate edge cases at the limit
-// aren't bounced.
+// magnitude. Anything beyond this is treated as malformed and the
+// handler falls back to rendering without an EXT-X-START tag. The
+// bound is the configured maximum look-ahead cap
+// (config.MaxLookaheadCeilingMs) converted to seconds — the largest
+// tail-to-now gap any stream can emit — with a small slack so
+// legitimate edge cases at the limit aren't bounced.
 const maxStickyOffsetSecs = float64(config.MaxLookaheadCeilingMs)/1000.0 + 60.0
 
 // parseStickyOffset reads the sticky `?to=` magnitude from a request.
 // Returns (value, true) only for a finite, non-negative, in-range
 // float. Missing/malformed/out-of-range all return (_, false) so the
-// caller can fall back to the redirect path uniformly.
+// caller can fall back to the "no EXT-X-START" path uniformly.
 func parseStickyOffset(r *http.Request) (float64, bool) {
 	raw := r.URL.Query().Get("to")
 	if raw == "" {
@@ -127,12 +127,11 @@ func parseStickyOffset(r *http.Request) (float64, bool) {
 	return v, true
 }
 
-// buildStickyMediaURL constructs the redirect target for a bare
-// `media.m3u8` request: `media.m3u8?to=<magnitude>` with any inbound
-// `vt=` preserved so the same authorization carries across the
-// redirect. The magnitude is formatted with the same "%.3f" layout
-// StartLineFromOffset uses, so byte-identical playlists are emitted on
-// every subsequent fetch of the redirected URL.
+// buildStickyMediaURL constructs the master-baked media URI:
+// `media.m3u8?to=<magnitude>[&vt=<...>]`. The magnitude is formatted
+// with the same "%.3f" layout StartLineFromOffset uses, so the EXT-X-START
+// tag the media playlist emits is byte-identical for every reload of the
+// same URL.
 func buildStickyMediaURL(offsetSecs float64, vt string) string {
 	var b strings.Builder
 	var scratch [64]byte
@@ -148,23 +147,24 @@ func buildStickyMediaURL(offsetSecs float64, vt string) string {
 
 // mediaPlaylistHandler returns the handler for GET /stream/{streamID}/media.m3u8.
 //
-// The handler has two modes:
+// EXT-X-START is sticky via a master-baked `?to=<magnitude>` query
+// param. Two paths:
 //
-//   - **Sticky render** (request carries a valid `?to=<magnitude>`):
-//     parse the magnitude, render the playlist with that offset baked
-//     into EXT-X-START. The same URL on every reload returns a
-//     byte-identical EXT-X-START line even as the snapshot tail
-//     advances, which is what current iOS/macOS clients require.
+//   - **`?to=` present and valid**: render the playlist with that
+//     offset baked into EXT-X-START, verbatim. The same URL on every
+//     reload returns a byte-identical EXT-X-START line even as the
+//     snapshot tail advances, which is what current iOS/macOS clients
+//     require — they stall when TIME-OFFSET mutates between reloads.
 //
-//   - **Redirect** (no `?to=`, or malformed): compute a fresh offset
-//     against the current snapshot and 302 to
-//     `media.m3u8?to=<fresh>[&vt=<...>]`. The player follows once and
-//     reuses the redirected URL from then on, capturing the offset at
-//     redirect time (fresh — no extra master-bake staleness).
-//
-// Cross-device sync is preserved: two viewers each get their own
-// redirect at their own first-fetch moment, so each session's baked
-// offset places its own start content PDT at that viewer's wall clock.
+//   - **`?to=` absent or malformed**: render WITHOUT EXT-X-START.
+//     Clients fall back to EXT-X-SERVER-CONTROL:HOLD-BACK for live-edge
+//     positioning. This path covers direct media.m3u8 fetches that
+//     bypassed the master playlist; the common flow is
+//     stream.m3u8 → media.m3u8?to=<X> which preserves cross-device
+//     sync. We deliberately don't 302 here: HLS reload semantics let
+//     players re-fetch the URL stored from the master, so a redirect
+//     would be re-followed on every reload and re-bake a new offset,
+//     re-introducing the iOS stall.
 func mediaPlaylistHandler(logger *slog.Logger, store *stream.Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		streamID := chi.URLParam(r, "streamID")
@@ -181,9 +181,7 @@ func mediaPlaylistHandler(logger *slog.Logger, store *stream.Store) http.Handler
 		}
 
 		// Block until a valid playlist is available, the stream is
-		// deleted, or the request is cancelled. The wait runs ahead
-		// of the redirect/render branch so the redirect target is
-		// always rooted in a known-renderable snapshot.
+		// deleted, or the request is cancelled.
 		select {
 		case <-s.HasPlaylist():
 		case <-s.Done():
@@ -198,37 +196,18 @@ func mediaPlaylistHandler(logger *slog.Logger, store *stream.Store) http.Handler
 		if snap == nil {
 			// All segments were evicted between the HasPlaylist gate
 			// and now. Tell the player to retry rather than serving
-			// an empty body — or worse, redirecting to a "to=" value
-			// derived from a stale endMs.
+			// an empty body.
 			writeStreamUnavailable(w)
 			return
 		}
 
-		offsetSecs, ok := parseStickyOffset(r)
-		if !ok {
-			// Bare/malformed fetch: capture a fresh offset against the
-			// current snapshot and redirect. The redirected URL is the
-			// one the player will keep using on every reload.
-			nowMs := store.Clock().Now().UnixMilli()
-			fresh := snap.FreshOffsetSecs(nowMs)
-			loc := buildStickyMediaURL(fresh, r.URL.Query().Get("vt"))
-			// no-store on the redirect itself: a CDN caching the 302
-			// would lock every viewer behind it to one session's
-			// offset, re-introducing the cross-device-sync regression
-			// the redirect exists to avoid. The target playlist body
-			// is cacheable on its own URL (one viewer's session).
-			w.Header().Set("Cache-Control", "no-store")
-			w.Header().Set("Location", loc)
-			w.WriteHeader(http.StatusFound)
-			return
+		// Sticky render when the master baked a `?to=` value into the
+		// URL; otherwise omit EXT-X-START and let HOLD-BACK position
+		// the client.
+		var startLine string
+		if offsetSecs, ok := parseStickyOffset(r); ok {
+			startLine = snap.StartLineFromOffset(offsetSecs)
 		}
-
-		// Sticky render: render with the client-supplied offset. Prefix
-		// and Suffix were baked at render time (with viewer tokens
-		// already embedded in segment URIs). StartLineFromOffset clamps
-		// at MinHoldBackSecs from below so a long-lived sticky URL that
-		// has rolled past the floor still emits a spec-compliant tag.
-		startLine := snap.StartLineFromOffset(offsetSecs)
 		total := len(snap.Prefix) + len(startLine) + len(snap.Suffix)
 
 		w.Header().Set("Content-Type", config.M3U8_MIME_TYPE)
@@ -264,6 +243,22 @@ func mediaPlaylistHandler(logger *slog.Logger, store *stream.Store) http.Handler
 }
 
 // masterPlaylistHandler returns the handler for GET /stream/{streamID}/stream.m3u8.
+//
+// Bakes a fresh `?to=<magnitude>` (the tail-to-now offset) into the
+// emitted media URI when a playlist snapshot is available. The player
+// parses that URL once from the master and reuses it on every reload,
+// so the rendered EXT-X-START stays byte-identical for the session.
+//
+// Cache-Control is no-store: each session needs its own master fetch
+// to capture a fresh wall-clock-aligned offset. Operators who want CDN
+// caching of stream.m3u8 can override this in their proxy and accept
+// the cross-device-sync drift bounded by the cache TTL.
+//
+// Pre-live-edge (no snapshot yet) the handler still serves a valid
+// master with a bare `media.m3u8` URI — the player polls until media
+// becomes available, then plays in the no-EXT-X-START fallback path.
+// The common case is master fetched after the stream is live, which
+// gets the full sticky-offset behavior.
 func masterPlaylistHandler(logger *slog.Logger, store *stream.Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		streamID := chi.URLParam(r, "streamID")
@@ -281,12 +276,20 @@ func masterPlaylistHandler(logger *slog.Logger, store *stream.Store) http.Handle
 
 		meta := s.Metadata()
 
-		// Propagate ?vt= from the incoming request into the media
-		// playlist URI. HLS players do not carry a parent query string
-		// over to relative URIs, so each emitted URI needs its own copy.
-		mediaURI := "media.m3u8"
-		if vt := r.URL.Query().Get("vt"); vt != "" {
-			mediaURI += "?vt=" + url.QueryEscape(vt)
+		// HLS players do not carry parent query strings over to
+		// relative URIs, so each emitted URI needs its own copy of
+		// any propagated param (?vt= for viewer-token auth; ?to= for
+		// the sticky EXT-X-START offset).
+		vt := r.URL.Query().Get("vt")
+		var mediaURI string
+		if snap := s.CachedPlaylistSnapshot(); snap != nil {
+			nowMs := store.Clock().Now().UnixMilli()
+			mediaURI = buildStickyMediaURL(snap.FreshOffsetSecs(nowMs), vt)
+		} else {
+			mediaURI = "media.m3u8"
+			if vt != "" {
+				mediaURI += "?vt=" + url.QueryEscape(vt)
+			}
 		}
 
 		builder := strings.Builder{}
@@ -300,7 +303,7 @@ func masterPlaylistHandler(logger *slog.Logger, store *stream.Store) http.Handle
 		builder.WriteByte('\n')
 
 		w.Header().Set("Content-Type", config.M3U8_MIME_TYPE)
-		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Cache-Control", "no-store")
 		body := builder.String()
 		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 		if _, err := io.WriteString(w, body); err != nil {

@@ -66,22 +66,24 @@ func TestE2E_ViewerToken_FullFlow(t *testing.T) {
 		return p != "" && strings.Contains(p, "segment_0.m4s")
 	}, 2*time.Second, 10*time.Millisecond)
 
-	// 5. GET master playlist with vt → media.m3u8 URI must carry the
-	//    viewer's own long-lived vt (master is not cached/rewritten; the
-	//    viewer fetches media.m3u8 using the same token they used here).
+	// 5. GET master playlist with vt → media.m3u8 URI must carry both
+	//    the viewer's own long-lived vt and the master-baked sticky
+	//    `?to=` offset.
 	req := httptest.NewRequest(http.MethodGet, "/stream/1/stream.m3u8?vt="+vt, nil)
 	rec = httptest.NewRecorder()
 	streamRouter.ServeHTTP(rec, req)
 	require.Equal(t, http.StatusOK, rec.Code)
-	assert.Contains(t, rec.Body.String(), "media.m3u8?vt="+vt)
+	masterBody := rec.Body.String()
+	assert.Regexp(t, `media\.m3u8\?to=[\d.]+&vt=`+vt, masterBody,
+		"master must bake ?to=<offset>&vt=<token> into the media URI")
 
-	// 6. GET media playlist with the viewer's vt → every emitted URI must
-	//    carry a ?vt=<token>. The token is the playlist-scoped short-lived
-	//    token baked by the renderer (NOT the viewer's long-lived vt); it
-	//    must still verify against the same per-stream key. The bare
-	//    media.m3u8 fetch redirects to the sticky-offset URL; the helper
-	//    follows it and the vt is preserved across the redirect.
-	rec, _ = fetchMediaPlaylist(t, streamRouter, "/stream/1/media.m3u8?vt="+vt)
+	// 6. Fetch master with vt; it bakes both `?to=` and `?vt=` into
+	//    the media URI. Follow that URI to get the media playlist:
+	//    every emitted URI must carry a ?vt=<token>. The token is the
+	//    playlist-scoped short-lived token baked by the renderer
+	//    (NOT the viewer's long-lived vt); it must still verify
+	//    against the same per-stream key.
+	rec, _ = fetchMediaViaMaster(t, streamRouter, "/stream/1/stream.m3u8?vt="+vt)
 	require.Equal(t, http.StatusOK, rec.Code)
 	mediaBody := rec.Body.String()
 	// Any stale placeholder system would leak literal "{VT}"; assert absence.
@@ -199,10 +201,11 @@ func TestE2E_ViewerToken_SegmentURIsStableAcrossRenders(t *testing.T) {
 		return strings.Contains(s.CachedPlaylist(), "segment_0.m4s")
 	}, 2*time.Second, 10*time.Millisecond)
 
-	// First render. The bare-fetch redirect issues a fresh sticky URL;
-	// the helper follows it. The stickiness applies only to EXT-X-START,
-	// not to the per-URI ?vt= tokens this test checks for stability.
-	rec, _ = fetchMediaPlaylist(t, streamRouter, "/stream/1/media.m3u8?vt="+vt)
+	// First render. Master bakes the fresh sticky URL; the helper
+	// follows it. The sticky-offset URL applies to EXT-X-START; the
+	// per-URI ?vt= tokens this test checks for stability are baked
+	// by the renderer and unrelated to the sticky offset.
+	rec, _ = fetchMediaViaMaster(t, streamRouter, "/stream/1/stream.m3u8?vt="+vt)
 	require.Equal(t, http.StatusOK, rec.Code)
 	firstBody := rec.Body.String()
 
@@ -218,7 +221,7 @@ func TestE2E_ViewerToken_SegmentURIsStableAcrossRenders(t *testing.T) {
 	}, 2*time.Second, 10*time.Millisecond)
 
 	// Second render.
-	rec, _ = fetchMediaPlaylist(t, streamRouter, "/stream/1/media.m3u8?vt="+vt)
+	rec, _ = fetchMediaViaMaster(t, streamRouter, "/stream/1/stream.m3u8?vt="+vt)
 	require.Equal(t, http.StatusOK, rec.Code)
 	secondBody := rec.Body.String()
 
@@ -253,7 +256,7 @@ func TestE2E_ViewerToken_SegmentURIsStableAcrossRenders(t *testing.T) {
 		return strings.Contains(s.CachedPlaylist(), "segment_2.m4s")
 	}, 2*time.Second, 10*time.Millisecond)
 
-	rec, _ = fetchMediaPlaylist(t, streamRouter, "/stream/1/media.m3u8?vt="+vt)
+	rec, _ = fetchMediaViaMaster(t, streamRouter, "/stream/1/stream.m3u8?vt="+vt)
 	require.Equal(t, http.StatusOK, rec.Code)
 	thirdBody := rec.Body.String()
 
