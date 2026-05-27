@@ -95,8 +95,10 @@ func (snap *PlaylistSnapshot) StartLineFromOffset(offsetSecs float64) string {
 // URL — and by StartLine to derive the per-request value the body
 // renderer uses.
 //
-// Returns MinHoldBackSecs on a nil receiver so callers don't have to
-// double-check before formatting.
+// Returns 0 on a nil receiver (we can't read MinHoldBackSecs without a
+// snapshot). All in-tree callers either nil-check the snapshot before
+// calling or feed the result back into StartLineFromOffset, which is
+// itself nil-safe — so the sentinel never surfaces to clients.
 func (snap *PlaylistSnapshot) FreshOffsetSecs(nowMs int64) float64 {
 	if snap == nil {
 		return 0
