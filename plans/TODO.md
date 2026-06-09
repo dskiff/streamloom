@@ -97,15 +97,17 @@ semantics (clients only fetch advertised segments). The cutoff advances
 monotonically with wall clock, so any segment that ever appeared in a
 playlist stays fetchable — well-behaved clients are never refused.
 
-- [x] `Stream.RunWithPublishedSegmentSlot` gates on
-      `Timestamp <= now + maxLookaheadMs`, returning the new
-      `ErrSegmentNotYetPublished` sentinel otherwise. `RunWithSegmentSlot`
-      stays the ungated raw accessor (tests, internal use); both share an
-      unexported `runWithSegmentSlot(index, gate, fn)` helper.
-- [x] Public segment handler (`pkg/routes/stream.go`) switches to the gated
-      accessor and collapses `ErrSegmentNotYetPublished` to the same 404 as
+- [x] `Stream.RunWithPublishedSegmentSlot` (the only public segment
+      accessor) gates on `Timestamp <= now + maxLookaheadMs`, returning the
+      new `ErrSegmentNotYetPublished` sentinel otherwise. The ungated raw
+      read survives only as the unexported `runWithSegmentSlot(index, gate,
+      fn)` helper for white-box tests, so no exported path bypasses the gate.
+- [x] Public segment handler (`pkg/routes/stream.go`) uses the gated accessor
+      and collapses `ErrSegmentNotYetPublished` to the same 404 as
       `ErrSegmentNotFound` so a beyond-cap segment is indistinguishable from
-      a missing one (no read-ahead enumeration signal).
+      a missing one (no read-ahead enumeration signal). The refusal is logged
+      at warn (matching the viewer-token rejection) so a compliant-client-only
+      event is visible to operators / fail2ban.
 - [x] Tests: `pkg/stream/stream_test.go` covers raw-vs-gated divergence and
       the segment becoming fetchable once the clock advances;
       `pkg/routes/stream_test.go` covers the 404 → 200 transition at the

@@ -55,10 +55,12 @@ func mustCommitSlot(t *testing.T, s *Stream, index uint32, data []byte, ts int64
 	require.NoError(t, err)
 }
 
-// readSegment reads segment data using RunWithSegmentSlot and returns the bytes.
+// readSegment reads segment data using the ungated raw accessor and returns
+// the bytes. Bypassing the look-ahead gate lets tests read back segments
+// committed with future timestamps, the common case under the mock clock.
 func readSegment(s *Stream, index uint32) ([]byte, error) {
 	var data []byte
-	err := s.RunWithSegmentSlot(index, func(slot *pool.BufferSlot) error {
+	err := s.runWithSegmentSlot(index, false, func(slot *pool.BufferSlot) error {
 		var buf bytes.Buffer
 		_, err := slot.WriteTo(&buf)
 		data = buf.Bytes()
@@ -609,7 +611,7 @@ func TestRejectPastTimestampDoesNotIncrementCount(t *testing.T) {
 	assert.Equal(t, int64(1), s.TotalSegmentCount(), "count after rejection")
 }
 
-func TestRunWithSegmentSlotNotFound(t *testing.T) {
+func TestReadSegmentNotFound(t *testing.T) {
 	clk := clock.NewMock(time.UnixMilli(0))
 	s := newTestStream(t, clk)
 
@@ -1216,7 +1218,7 @@ func TestConcurrentReadersAndEviction(t *testing.T) {
 		readerWg.Add(1)
 		go func(i int) {
 			defer readerWg.Done()
-			_ = s.RunWithSegmentSlot(uint32(i), func(slot *pool.BufferSlot) error {
+			_ = s.runWithSegmentSlot(uint32(i), false, func(slot *pool.BufferSlot) error {
 				readersReady <- struct{}{}
 				<-releaseReaders
 				var buf bytes.Buffer

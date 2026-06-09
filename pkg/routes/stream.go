@@ -385,7 +385,14 @@ func segmentHandler(logger *slog.Logger, store *stream.Store) http.HandlerFunc {
 				// playlist. Collapse to the same 404 as a missing segment so
 				// a client cannot distinguish "no such segment" from "future
 				// segment not yet live" and read ahead of the live edge.
-				logger.Debug("refusing fetch of unpublished segment", "streamID", streamID, "segmentID", segmentIDStr)
+				//
+				// Logged at warn (matching the viewer-token rejection): a
+				// compliant client only fetches advertised segments, so this
+				// fires only on a misconfigured/buggy client or a deliberate
+				// read-ahead probe — both worth surfacing, and the signal a
+				// log-driven blocker (e.g. fail2ban) keys on.
+				logger.Warn("refusing segment fetch beyond published look-ahead",
+					"streamID", streamID, "segmentID", segmentIDStr)
 				w.WriteHeader(http.StatusNotFound)
 				return
 			}

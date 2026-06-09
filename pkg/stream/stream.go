@@ -473,42 +473,39 @@ func (s *Stream) CommitSlot(index uint32, buf *pool.BufferSlot, timestamp int64,
 	return nil
 }
 
-// RunWithSegmentSlot finds the segment with the given index, acquires a
-// reference to its BufferSlot, and calls fn outside the lock. The reference
-// prevents eviction from reclaiming the buffer while the callback runs.
-// The slot must not be retained or used after fn returns.
+// RunWithPublishedSegmentSlot finds the segment with the given index, verifies
+// it has entered the published look-ahead horizon, acquires a reference to its
+// BufferSlot, and calls fn outside the lock. The reference prevents eviction
+// from reclaiming the buffer while fn runs; the slot must not be retained or
+// used after fn returns.
 //
-// This is the raw accessor: it serves any committed segment regardless of
-// whether it has been published in a media playlist. The public HLS segment
-// handler uses RunWithPublishedSegmentSlot instead, which additionally gates
-// on the look-ahead horizon.
-func (s *Stream) RunWithSegmentSlot(index uint32, fn func(slot *pool.BufferSlot) error) error {
-	return s.runWithSegmentSlot(index, false, fn)
-}
-
-// RunWithPublishedSegmentSlot is RunWithSegmentSlot restricted to segments
-// that have entered the published look-ahead horizon. It returns
-// ErrSegmentNotYetPublished when the segment exists but its timestamp is
-// beyond now + maxLookaheadMs — i.e. it has not appeared in any media
-// playlist the renderer has produced (renderPlaylistCache applies the same
-// cutoff).
+// It returns ErrSegmentNotFound if no segment has the index, or
+// ErrSegmentNotYetPublished if the segment exists but its timestamp is beyond
+// now + maxLookaheadMs — i.e. the renderer has not advertised it in any media
+// playlist yet (renderPlaylistCache applies the same cutoff).
 //
-// This is the entry point for the public HLS segment route. Viewer tokens
-// authorize a time window, not a specific segment, so without this gate a
-// token holder could enumerate segment indices and pull segments the
-// transcoder pushed ahead of wall clock before they go live, reading ahead
-// of the live edge. Gating here keeps the publicly fetchable set aligned
-// with the advertised set. Because the cutoff advances monotonically with
-// the wall clock, any segment that has ever been published stays fetchable,
-// so a well-behaved client is never refused a segment it found in a playlist.
+// This is the only public segment accessor, and the entry point for the
+// public HLS segment route. Viewer tokens authorize a time window, not a
+// specific segment, so without this gate a token holder could enumerate
+// segment indices and pull segments the transcoder pushed ahead of wall clock
+// before they go live, reading ahead of the live edge. Because the cutoff
+// advances monotonically with the wall clock, any segment that has ever been
+// published stays fetchable, so a well-behaved client is never refused a
+// segment it found in a playlist.
 func (s *Stream) RunWithPublishedSegmentSlot(index uint32, fn func(slot *pool.BufferSlot) error) error {
 	return s.runWithSegmentSlot(index, true, fn)
 }
 
-// runWithSegmentSlot is the shared implementation behind RunWithSegmentSlot
-// and RunWithPublishedSegmentSlot. When gateToLookahead is true, a segment
-// whose timestamp is past now + maxLookaheadMs is refused with
-// ErrSegmentNotYetPublished.
+// runWithSegmentSlot finds the segment with the given index, acquires a
+// reference to its BufferSlot, and calls fn outside the lock. When
+// gateToLookahead is true, a segment whose timestamp is past
+// now + maxLookaheadMs is refused with ErrSegmentNotYetPublished; otherwise
+// any committed segment is served regardless of publish state.
+//
+// Only the gated form is exported, via RunWithPublishedSegmentSlot. The
+// ungated form is reachable solely from white-box tests in this package that
+// need to read back a segment independent of the look-ahead policy (e.g.
+// segments committed with future timestamps under the mock clock).
 func (s *Stream) runWithSegmentSlot(index uint32, gateToLookahead bool, fn func(slot *pool.BufferSlot) error) error {
 	s.mu.RLock()
 
