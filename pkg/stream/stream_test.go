@@ -1983,7 +1983,7 @@ func TestConcurrentReadersAndGenerationDrop(t *testing.T) {
 		readerWg.Add(1)
 		go func(i int) {
 			defer readerWg.Done()
-			readerErrs <- s.RunWithSegmentSlot(uint32(i), func(slot *pool.BufferSlot) error {
+			readerErrs <- s.runWithSegmentSlot(uint32(i), false, func(slot *pool.BufferSlot) error {
 				readersReady <- struct{}{}
 				<-releaseReaders
 				var buf bytes.Buffer

@@ -298,11 +298,11 @@ func (s *Stream) CurrentGeneration() int64 {
 // whose generation is older than the stream's current generation. Freed
 // buffers are returned to the pool. The segment slice is compacted in-place.
 //
-// The read path serves any committed index, so even segments ahead of the
-// playlist window can have in-flight readers. A stale segment whose buffer
-// is still held by a reader is removed from the list all the same — it must
-// not be served or listed again — but its buffer is parked on pendingFree
-// and returned to the pool by a later sweep, once the reader finishes.
+// A segment can still have an in-flight reader — a viewer fetching it — when
+// a generation advance drops it. A stale segment whose buffer is still held
+// by a reader is removed from the list all the same — it must not be served
+// or listed again — but its buffer is parked on pendingFree and returned to
+// the pool by a later sweep, once the reader finishes.
 // Unlike evictOldLocked's deferral, the segment is not retained: keeping
 // invalidated content in the list would let new requests attach readers
 // indefinitely and block the replacing generation from reusing its index.
@@ -338,7 +338,7 @@ func (s *Stream) dropStaleGenerationLocked(fromPos int) {
 // later sweep.
 //
 // Must be called with s.mu held (write). The write lock makes the Readers()
-// check stable: readers attach only under s.mu.RLock (RunWithSegmentSlot),
+// check stable: readers attach only under s.mu.RLock (runWithSegmentSlot),
 // and a pending-free buffer is no longer reachable from segments, so a count
 // of zero cannot rise again.
 func (s *Stream) sweepPendingFreeLocked() {
