@@ -84,6 +84,33 @@ preserving HLS's append-only invariant under out-of-order ingest.
       gate truncates the window, to surface ingest reordering rather
       than silently masking it.
 
+## Gate segment fetches to the published look-ahead
+
+Viewer tokens authorize a time window, not a specific segment (the token
+payload is `[version][expiry][MAC]`), and the segment route serves any
+buffered index. A transcoder that pushes a batch ahead of wall clock leaves
+segments in the buffer that the renderer has not advertised yet (timestamp
+beyond `now + maxLookaheadMs`); a token holder could enumerate
+`segment_<N+k>.m4s` and read ahead of the live edge. Gating the fetch to the
+same cutoff the renderer publishes by shrinks that surface and matches HLS
+semantics (clients only fetch advertised segments). The cutoff advances
+monotonically with wall clock, so any segment that ever appeared in a
+playlist stays fetchable — well-behaved clients are never refused.
+
+- [x] `Stream.RunWithPublishedSegmentSlot` gates on
+      `Timestamp <= now + maxLookaheadMs`, returning the new
+      `ErrSegmentNotYetPublished` sentinel otherwise. `RunWithSegmentSlot`
+      stays the ungated raw accessor (tests, internal use); both share an
+      unexported `runWithSegmentSlot(index, gate, fn)` helper.
+- [x] Public segment handler (`pkg/routes/stream.go`) switches to the gated
+      accessor and collapses `ErrSegmentNotYetPublished` to the same 404 as
+      `ErrSegmentNotFound` so a beyond-cap segment is indistinguishable from
+      a missing one (no read-ahead enumeration signal).
+- [x] Tests: `pkg/stream/stream_test.go` covers raw-vs-gated divergence and
+      the segment becoming fetchable once the clock advances;
+      `pkg/routes/stream_test.go` covers the 404 → 200 transition at the
+      HTTP surface. Pre-commit: `go fmt / vet / test`; `gosec` run locally.
+
 ## Cross-device player synchronization
 
 Goal: two viewers on separate devices joining at different times should see

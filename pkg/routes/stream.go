@@ -367,7 +367,7 @@ func segmentHandler(logger *slog.Logger, store *stream.Store) http.HandlerFunc {
 			return
 		}
 
-		err = s.RunWithSegmentSlot(uint32(segmentID), func(slot *pool.BufferSlot) error {
+		err = s.RunWithPublishedSegmentSlot(uint32(segmentID), func(slot *pool.BufferSlot) error {
 			w.Header().Set("Content-Type", config.MP4_MIME_TYPE)
 			w.Header().Set("Content-Length", strconv.Itoa(slot.Len()))
 			w.Header().Set("Cache-Control", "no-cache")
@@ -376,6 +376,16 @@ func segmentHandler(logger *slog.Logger, store *stream.Store) http.HandlerFunc {
 		})
 		if err != nil {
 			if errors.Is(err, stream.ErrSegmentNotFound) {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			if errors.Is(err, stream.ErrSegmentNotYetPublished) {
+				// The segment is buffered but sits beyond the published
+				// look-ahead horizon, so it has not appeared in any media
+				// playlist. Collapse to the same 404 as a missing segment so
+				// a client cannot distinguish "no such segment" from "future
+				// segment not yet live" and read ahead of the live edge.
+				logger.Debug("refusing fetch of unpublished segment", "streamID", streamID, "segmentID", segmentIDStr)
 				w.WriteHeader(http.StatusNotFound)
 				return
 			}
