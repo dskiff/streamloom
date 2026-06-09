@@ -125,6 +125,26 @@ func TestTrustedRealIP_UsesRightmostForwardedEntry(t *testing.T) {
 		"must use the rightmost (proxy-appended) entry, not the spoofable leftmost")
 }
 
+func TestTrustedRealIP_StripsForwardedOnTrustedPath(t *testing.T) {
+	trusted := []*net.IPNet{mustParseCIDR("10.0.0.0/8")}
+	var gotRemoteAddr, gotXFF string
+	handler := TrustedRealIP(trusted)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotRemoteAddr = r.RemoteAddr
+		gotXFF = r.Header.Get("X-Forwarded-For")
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.RemoteAddr = "10.0.0.1:1234"
+	// Forged leftmost entry plus the proxy-appended real client.
+	req.Header.Set("X-Forwarded-For", "1.2.3.4, 198.51.100.7")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, "198.51.100.7", gotRemoteAddr)
+	assert.Empty(t, gotXFF,
+		"X-Forwarded-For must be stripped after resolution so forgeable entries don't reach downstream")
+}
+
 func TestTrustedRealIP_IgnoresXRealIP(t *testing.T) {
 	trusted := []*net.IPNet{mustParseCIDR("10.0.0.0/8")}
 	var gotRemoteAddr, gotXRealIP string

@@ -20,6 +20,12 @@ import (
 // bounds that map (to the configured/initialized streams) and keeps the
 // active-watcher metric free of phantom streams.
 func RecordWatcher(tracker *watcher.Tracker, streamExists func(streamID string) bool) func(http.Handler) http.Handler {
+	// Fail fast at router-construction time. Without this, a nil predicate
+	// would surface as a deferred nil-function-call panic on the first request
+	// rather than at setup (mirrors ViewerTokenAuth's configuration checks).
+	if streamExists == nil {
+		panic("middleware: RecordWatcher requires a non-nil streamExists predicate")
+	}
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			streamID := chi.URLParam(r, "streamID")

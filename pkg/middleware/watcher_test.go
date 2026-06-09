@@ -51,6 +51,13 @@ func TestRecordWatcher_SkipsWhenStreamMissing(t *testing.T) {
 		"a request to a non-existent stream must not be recorded")
 }
 
+func TestRecordWatcher_NilPredicatePanics(t *testing.T) {
+	clk := clock.NewMock(time.UnixMilli(1000))
+	tr := watcher.NewTracker(clk)
+	assert.Panics(t, func() { RecordWatcher(tr, nil) },
+		"a nil streamExists predicate must panic at construction, not on first request")
+}
+
 func TestExtractIP(t *testing.T) {
 	tests := []struct {
 		name string

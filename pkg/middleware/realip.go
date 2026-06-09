@@ -24,9 +24,10 @@ import (
 //     (r.RemoteAddr) is itself a trusted proxy. A trusted proxy appends the
 //     immediate peer to X-Forwarded-For, so the real client is the RIGHTMOST
 //     entry that is not itself a trusted proxy; entries further left can be
-//     forged by the client and are skipped. When the direct connection is not
-//     trusted, X-Forwarded-For is stripped so a client talking to streamloom
-//     directly cannot inject a forwarding chain.
+//     forged by the client and are skipped. The header is then stripped on
+//     every path — its spoofable left-hand entries must never reach a
+//     downstream consumer — so the resolved RemoteAddr is the single source of
+//     client-IP truth.
 //
 // When trustedNets is empty, no proxy is trusted and the direct connection IP
 // is always used (forwarded headers are stripped).
@@ -38,21 +39,25 @@ import (
 func TrustedRealIP(trustedNets []*net.IPNet) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// Never trust these: a default-configured proxy passes them through
-			// from the client verbatim. Strip on every path so no downstream
-			// consumer is fooled into honoring them.
+			// None of these forwarding headers are propagated downstream: the
+			// authoritative client IP is resolved into RemoteAddr here, and
+			// every one of them is client-forgeable under a default-configured
+			// proxy. Capture X-Forwarded-For for use on the trusted path, then
+			// strip all three up front so no later middleware or handler can be
+			// tricked into trusting their (spoofable) contents.
+			xff := r.Header.Get("X-Forwarded-For")
+			r.Header.Del("X-Forwarded-For")
 			r.Header.Del("True-Client-IP")
 			r.Header.Del("X-Real-IP")
 
 			if !IsTrusted(r.RemoteAddr, trustedNets) {
-				// Direct (untrusted) client: it cannot speak for any other host,
-				// so a forwarding chain it supplies is spoofed. Strip it.
-				r.Header.Del("X-Forwarded-For")
+				// Direct (untrusted) client: it cannot speak for any other
+				// host, so the forwarding chain it supplied was just discarded.
 				next.ServeHTTP(w, r)
 				return
 			}
 
-			if clientIP := rightmostUntrustedIP(r.Header.Get("X-Forwarded-For"), trustedNets); clientIP != "" {
+			if clientIP := rightmostUntrustedIP(xff, trustedNets); clientIP != "" {
 				r.RemoteAddr = clientIP
 			}
 			// Otherwise keep the trusted peer's RemoteAddr rather than inventing
