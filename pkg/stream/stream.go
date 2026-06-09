@@ -20,6 +20,14 @@ const MaxInitBytes = 1 << 20
 // ErrSegmentNotFound is returned when a segment index does not exist.
 var ErrSegmentNotFound = errors.New("segment not found")
 
+// ErrSegmentNotYetPublished is returned by RunWithPublishedSegmentSlot when a
+// segment exists in the buffer but its timestamp is beyond the published
+// look-ahead horizon (now + maxLookaheadMs). Such a segment has not been
+// advertised in any media playlist yet, so it is not publicly fetchable. The
+// HTTP layer collapses this to the same 404 as ErrSegmentNotFound so a client
+// cannot distinguish a missing segment from an unpublished future one.
+var ErrSegmentNotYetPublished = errors.New("segment not yet published")
+
 // ErrDuplicateIndex is returned when a segment with the same index already exists.
 var ErrDuplicateIndex = errors.New("duplicate segment index")
 
@@ -290,11 +298,11 @@ func (s *Stream) CurrentGeneration() int64 {
 // whose generation is older than the stream's current generation. Freed
 // buffers are returned to the pool. The segment slice is compacted in-place.
 //
-// The read path serves any committed index, so even segments ahead of the
-// playlist window can have in-flight readers. A stale segment whose buffer
-// is still held by a reader is removed from the list all the same — it must
-// not be served or listed again — but its buffer is parked on pendingFree
-// and returned to the pool by a later sweep, once the reader finishes.
+// A segment can still have an in-flight reader — a viewer fetching it — when
+// a generation advance drops it. A stale segment whose buffer is still held
+// by a reader is removed from the list all the same — it must not be served
+// or listed again — but its buffer is parked on pendingFree and returned to
+// the pool by a later sweep, once the reader finishes.
 // Unlike evictOldLocked's deferral, the segment is not retained: keeping
 // invalidated content in the list would let new requests attach readers
 // indefinitely and block the replacing generation from reusing its index.
@@ -330,7 +338,7 @@ func (s *Stream) dropStaleGenerationLocked(fromPos int) {
 // later sweep.
 //
 // Must be called with s.mu held (write). The write lock makes the Readers()
-// check stable: readers attach only under s.mu.RLock (RunWithSegmentSlot),
+// check stable: readers attach only under s.mu.RLock (runWithSegmentSlot),
 // and a pending-free buffer is no longer reachable from segments, so a count
 // of zero cannot rise again.
 func (s *Stream) sweepPendingFreeLocked() {
@@ -507,11 +515,40 @@ func (s *Stream) CommitSlot(index uint32, buf *pool.BufferSlot, timestamp int64,
 	return nil
 }
 
-// RunWithSegmentSlot finds the segment with the given index, acquires a
-// reference to its BufferSlot, and calls fn outside the lock. The reference
-// prevents eviction from reclaiming the buffer while the callback runs.
-// The slot must not be retained or used after fn returns.
-func (s *Stream) RunWithSegmentSlot(index uint32, fn func(slot *pool.BufferSlot) error) error {
+// RunWithPublishedSegmentSlot finds the segment with the given index, verifies
+// it has entered the published look-ahead horizon, acquires a reference to its
+// BufferSlot, and calls fn outside the lock. The reference prevents eviction
+// from reclaiming the buffer while fn runs; the slot must not be retained or
+// used after fn returns.
+//
+// It returns ErrSegmentNotFound if no segment has the index, or
+// ErrSegmentNotYetPublished if the segment exists but its timestamp is beyond
+// now + maxLookaheadMs — i.e. the renderer has not advertised it in any media
+// playlist yet (renderPlaylistCache applies the same cutoff).
+//
+// This is the only public segment accessor, and the entry point for the
+// public HLS segment route. Viewer tokens authorize a time window, not a
+// specific segment, so without this gate a token holder could enumerate
+// segment indices and pull segments the transcoder pushed ahead of wall clock
+// before they go live, reading ahead of the live edge. Because the cutoff
+// advances monotonically with the wall clock, any segment that has ever been
+// published stays fetchable, so a well-behaved client is never refused a
+// segment it found in a playlist.
+func (s *Stream) RunWithPublishedSegmentSlot(index uint32, fn func(slot *pool.BufferSlot) error) error {
+	return s.runWithSegmentSlot(index, true, fn)
+}
+
+// runWithSegmentSlot finds the segment with the given index, acquires a
+// reference to its BufferSlot, and calls fn outside the lock. When
+// gateToLookahead is true, a segment whose timestamp is past
+// now + maxLookaheadMs is refused with ErrSegmentNotYetPublished; otherwise
+// any committed segment is served regardless of publish state.
+//
+// Only the gated form is exported, via RunWithPublishedSegmentSlot. The
+// ungated form is reachable solely from white-box tests in this package that
+// need to read back a segment independent of the look-ahead policy (e.g.
+// segments committed with future timestamps under the mock clock).
+func (s *Stream) runWithSegmentSlot(index uint32, gateToLookahead bool, fn func(slot *pool.BufferSlot) error) error {
 	s.mu.RLock()
 
 	idx := sort.Search(len(s.segments), func(i int) bool {
@@ -520,6 +557,15 @@ func (s *Stream) RunWithSegmentSlot(index uint32, fn func(slot *pool.BufferSlot)
 	if idx >= len(s.segments) || s.segments[idx].Index != index {
 		s.mu.RUnlock()
 		return ErrSegmentNotFound
+	}
+
+	// Gate the fetch to the published look-ahead horizon. The renderer
+	// advertises only segments with Timestamp <= now + maxLookaheadMs (see
+	// renderPlaylistCache); refusing the rest here keeps the publicly
+	// fetchable set aligned with the advertised set.
+	if gateToLookahead && s.segments[idx].Timestamp > s.clock.Now().UnixMilli()+s.maxLookaheadMs {
+		s.mu.RUnlock()
+		return ErrSegmentNotYetPublished
 	}
 
 	buf := s.segments[idx].Data

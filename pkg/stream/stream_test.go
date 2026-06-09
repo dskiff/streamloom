@@ -55,10 +55,25 @@ func mustCommitSlot(t *testing.T, s *Stream, index uint32, data []byte, ts int64
 	require.NoError(t, err)
 }
 
-// readSegment reads segment data using RunWithSegmentSlot and returns the bytes.
+// readSegment reads segment data using the ungated raw accessor and returns
+// the bytes. Bypassing the look-ahead gate lets tests read back segments
+// committed with future timestamps, the common case under the mock clock.
 func readSegment(s *Stream, index uint32) ([]byte, error) {
 	var data []byte
-	err := s.RunWithSegmentSlot(index, func(slot *pool.BufferSlot) error {
+	err := s.runWithSegmentSlot(index, false, func(slot *pool.BufferSlot) error {
+		var buf bytes.Buffer
+		_, err := slot.WriteTo(&buf)
+		data = buf.Bytes()
+		return err
+	})
+	return data, err
+}
+
+// readPublishedSegment reads segment data using the look-ahead-gated
+// RunWithPublishedSegmentSlot and returns the bytes.
+func readPublishedSegment(s *Stream, index uint32) ([]byte, error) {
+	var data []byte
+	err := s.RunWithPublishedSegmentSlot(index, func(slot *pool.BufferSlot) error {
 		var buf bytes.Buffer
 		_, err := slot.WriteTo(&buf)
 		data = buf.Bytes()
@@ -299,6 +314,28 @@ func newTestStream(t *testing.T, clk *clock.Mock) *Stream {
 	mustInit(t, store, "1", Metadata{Bandwidth: 1000, TargetDurationSecs: 1}, []byte{0x00}, testCap, testSegmentBytes, testBackwardBufferSize)
 	s := store.Get("1")
 	require.NotNil(t, s, "expected stream")
+	return s
+}
+
+// newTestStreamWithLookahead builds a stream wired to the caller's mock clock
+// with an explicit look-ahead cap, so a test can advance the clock and
+// observe the look-ahead gate. Unlike setupStreamForPlaylistWithLookahead it
+// keeps the clock under the caller's control rather than owning its own.
+func newTestStreamWithLookahead(t *testing.T, clk *clock.Mock, targetDurationSecs int, maxLookaheadMs int64) *Stream {
+	t.Helper()
+	store := NewStore(clk)
+	meta := Metadata{
+		Bandwidth:          4000000,
+		Codecs:             "avc1.64001f",
+		Width:              1920,
+		Height:             1080,
+		FrameRate:          23.976,
+		TargetDurationSecs: targetDurationSecs,
+	}
+	require.NoError(t, store.Init("1", meta, []byte("init"), 50, testSegmentBytes, 20, 5, 12, maxLookaheadMs))
+	s := store.Get("1")
+	require.NotNil(t, s, "expected stream")
+	t.Cleanup(func() { store.Delete("1") })
 	return s
 }
 
@@ -588,12 +625,86 @@ func TestRejectPastTimestampDoesNotIncrementCount(t *testing.T) {
 	assert.Equal(t, int64(1), s.TotalSegmentCount(), "count after rejection")
 }
 
-func TestRunWithSegmentSlotNotFound(t *testing.T) {
+func TestReadSegmentNotFound(t *testing.T) {
 	clk := clock.NewMock(time.UnixMilli(0))
 	s := newTestStream(t, clk)
 
 	_, err := readSegment(s, 999)
 	assert.ErrorIs(t, err, ErrSegmentNotFound)
+}
+
+func TestRunWithPublishedSegmentSlotNotFound(t *testing.T) {
+	clk := clock.NewMock(time.UnixMilli(0))
+	s := newTestStream(t, clk)
+
+	// A missing index is ErrSegmentNotFound, not ErrSegmentNotYetPublished:
+	// the look-ahead gate only applies once the segment is located.
+	_, err := readPublishedSegment(s, 999)
+	assert.ErrorIs(t, err, ErrSegmentNotFound)
+}
+
+// TestRunWithPublishedSegmentSlot_GatesBeyondLookahead verifies that the
+// gated accessor refuses a buffered segment whose timestamp is past the
+// published look-ahead horizon, while the raw accessor still serves it. This
+// is the read-ahead defense: viewer tokens authorize a time window, not a
+// specific segment, so the public route must not serve segments the renderer
+// has not advertised yet.
+func TestRunWithPublishedSegmentSlot_GatesBeyondLookahead(t *testing.T) {
+	clk := clock.NewMock(time.UnixMilli(0))
+	// Target 2s, look-ahead 6s. nowMs starts at 0, so the cap is 6000.
+	s := newTestStreamWithLookahead(t, clk, 2, 6000)
+
+	within := []byte("within-cap")
+	beyond := []byte("beyond-cap")
+	mustCommitSlot(t, s, 0, within, 2000, 2000)  // 2000 <= 0+6000: within cap
+	mustCommitSlot(t, s, 1, beyond, 10000, 2000) // 10000 > 0+6000: beyond cap
+
+	// The raw accessor serves both — both are committed to the buffer.
+	got, err := readSegment(s, 0)
+	require.NoError(t, err)
+	assert.Equal(t, within, got)
+	got, err = readSegment(s, 1)
+	require.NoError(t, err)
+	assert.Equal(t, beyond, got)
+
+	// The gated accessor serves the within-cap segment...
+	got, err = readPublishedSegment(s, 0)
+	require.NoError(t, err)
+	assert.Equal(t, within, got)
+
+	// ...but refuses the beyond-cap one as not-yet-published.
+	_, err = readPublishedSegment(s, 1)
+	assert.ErrorIs(t, err, ErrSegmentNotYetPublished)
+
+	// Advancing wall clock so the cap reaches the segment makes it
+	// fetchable: cap = 4000 + 6000 = 10000 >= 10000.
+	clk.Set(time.UnixMilli(4000))
+	got, err = readPublishedSegment(s, 1)
+	require.NoError(t, err)
+	assert.Equal(t, beyond, got)
+}
+
+// TestRunWithPublishedSegmentSlot_ZeroLookaheadPinsAtNow checks the legacy
+// maxLookaheadMs=0 configuration: the gate degenerates to "timestamp must be
+// at or before now", matching the renderer pinning the tail at wall clock.
+func TestRunWithPublishedSegmentSlot_ZeroLookaheadPinsAtNow(t *testing.T) {
+	clk := clock.NewMock(time.UnixMilli(0))
+	s := newTestStreamWithLookahead(t, clk, 2, 0)
+
+	// First segment is exempt from the past-timestamp commit check, so we can
+	// seed a future-PDT segment on an empty stream.
+	future := []byte("future")
+	mustCommitSlot(t, s, 0, future, 5000, 2000)
+
+	// At now=0 the cap is exactly 0, so the future segment is gated.
+	_, err := readPublishedSegment(s, 0)
+	assert.ErrorIs(t, err, ErrSegmentNotYetPublished)
+
+	// Once wall clock reaches the segment PDT it becomes fetchable.
+	clk.Set(time.UnixMilli(5000))
+	got, err := readPublishedSegment(s, 0)
+	require.NoError(t, err)
+	assert.Equal(t, future, got)
 }
 
 func TestConcurrentSegmentAccess(t *testing.T) {
@@ -1121,7 +1232,7 @@ func TestConcurrentReadersAndEviction(t *testing.T) {
 		readerWg.Add(1)
 		go func(i int) {
 			defer readerWg.Done()
-			_ = s.RunWithSegmentSlot(uint32(i), func(slot *pool.BufferSlot) error {
+			_ = s.runWithSegmentSlot(uint32(i), false, func(slot *pool.BufferSlot) error {
 				readersReady <- struct{}{}
 				<-releaseReaders
 				var buf bytes.Buffer
@@ -1872,7 +1983,7 @@ func TestConcurrentReadersAndGenerationDrop(t *testing.T) {
 		readerWg.Add(1)
 		go func(i int) {
 			defer readerWg.Done()
-			readerErrs <- s.RunWithSegmentSlot(uint32(i), func(slot *pool.BufferSlot) error {
+			readerErrs <- s.runWithSegmentSlot(uint32(i), false, func(slot *pool.BufferSlot) error {
 				readersReady <- struct{}{}
 				<-releaseReaders
 				var buf bytes.Buffer

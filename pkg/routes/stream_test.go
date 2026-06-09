@@ -79,6 +79,42 @@ func TestGetSegment_SegmentNotFound(t *testing.T) {
 	assert.NotEqual(t, config.MP4_MIME_TYPE, rec.Header().Get("Content-Type"))
 }
 
+// TestGetSegment_BeyondLookahead_Returns404 asserts that a segment buffered
+// ahead of the published look-ahead horizon is refused with the same 404 as
+// a missing segment, then becomes fetchable once wall clock advances past
+// the cutoff. This keeps the publicly fetchable set aligned with what the
+// media playlist advertises: a token holder cannot enumerate future segment
+// indices to read ahead of the live edge.
+func TestGetSegment_BeyondLookahead_Returns404(t *testing.T) {
+	clk := clock.NewMock(time.UnixMilli(1000))
+	router, store, _ := testStreamRouter(t, clk)
+	initStream(t, store, "1") // target=2s ⇒ default look-ahead 6000ms
+
+	s := store.Get("1")
+	require.NotNil(t, s)
+
+	// PDT 20000 is well past now+lookahead = 1000+6000 = 7000, so the
+	// renderer will not advertise it yet. The fetch must look exactly like a
+	// missing segment.
+	segData := []byte("future-seg")
+	commitSegment(t, s, 0, segData, 20000)
+
+	req := httptest.NewRequest(http.MethodGet, "/stream/1/segment_0.m4s", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	assert.Equal(t, http.StatusNotFound, rec.Code)
+	assert.NotEqual(t, config.MP4_MIME_TYPE, rec.Header().Get("Content-Type"))
+
+	// Advance wall clock so the segment enters the published horizon
+	// (cap = 14000+6000 = 20000 >= 20000); the same fetch now succeeds.
+	clk.Set(time.UnixMilli(14000))
+	req = httptest.NewRequest(http.MethodGet, "/stream/1/segment_0.m4s", nil)
+	rec = httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, segData, rec.Body.Bytes())
+}
+
 func TestGetSegment_InvalidSegmentID(t *testing.T) {
 	router, store, _ := testStreamRouter(t, clock.Real{})
 	initStream(t, store, "1")
