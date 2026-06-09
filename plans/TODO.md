@@ -171,3 +171,31 @@ PDT close to wall time.
       `TestInitRejectsPlaylistWindowSizeAboveBackwardBuffer`,
       `TestInitStoresPlaylistWindowSize`. README updated with the
       header and the `X-SL-BACKWARD-BUFFER-SIZE` interaction.
+
+## Stale-generation drop: no panic with active readers
+
+Security-review fix: `dropStaleGenerationLocked` panicked when a dropped
+stale-generation segment still had an in-flight reader. The plain-string
+panic unwound `CommitSlot` mid-mutation under `s.mu` (generation already
+advanced, slice partially compacted), leaked the new segment's buffer
+(handler only releases on error returns), and `middleware.Recoverer`
+turned it into a 500 — leaving the stream serving from corrupted state.
+Reachable by any viewer holding a read on a segment that a generation
+advance drops (the read path serves any committed index).
+
+- [x] `dropStaleGenerationLocked`: replace the panic. A reader-held stale
+      segment is still removed from the list (not servable or
+      playlist-visible, index immediately reusable by the new
+      generation), but its buffer is parked on a new `Stream.pendingFree`
+      list instead of being returned to the pool.
+- [x] `sweepPendingFreeLocked`: returns parked buffers with a drained
+      reader count to the pool. Runs under the write lock on every
+      `AcquireSlot` and `CommitSlot`, so the pool recovers as soon as
+      readers finish. Write lock makes the `Readers() == 0` check stable:
+      readers attach only under `RLock` and parked buffers are
+      unreachable from `segments`.
+- [x] Tests: `TestCommitSlot_GenerationAdvance_DefersBufferWithActiveReader`,
+      `TestCommitSlot_GenerationAdvance_ReplacesReaderHeldIndex`,
+      `TestCommitSlot_PendingFreeNotSweptWhileReaderActive`,
+      `TestAcquireSlot_SweepsPendingFreeAfterReadersDrain`,
+      `TestConcurrentReadersAndGenerationDrop` (passes `-race`).
