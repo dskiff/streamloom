@@ -17,6 +17,17 @@ const DefaultWindowMs int64 = 60_000
 // CleanupInterval is how often the background goroutine purges stale entries.
 const CleanupInterval = 5 * time.Minute
 
+// MaxIPsPerStream caps the number of distinct client IPs tracked per stream.
+// Active-watcher counting is best-effort, so once a stream is already tracking
+// this many distinct IPs, a previously-unseen IP is dropped rather than
+// inserted (already-tracked IPs still refresh their last-seen timestamp). This
+// bounds per-stream memory: a flood of distinct IPs — whether a genuinely huge
+// audience or an attacker cycling source addresses — can no longer grow the
+// map without limit. The periodic Cleanup frees slots again as entries age
+// past MaxWindowMs. The ceiling is far above any realistic simultaneous
+// audience, so legitimate counts saturate rather than degrade in practice.
+const MaxIPsPerStream = 100_000
+
 // streamWatchers holds per-stream IP tracking data.
 type streamWatchers struct {
 	ips map[string]int64 // IP -> last-seen UnixMilli
@@ -38,6 +49,12 @@ func NewTracker(clk clock.Clock) *Tracker {
 }
 
 // Record updates the last-seen timestamp for a client IP on a stream.
+//
+// At most MaxIPsPerStream distinct IPs are retained per stream: once that
+// ceiling is reached, a previously-unseen IP is dropped instead of inserted.
+// Already-tracked IPs always refresh, so steady-state viewers are unaffected
+// and the count only degrades (saturating at the cap) under an abnormally
+// large or adversarial set of distinct IPs.
 func (t *Tracker) Record(streamID, ip string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -46,6 +63,9 @@ func (t *Tracker) Record(streamID, ip string) {
 	if sw == nil {
 		sw = &streamWatchers{ips: make(map[string]int64)}
 		t.streams[streamID] = sw
+	}
+	if _, exists := sw.ips[ip]; !exists && len(sw.ips) >= MaxIPsPerStream {
+		return
 	}
 	sw.ips[ip] = t.clock.Now().UnixMilli()
 }
