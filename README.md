@@ -84,9 +84,60 @@ in front of streamloom (e.g. nginx, caddy, or the WAF of your choice). TLS termi
 | `SL_BIND_ADDR` | No | IP address to bind both servers to. Defaults to `127.0.0.1` in dev, `0.0.0.0` (all interfaces) in production. Override to restrict binding in non-container deployments. |
 | `SL_STREAM_MAX_BUFFER_BYTES` | No | Maximum total buffer size per stream in bytes (default: 1 GiB) |
 | `SL_BUFFER_WORKING_SPACE` | No | Extra buffer pool slots beyond ring buffer capacity for concurrent handlers (default: 20) |
-| `SL_TRUSTED_PROXIES` | No | Comma-separated CIDR ranges of trusted reverse proxies (e.g. `10.0.0.0/8,172.16.0.0/12`). When set, `X-Forwarded-For` and `X-Real-IP` headers are only trusted from these IPs. When unset, forwarded headers are never trusted. |
+| `SL_TRUSTED_PROXIES` | No | Comma-separated CIDR ranges of your reverse proxies (e.g. `10.0.0.0/8,172.16.0.0/12`). The client IP is taken from `X-Forwarded-For` **only** when the direct connection comes from one of these ranges. `True-Client-IP` and `X-Real-IP` are never trusted and are always stripped. When unset, the direct connection IP is always used. See [Client IP resolution](#client-ip-resolution). |
 | `SL_DEBUG` | No | Enable debug-level logging (`true`/`1`) |
 | `SL_REQUEST_LOG_FILE` | No | File path for HTTP request logs. When set, structured request logs are appended to this file. When unset, request logging is disabled. Log rotation should be handled externally (e.g. `logrotate` with `copytruncate`). |
+
+## Client IP resolution
+
+streamloom uses the resolved client IP to count distinct active watchers. That
+count keys an in-memory map, so the IP must not be client-spoofable — otherwise
+a single client could both skew the count and grow the map without bound
+(per-stream growth is also capped as a backstop, but the IP must still be
+trustworthy).
+
+Resolution rules:
+
+- `True-Client-IP` and `X-Real-IP` are **never** trusted and are stripped from
+  every request. A reverse proxy with a default configuration forwards these
+  client-set headers through untouched, so honoring them would let any client
+  pick its own source IP.
+- `X-Forwarded-For` is consulted **only** when the direct TCP peer is inside
+  `SL_TRUSTED_PROXIES`. The real client is the **rightmost** entry that is not
+  itself a trusted-proxy IP — the hop your proxy appended. Entries further left
+  can be forged by the client and are ignored.
+- If `SL_TRUSTED_PROXIES` is unset, or the peer is not trusted, the direct
+  connection IP is used and all forwarding headers are stripped.
+
+### Required reverse-proxy configuration
+
+If you run a TLS-terminating proxy in front of streamloom (recommended), you
+must:
+
+1. Set `SL_TRUSTED_PROXIES` to the proxy's address range. Otherwise the peer is
+   untrusted and every viewer collapses to the proxy's IP, making the watcher
+   count meaningless.
+2. Ensure the proxy **appends the real client to `X-Forwarded-For`** (or
+   overwrites it with the real client). Do not pass a client-supplied
+   `X-Forwarded-For` chain through unchanged.
+3. **Strip inbound `True-Client-IP` and `X-Real-IP`** from client requests as
+   defense in depth (streamloom ignores them regardless).
+
+Caddy example:
+
+```caddy
+example.com {
+	reverse_proxy streamloom:8080 {
+		# Strip client-supplied IP headers that must not be trusted.
+		header_up -True-Client-IP
+		header_up -X-Real-IP
+		# Caddy appends the real client to X-Forwarded-For by default — the
+		# entry streamloom reads. Overwriting it outright also discards any
+		# client-supplied chain:
+		header_up X-Forwarded-For {http.request.remote.host}
+	}
+}
+```
 
 ## API
 

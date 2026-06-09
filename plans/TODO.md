@@ -4,6 +4,36 @@ Task list for in-flight streamloom work. Completed tasks are kept briefly
 for context, then pruned once a successor task exists or the work is well
 past.
 
+## Active-watcher map: memory-DoS hardening
+
+Close the unbounded / spoofable active-watcher map (memory DoS). All tasks
+**complete**.
+
+- [x] Cap per-stream tracked IPs at `watcher.MaxIPsPerStream` (100k). At
+      capacity, previously-unseen IPs are dropped while tracked IPs still
+      refresh, so counting degrades gracefully instead of exhausting memory.
+      Tests: `TestRecord_CapsDistinctIPsPerStream`, `TestRecord_CapIsPerStream`.
+- [x] Bound the stream dimension: `mw.RecordWatcher` now takes a
+      `streamExists` predicate and records only for streams the store holds
+      (wired via `store.Get` in `routes.Stream`). Without it, arbitrary
+      `{streamID}` path values could mint unbounded tracker streams. Tests:
+      `TestRecordWatcher_{RecordsWhenStreamExists,SkipsWhenStreamMissing}`,
+      `TestActiveWatchers_UninitializedStreamNotRecorded`.
+- [x] Fix client-IP trust in `mw.TrustedRealIP`: never honor `True-Client-IP`
+      / `X-Real-IP` (stripped on every path); on the trusted path derive the
+      client from the **rightmost non-trusted** `X-Forwarded-For` entry
+      instead of chi's spoofable leftmost. Dropped the `chi/middleware.RealIP`
+      dependency. Tests: `TestTrustedRealIP_*`, `TestRightmostUntrustedIP`,
+      and end-to-end `TestActiveWatchers_{TrueClientIPSpoofDoesNotInflate,
+      ForgedForwardedPrefixDoesNotInflate,DistinctForwardedClientsCounted}`.
+- [x] README: new "Client IP resolution" section documents the trust model
+      and required reverse-proxy header hygiene (strip inbound
+      `True-Client-IP`/`X-Real-IP`; append/overwrite `X-Forwarded-For`), with
+      a Caddy example. Updated the `SL_TRUSTED_PROXIES` row.
+- [x] Pre-commit: `go fmt / vet / test` green. `gosec` clean for the change
+      (the two pre-existing G705 taint findings on `stream.go`/`api.go` are
+      unchanged by this work).
+
 ## HMAC key derivation (stream + type → derived key)
 
 All tasks below are **complete**. Kept here until the change lands on

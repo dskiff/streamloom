@@ -60,6 +60,11 @@ func Stream(logger *slog.Logger, env config.Env, store *stream.Store, requestLog
 		w.WriteHeader(http.StatusOK)
 	})
 
+	// streamExists gates watcher recording to streams the store actually
+	// holds, so a client requesting arbitrary {streamID} values cannot grow
+	// the tracker's map without bound (see mw.RecordWatcher).
+	streamExists := func(streamID string) bool { return store.Get(streamID) != nil }
+
 	router.Route("/stream/{streamID}", func(r chi.Router) {
 		// Playlist routes accept only TypePlaylist tokens. Segment-class
 		// tokens are deliberately refused here (they fail MAC under the
@@ -71,7 +76,7 @@ func Stream(logger *slog.Logger, env config.Env, store *stream.Store, requestLog
 		// do not inflate the active-viewer count.
 		r.Group(func(r chi.Router) {
 			r.Use(mw.ViewerTokenAuth(store.Clock(), env.STREAM_VIEWER_TOKEN_KEYS, logger, viewer.TypePlaylist))
-			r.Use(mw.RecordWatcher(tracker))
+			r.Use(mw.RecordWatcher(tracker, streamExists))
 
 			r.Get("/media.m3u8", mediaPlaylistHandler(logger, store))
 			r.Get("/stream.m3u8", masterPlaylistHandler(logger, store))
@@ -83,7 +88,7 @@ func Stream(logger *slog.Logger, env config.Env, store *stream.Store, requestLog
 		// first so the hot path verifies with a single HMAC.
 		r.Group(func(r chi.Router) {
 			r.Use(mw.ViewerTokenAuth(store.Clock(), env.STREAM_VIEWER_TOKEN_KEYS, logger, viewer.TypeSegment, viewer.TypePlaylist))
-			r.Use(mw.RecordWatcher(tracker))
+			r.Use(mw.RecordWatcher(tracker, streamExists))
 
 			r.Get("/init.mp4", initHandler(logger, store))
 			r.Get("/segment_{segmentID}.m4s", segmentHandler(logger, store))
