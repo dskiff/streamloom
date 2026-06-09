@@ -97,6 +97,20 @@ func commitSlotGen(t *testing.T, s *Stream, index uint32, data []byte, ts int64,
 	return err
 }
 
+// poolFreeCount returns the stream's buffer-pool free count under lock.
+func poolFreeCount(s *Stream) int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.bufPool.FreeCount()
+}
+
+// pendingFreeCount returns the number of buffers parked on pendingFree under lock.
+func pendingFreeCount(s *Stream) int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.pendingFree)
+}
+
 // --- Store and Stream tests ---
 
 func TestNewStore(t *testing.T) {
@@ -1641,6 +1655,274 @@ func TestCommitSlot_ZeroGenerationStaleAfterAdvance(t *testing.T) {
 	// Push with generation 0 → stale.
 	err = commitSlotGen(t, s, 1, []byte("data2"), 7000, 2000, 0)
 	assert.ErrorIs(t, err, ErrStaleGeneration)
+}
+
+func TestCommitSlot_GenerationAdvance_DefersBufferWithActiveReader(t *testing.T) {
+	// A viewer holds a reader on a segment that a generation advance drops.
+	// CommitSlot must succeed, remove the segment from the list, and defer
+	// the buffer's return to the pool until the reader finishes — never
+	// panic mid-mutation.
+	clk := clock.NewMock(time.UnixMilli(0))
+	store := NewStore(clk)
+	meta := Metadata{Bandwidth: 1, Codecs: "avc1.64001f", Width: 1, Height: 1, FrameRate: 30, TargetDurationSecs: 2}
+	mustInit(t, store, "g", meta, []byte("init"), 10, testSegmentBytes, 5)
+	s := store.Get("g")
+
+	// Push 5 segments at gen=0.
+	for i := uint32(0); i < 5; i++ {
+		err := commitSlotGen(t, s, i, []byte("data"), int64(5000+i*2000), 2000, 0)
+		require.NoError(t, err)
+	}
+
+	// Simulate an in-flight viewer holding segment 3's buffer.
+	s.mu.RLock()
+	seg3Data := s.segments[3].Data
+	seg3Data.ReaderInc()
+	s.mu.RUnlock()
+
+	freeBefore := poolFreeCount(s)
+
+	// Push gen=1 at index=2 → gen=0 segments 2,3,4 are dropped. Index 3 is
+	// reader-held: its buffer must be parked, not returned to the pool.
+	err := commitSlotGen(t, s, 2, []byte("new"), 9000, 2000, 1)
+	require.NoError(t, err)
+
+	segCount, _ := s.SegmentLoad()
+	assert.Equal(t, 3, segCount) // 0,1 (gen=0) + 2 (gen=1)
+
+	// Dropped indices must no longer be served, including the reader-held one.
+	_, err = readSegment(s, 3)
+	assert.ErrorIs(t, err, ErrSegmentNotFound)
+	_, err = readSegment(s, 4)
+	assert.ErrorIs(t, err, ErrSegmentNotFound)
+
+	// Buffers for indices 2 and 4 went back to the pool, index 3's is
+	// parked, and the new segment consumed one slot: net +1 free.
+	assert.Equal(t, freeBefore+1, poolFreeCount(s))
+	assert.Equal(t, 1, pendingFreeCount(s))
+
+	// The in-flight reader's buffer is untouched while parked.
+	var got bytes.Buffer
+	_, err = seg3Data.WriteTo(&got)
+	require.NoError(t, err)
+	assert.Equal(t, []byte("data"), got.Bytes())
+
+	// Reader finishes → the next commit sweeps the parked buffer back.
+	seg3Data.ReaderDec()
+	err = commitSlotGen(t, s, 3, []byte("new2"), 11000, 2000, 1)
+	require.NoError(t, err)
+	assert.Equal(t, 0, pendingFreeCount(s))
+	assert.Equal(t, freeBefore+1, poolFreeCount(s)) // parked buffer back, new segment out
+}
+
+func TestCommitSlot_GenerationAdvance_ReplacesReaderHeldIndex(t *testing.T) {
+	// A new generation re-pushing an index whose stale predecessor is
+	// reader-held must succeed: the stale segment leaves the list so the
+	// index is immediately reusable, while its buffer stays parked until
+	// the reader finishes.
+	clk := clock.NewMock(time.UnixMilli(0))
+	store := NewStore(clk)
+	meta := Metadata{Bandwidth: 1, Codecs: "avc1.64001f", Width: 1, Height: 1, FrameRate: 30, TargetDurationSecs: 2}
+	mustInit(t, store, "g", meta, []byte("init"), 10, testSegmentBytes, 5)
+	s := store.Get("g")
+
+	require.NoError(t, commitSlotGen(t, s, 0, []byte("old0"), 5000, 2000, 0))
+	require.NoError(t, commitSlotGen(t, s, 1, []byte("old1"), 7000, 2000, 0))
+	require.NoError(t, commitSlotGen(t, s, 2, []byte("old2"), 9000, 2000, 0))
+
+	s.mu.RLock()
+	seg2Data := s.segments[2].Data
+	seg2Data.ReaderInc()
+	s.mu.RUnlock()
+
+	freeBefore := poolFreeCount(s)
+
+	// Same index, newer generation → replaces the reader-held segment.
+	require.NoError(t, commitSlotGen(t, s, 2, []byte("new2"), 9500, 2000, 1))
+	assert.Equal(t, 1, pendingFreeCount(s))
+
+	// New requests for index 2 see the new generation's data.
+	data, err := readSegment(s, 2)
+	require.NoError(t, err)
+	assert.Equal(t, []byte("new2"), data)
+
+	// The in-flight reader still sees the old bytes.
+	var got bytes.Buffer
+	_, err = seg2Data.WriteTo(&got)
+	require.NoError(t, err)
+	assert.Equal(t, []byte("old2"), got.Bytes())
+
+	// Reader finishes → AcquireSlot sweeps the parked buffer back.
+	seg2Data.ReaderDec()
+	buf, ok := s.AcquireSlot()
+	require.True(t, ok)
+	s.ReleaseSlot(buf)
+	assert.Equal(t, 0, pendingFreeCount(s))
+	assert.Equal(t, freeBefore, poolFreeCount(s)) // same segment count as before the swap
+}
+
+func TestCommitSlot_PendingFreeNotSweptWhileReaderActive(t *testing.T) {
+	// While a reader holds a parked buffer, sweeps must leave it alone: it
+	// stays off the free list and its contents stay intact across commits.
+	clk := clock.NewMock(time.UnixMilli(0))
+	store := NewStore(clk)
+	meta := Metadata{Bandwidth: 1, Codecs: "avc1.64001f", Width: 1, Height: 1, FrameRate: 30, TargetDurationSecs: 2}
+	mustInit(t, store, "g", meta, []byte("init"), 10, testSegmentBytes, 5)
+	s := store.Get("g")
+
+	require.NoError(t, commitSlotGen(t, s, 0, []byte("old0"), 5000, 2000, 0))
+	require.NoError(t, commitSlotGen(t, s, 1, []byte("old1"), 7000, 2000, 0))
+	require.NoError(t, commitSlotGen(t, s, 2, []byte("old2"), 9000, 2000, 0))
+
+	s.mu.RLock()
+	seg2Data := s.segments[2].Data
+	seg2Data.ReaderInc()
+	s.mu.RUnlock()
+
+	require.NoError(t, commitSlotGen(t, s, 2, []byte("new2"), 9500, 2000, 1))
+
+	// Further commits run the sweep but must skip the reader-held buffer.
+	require.NoError(t, commitSlotGen(t, s, 3, []byte("new3"), 11000, 2000, 1))
+	require.NoError(t, commitSlotGen(t, s, 4, []byte("new4"), 13000, 2000, 1))
+	assert.Equal(t, 1, pendingFreeCount(s))
+
+	var got bytes.Buffer
+	_, err := seg2Data.WriteTo(&got)
+	require.NoError(t, err)
+	assert.Equal(t, []byte("old2"), got.Bytes())
+
+	seg2Data.ReaderDec()
+	require.NoError(t, commitSlotGen(t, s, 5, []byte("new5"), 15000, 2000, 1))
+	assert.Equal(t, 0, pendingFreeCount(s))
+	// Pool of 10 with 6 committed segments (0-5) and nothing parked.
+	assert.Equal(t, 4, poolFreeCount(s))
+}
+
+func TestAcquireSlot_SweepsPendingFreeAfterReadersDrain(t *testing.T) {
+	// Parked buffers consume pool slots until their readers drain.
+	// AcquireSlot must reclaim drained buffers itself so the pool recovers
+	// without needing a successful commit in between.
+	clk := clock.NewMock(time.UnixMilli(0))
+	store := NewStore(clk)
+	meta := Metadata{Bandwidth: 1, Codecs: "avc1.64001f", Width: 1, Height: 1, FrameRate: 30, TargetDurationSecs: 2}
+	// Capacity 3 + workingSpace 1 → pool of 4.
+	require.NoError(t, store.Init("g", meta, []byte("init"), 3, testSegmentBytes, 1, 1, testPlaylistWindowSize, testMaxLookaheadMs))
+	t.Cleanup(func() { store.Delete("g") })
+	s := store.Get("g")
+
+	for i := uint32(0); i < 3; i++ {
+		require.NoError(t, commitSlotGen(t, s, i, []byte("data"), int64(5000+i*2000), 2000, 0))
+	}
+
+	// Readers on indices 1 and 2.
+	s.mu.RLock()
+	seg1Data := s.segments[1].Data
+	seg2Data := s.segments[2].Data
+	seg1Data.ReaderInc()
+	seg2Data.ReaderInc()
+	s.mu.RUnlock()
+
+	// Gen advance at index 0 drops all gen=0 segments: index 0's buffer
+	// returns to the pool, indices 1 and 2 are parked.
+	require.NoError(t, commitSlotGen(t, s, 0, []byte("new"), 10000, 2000, 1))
+	assert.Equal(t, 2, pendingFreeCount(s))
+	assert.Equal(t, 1, poolFreeCount(s)) // 4 total = 1 committed + 2 parked + 1 free
+
+	buf, ok := s.AcquireSlot()
+	require.True(t, ok)
+
+	// Pool exhausted: both parked buffers are still reader-held.
+	_, ok = s.AcquireSlot()
+	assert.False(t, ok, "pool should be exhausted while parked buffers are reader-held")
+
+	// One reader finishes → the next acquire reclaims its buffer.
+	seg1Data.ReaderDec()
+	buf2, ok := s.AcquireSlot()
+	require.True(t, ok, "AcquireSlot should reclaim the drained parked buffer")
+	assert.Equal(t, 1, pendingFreeCount(s))
+
+	seg2Data.ReaderDec()
+	s.ReleaseSlot(buf)
+	s.ReleaseSlot(buf2)
+}
+
+func TestConcurrentReadersAndGenerationDrop(t *testing.T) {
+	t0 := time.Date(2025, 6, 1, 12, 0, 0, 0, time.UTC)
+	clk := clock.NewMock(t0)
+
+	store := NewStore(clk)
+	require.NoError(t, store.Init("1", Metadata{Bandwidth: 1000, TargetDurationSecs: 1}, []byte{0x00}, 20, testSegmentBytes, 2, 2, testPlaylistWindowSize, testMaxLookaheadMs))
+	t.Cleanup(func() { store.Delete("1") })
+	s := store.Get("1")
+
+	// Add 10 future segments at gen=0.
+	for i := range 10 {
+		ts := t0.UnixMilli() + int64((i+1)*1000)
+		require.NoError(t, commitSlot(t, s, uint32(i), []byte{byte(i)}, ts, 1000))
+	}
+
+	// Readers hold segments 5-9 — the ones the generation advance drops.
+	const numReaders = 5
+	readersReady := make(chan struct{}, numReaders)
+	releaseReaders := make(chan struct{})
+	readerErrs := make(chan error, numReaders)
+
+	var readerWg sync.WaitGroup
+	for i := 5; i < 10; i++ {
+		readerWg.Add(1)
+		go func(i int) {
+			defer readerWg.Done()
+			readerErrs <- s.RunWithSegmentSlot(uint32(i), func(slot *pool.BufferSlot) error {
+				readersReady <- struct{}{}
+				<-releaseReaders
+				var buf bytes.Buffer
+				if _, err := slot.WriteTo(&buf); err != nil {
+					return err
+				}
+				if !bytes.Equal(buf.Bytes(), []byte{byte(i)}) {
+					return fmt.Errorf("segment %d: read %v, want %v", i, buf.Bytes(), []byte{byte(i)})
+				}
+				return nil
+			})
+		}(i)
+	}
+	for range numReaders {
+		<-readersReady
+	}
+
+	// Push gen=1 over indices 5-9 while the readers are mid-flight. The
+	// first commit parks all five reader-held gen=0 buffers; none of the
+	// commits may panic or fail.
+	for i := 5; i < 10; i++ {
+		ts := t0.UnixMilli() + int64((i+11)*1000)
+		buf, ok := s.AcquireSlot()
+		require.True(t, ok, "AcquireSlot for gen-1 segment %d", i)
+		_, err := buf.ReadFrom(bytes.NewReader([]byte{byte(100 + i)}))
+		require.NoError(t, err)
+		require.NoError(t, s.CommitSlot(uint32(i), buf, ts, 1000, 1))
+	}
+	assert.Equal(t, numReaders, pendingFreeCount(s))
+
+	// Readers complete and must still have seen their original gen-0 bytes.
+	close(releaseReaders)
+	readerWg.Wait()
+	close(readerErrs)
+	for err := range readerErrs {
+		assert.NoError(t, err)
+	}
+
+	// New requests see the new generation's data.
+	for i := uint32(5); i < 10; i++ {
+		data, err := readSegment(s, i)
+		require.NoError(t, err)
+		assert.Equal(t, []byte{byte(100 + i)}, data)
+	}
+
+	// A later acquire sweeps the drained buffers back to the pool.
+	buf, ok := s.AcquireSlot()
+	require.True(t, ok)
+	s.ReleaseSlot(buf)
+	assert.Equal(t, 0, pendingFreeCount(s))
 }
 
 func TestStoreInit_EmptyInitData(t *testing.T) {

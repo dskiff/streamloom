@@ -126,6 +126,13 @@ type Stream struct {
 	currentGeneration int64  // latest generation seen; segments from older generations are dropped
 	bufPool           *pool.BufferPool
 
+	// pendingFree holds buffers of dropped stale-generation segments that
+	// still had in-flight readers at drop time. The segments are already
+	// removed from the list, so no new readers can attach; once the last
+	// reader finishes, sweepPendingFreeLocked returns the buffer to the
+	// pool. Swept on every AcquireSlot and CommitSlot.
+	pendingFree []*pool.BufferSlot
+
 	// backwardBufferSize is the maximum number of backward segments to
 	// retain. A segment is "backward" when its Timestamp is before the
 	// current wall-clock time, regardless of whether it has appeared in a
@@ -283,20 +290,26 @@ func (s *Stream) CurrentGeneration() int64 {
 // whose generation is older than the stream's current generation. Freed
 // buffers are returned to the pool. The segment slice is compacted in-place.
 //
-// Segments at/after the insertion point are in the future and must not have
-// active readers; a non-zero reader count triggers a panic.
+// The read path serves any committed index, so even segments ahead of the
+// playlist window can have in-flight readers. A stale segment whose buffer
+// is still held by a reader is removed from the list all the same — it must
+// not be served or listed again — but its buffer is parked on pendingFree
+// and returned to the pool by a later sweep, once the reader finishes.
+// Unlike evictOldLocked's deferral, the segment is not retained: keeping
+// invalidated content in the list would let new requests attach readers
+// indefinitely and block the replacing generation from reusing its index.
 //
 // Must be called with s.mu held.
 func (s *Stream) dropStaleGenerationLocked(fromPos int) {
 	w := fromPos // write cursor
 	for r := fromPos; r < len(s.segments); r++ {
 		if s.segments[r].Generation < s.currentGeneration {
-			if s.segments[r].Data.Readers() > 0 {
-				panic(fmt.Sprintf("streamloom: stale segment index=%d has %d active readers",
-					s.segments[r].Index, s.segments[r].Data.Readers()))
-			}
 			s.bufPool.AssertCheckedOut(s.segments[r].Data)
-			s.bufPool.Put(s.segments[r].Data)
+			if s.segments[r].Data.Readers() > 0 {
+				s.pendingFree = append(s.pendingFree, s.segments[r].Data)
+			} else {
+				s.bufPool.Put(s.segments[r].Data)
+			}
 			s.segments[r].Data = nil
 			continue
 		}
@@ -310,6 +323,32 @@ func (s *Stream) dropStaleGenerationLocked(fromPos int) {
 		s.segments[i] = Slot{}
 	}
 	s.segments = s.segments[:w]
+}
+
+// sweepPendingFreeLocked returns to the pool any pending-free buffers whose
+// readers have drained. Buffers still held by a reader stay parked for a
+// later sweep.
+//
+// Must be called with s.mu held (write). The write lock makes the Readers()
+// check stable: readers attach only under s.mu.RLock (RunWithSegmentSlot),
+// and a pending-free buffer is no longer reachable from segments, so a count
+// of zero cannot rise again.
+func (s *Stream) sweepPendingFreeLocked() {
+	w := 0 // write cursor
+	for _, buf := range s.pendingFree {
+		if buf.Readers() > 0 {
+			s.pendingFree[w] = buf
+			w++
+			continue
+		}
+		s.bufPool.AssertCheckedOut(buf)
+		s.bufPool.Put(buf)
+	}
+	// Clear trailing entries to avoid retaining returned buffers.
+	for i := w; i < len(s.pendingFree); i++ {
+		s.pendingFree[i] = nil
+	}
+	s.pendingFree = s.pendingFree[:w]
 }
 
 // evictOldLocked removes backward (past) segments that exceed backwardBufferSize.
@@ -361,6 +400,7 @@ func (s *Stream) evictOldLocked() {
 func (s *Stream) AcquireSlot() (*pool.BufferSlot, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.sweepPendingFreeLocked()
 	return s.bufPool.Get()
 }
 
@@ -393,6 +433,8 @@ func (s *Stream) ReleaseSlot(buf *pool.BufferSlot) {
 func (s *Stream) CommitSlot(index uint32, buf *pool.BufferSlot, timestamp int64, durationMs uint32, generation int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	s.sweepPendingFreeLocked()
 
 	// Reject segments from older generations.
 	if s.currentGeneration > generation {
