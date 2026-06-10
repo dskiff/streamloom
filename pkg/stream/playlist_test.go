@@ -13,6 +13,29 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// --- Renderer sleep-overflow guard tests ---
+
+func TestSleepForMs_ClampsOverflowingDelay(t *testing.T) {
+	// ~400 years in milliseconds overflows int64 when multiplied by
+	// time.Millisecond, wrapping negative — exactly what fired the renderer's
+	// timer immediately and spun it in a busy loop. The helper must clamp to
+	// maxRenderSleep and stay strictly positive.
+	overflowing := int64(400) * 365 * 24 * 60 * 60 * 1000
+	got := sleepForMs(overflowing)
+	assert.Equal(t, maxRenderSleep, got, "overflowing delay must clamp to maxRenderSleep")
+	assert.Positive(t, got, "clamped sleep must be positive (a negative duration busy-loops the timer)")
+}
+
+func TestSleepForMs_PassesThroughNormalDelay(t *testing.T) {
+	assert.Equal(t, 1500*time.Millisecond, sleepForMs(1500))
+}
+
+func TestSleepForMs_Boundary(t *testing.T) {
+	capMs := int64(maxRenderSleep / time.Millisecond)
+	assert.Equal(t, time.Duration(capMs-1)*time.Millisecond, sleepForMs(capMs-1), "just under the cap passes through")
+	assert.Equal(t, maxRenderSleep, sleepForMs(capMs), "at the cap clamps to maxRenderSleep")
+}
+
 // setupStreamForPlaylist creates a Store, initializes a stream with the given
 // target duration, and returns the Store and Stream. The clock is fixed to
 // time zero (so all segment timestamps are in the future and CommitSlot accepts
@@ -180,8 +203,12 @@ func TestRenderMediaPlaylist_DurationFormatting(t *testing.T) {
 }
 
 func TestRenderMediaPlaylist_TimestampFormat(t *testing.T) {
-	// Unix ms 1700000000000 = 2023-11-14T22:13:20.000Z
-	_, s := setupStreamForPlaylist(t, 2)
+	// Unix ms 1700000000000 = 2023-11-14T22:13:20.000Z. Pin the clock just
+	// before it (rather than the epoch-0 fixture) so the real-world timestamp
+	// sits within the accepted future horizon — CommitSlot now rejects
+	// timestamps far beyond the stream clock.
+	clk := clock.NewMock(time.UnixMilli(1700000000000 - 1000))
+	s := newTestStreamWithLookahead(t, clk, 2, testMaxLookaheadMs)
 
 	mustCommitSlot(t, s, 0, []byte("d"), 1700000000000, 2000)
 

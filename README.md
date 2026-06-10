@@ -179,6 +179,8 @@ Upload a video segment. Requires the following headers:
 
 The request body should contain the raw segment data.
 
+`X-SL-TIMESTAMP` must fall within an accepted window relative to the server clock: a timestamp in the past (on a non-empty stream) or more than two hours in the future is rejected with `422 Unprocessable Entity`. The upper bound rejects implausible timestamps, which in practice come from a transcoder emitting the wrong time unit (e.g. microseconds for milliseconds).
+
 ### `POST /api/v1/stream/{streamID}/viewer_token`
 
 Mint a short-lived, stateless viewer token for stream playback. Requires the push bearer token (`Authorization: Bearer <SL_STREAM_<id>_TOKEN>`). Requires that `SL_STREAM_<id>_VIEWER_TOKEN_KEY` is configured for the stream; otherwise the endpoint returns `409 Conflict`.

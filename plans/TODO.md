@@ -58,6 +58,28 @@ disconnect. All tasks **complete**.
       client-gone path writes nothing. `go fmt/vet/test` green, `-race`
       clean; `gosec` unchanged (the two pre-existing G705 taint findings on
       `stream.go`/`api.go` are untouched).
+## Unbounded future timestamp: renderer busy-loop (CPU DoS)
+
+Close the unbounded `X-SL-TIMESTAMP` upper bound that could wedge the
+playlist renderer in a 100%-CPU busy loop. A timestamp ~292–584 years out
+made `time.Duration(sleepMs) * time.Millisecond` overflow int64 nanoseconds
+to a negative value, so `timer.Reset` fired immediately and re-rendered in a
+tight loop (re-acquiring the stream RLock each pass); the future segment
+never became "backward," so eviction never removed it. A transcoder unit bug
+(seconds/µs/ns vs ms) is the likely source. All tasks **complete**.
+
+- [x] `CommitSlot` rejects timestamps more than `stream.MaxFutureTimestampMs`
+      (2h = look-ahead ceiling + 1h slack) ahead of the stream clock with the
+      new `ErrTimestampTooFarInFuture` sentinel — no first-segment exception.
+      The push handler maps it to `422 Unprocessable Entity`, mirroring
+      `ErrTimestampInPast`. Tests: `TestRejectFarFutureTimestamp{,UnitBug}`,
+      `TestAllowTimestampAtFutureHorizon`, `TestPostSegment_TimestampTooFarInFuture`.
+- [x] Defense-in-depth: the renderer's sleep computation is clamped via
+      `sleepForMs` at `maxRenderSleep` (24h) so the ms→ns multiply can never
+      overflow regardless of how a timestamp reached the buffer. Tests:
+      `TestSleepForMs_{ClampsOverflowingDelay,PassesThroughNormalDelay,Boundary}`.
+- [x] README documents the accepted `X-SL-TIMESTAMP` window and the 422
+      rejection. Pre-commit `go fmt / vet / test` green; `gosec` unchanged.
 
 ## IPv6 SL_BIND_ADDR can't boot the server
 

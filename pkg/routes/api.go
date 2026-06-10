@@ -577,6 +577,11 @@ func API(logger *slog.Logger, env config.Env, store *stream.Store, requestLogger
 					w.WriteHeader(http.StatusUnprocessableEntity)
 					return
 				}
+				if errors.Is(err, stream.ErrTimestampTooFarInFuture) {
+					logger.Warn("segment timestamp too far in the future", "streamID", streamID, "index", index, "timestamp", timestampNum)
+					w.WriteHeader(http.StatusUnprocessableEntity)
+					return
+				}
 				if errors.Is(err, stream.ErrDuplicateIndex) {
 					logger.Warn("duplicate segment index", "streamID", streamID, "index", index)
 					w.WriteHeader(http.StatusConflict)
