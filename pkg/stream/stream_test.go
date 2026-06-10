@@ -625,6 +625,50 @@ func TestRejectPastTimestampDoesNotIncrementCount(t *testing.T) {
 	assert.Equal(t, int64(1), s.TotalSegmentCount(), "count after rejection")
 }
 
+// --- Far-future-timestamp rejection tests ---
+
+func TestRejectFarFutureTimestamp(t *testing.T) {
+	fixedTime := time.Date(2025, 6, 1, 12, 0, 0, 0, time.UTC)
+	clk := clock.NewMock(fixedTime)
+	nowMs := fixedTime.UnixMilli()
+
+	s := newTestStream(t, clk)
+
+	// A timestamp just past the future horizon is rejected even as the first
+	// segment on an empty stream — there is no first-segment exception here.
+	err := commitSlot(t, s, 0, []byte{0x01}, nowMs+MaxFutureTimestampMs+1, 1000)
+	assert.ErrorIs(t, err, ErrTimestampTooFarInFuture)
+	assert.Equal(t, int64(0), s.TotalSegmentCount(), "rejected segment must not be counted")
+}
+
+func TestRejectFarFutureTimestampUnitBug(t *testing.T) {
+	// A transcoder emitting microseconds where milliseconds are expected pushes
+	// timestamps ~1000x too large (here ~57000 AD); ingest must reject them.
+	fixedTime := time.Date(2025, 6, 1, 12, 0, 0, 0, time.UTC)
+	clk := clock.NewMock(fixedTime)
+	nowMs := fixedTime.UnixMilli()
+
+	s := newTestStream(t, clk)
+
+	microsAsMillis := nowMs * 1000
+	err := commitSlot(t, s, 0, []byte{0x01}, microsAsMillis, 1000)
+	assert.ErrorIs(t, err, ErrTimestampTooFarInFuture)
+}
+
+func TestAllowTimestampAtFutureHorizon(t *testing.T) {
+	fixedTime := time.Date(2025, 6, 1, 12, 0, 0, 0, time.UTC)
+	clk := clock.NewMock(fixedTime)
+	nowMs := fixedTime.UnixMilli()
+
+	s := newTestStream(t, clk)
+
+	// Exactly at the horizon is accepted (the bound is inclusive); one
+	// millisecond past it is rejected.
+	require.NoError(t, commitSlot(t, s, 0, []byte{0x01}, nowMs+MaxFutureTimestampMs, 1000))
+	err := commitSlot(t, s, 1, []byte{0x02}, nowMs+MaxFutureTimestampMs+1, 1000)
+	assert.ErrorIs(t, err, ErrTimestampTooFarInFuture)
+}
+
 func TestReadSegmentNotFound(t *testing.T) {
 	clk := clock.NewMock(time.UnixMilli(0))
 	s := newTestStream(t, clk)

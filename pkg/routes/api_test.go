@@ -605,6 +605,21 @@ func TestPostSegment_TimestampInPast(t *testing.T) {
 	assert.Equal(t, http.StatusUnprocessableEntity, rec.Code)
 }
 
+func TestPostSegment_TimestampTooFarInFuture(t *testing.T) {
+	clk := clock.NewMock(time.UnixMilli(0))
+	router, store, _, _ := testAPIRouterWithToken(t, clk)
+
+	hdrs := initHeaders()
+	postInit(router, "1", "test-token", hdrs, []byte("init-data"))
+	t.Cleanup(func() { store.Delete("1") })
+
+	// A timestamp just past the accepted future horizon must be rejected at
+	// ingest with 422.
+	tooFar := strconv.FormatInt(stream.MaxFutureTimestampMs+1, 10)
+	rec := postSegment(router, "1", "test-token", "0", tooFar, "2000", []byte("data"))
+	assert.Equal(t, http.StatusUnprocessableEntity, rec.Code)
+}
+
 func TestPostSegment_OversizedBody(t *testing.T) {
 	clk := clock.NewMock(time.UnixMilli(0))
 	router, store, _, _ := testAPIRouterWithToken(t, clk)

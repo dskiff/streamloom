@@ -11,6 +11,25 @@ import (
 // Prevents busy-looping when many segments have past timestamps.
 const minRenderInterval = 50 * time.Millisecond
 
+// maxRenderSleep caps a single renderer sleep. The wait is computed in
+// milliseconds and converted to a time.Duration (int64 nanoseconds); a large
+// enough millisecond count overflows that conversion and wraps negative, which
+// would fire the timer at once and spin the loop. The cap keeps the conversion
+// in range while staying far longer than any real wait between segments, so
+// legitimate sleeps are untouched — and a new commit wakes the renderer sooner
+// regardless.
+const maxRenderSleep = 24 * time.Hour
+
+// sleepForMs converts a positive millisecond delay to a Duration, clamped at
+// maxRenderSleep so the conversion cannot overflow (see maxRenderSleep). The
+// guard compares in milliseconds to stay clear of the overflow it prevents.
+func sleepForMs(sleepMs int64) time.Duration {
+	if sleepMs >= int64(maxRenderSleep/time.Millisecond) {
+		return maxRenderSleep
+	}
+	return time.Duration(sleepMs) * time.Millisecond
+}
+
 // PlaylistSnapshot is the renderer's cached output for one published window.
 // The body is stored split around the EXT-X-START line: the handler
 // synthesizes that single line per request from the current wall clock so
@@ -348,7 +367,7 @@ func (s *Stream) runPlaylistRenderer() {
 				}
 				continue
 			}
-			timer.Reset(time.Duration(sleepMs) * time.Millisecond)
+			timer.Reset(sleepForMs(sleepMs))
 			select {
 			case <-timer.C():
 			case <-s.notifyCh:

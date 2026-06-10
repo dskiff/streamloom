@@ -48,10 +48,25 @@ var ErrDuplicateIndex = errors.New("duplicate segment index")
 // ErrBufferFull is returned when the buffer has reached capacity. The caller should back off and retry.
 var ErrBufferFull = errors.New("buffer full")
 
+// MaxFutureTimestampMs is the largest amount by which a committed segment's
+// timestamp may exceed the stream clock. CommitSlot rejects anything further
+// out as implausible: a timestamp this far ahead is much more likely a
+// transcoder emitting the wrong time unit (e.g. microseconds where
+// milliseconds are expected) than real content.
+//
+// Set it above the furthest ahead the pipeline legitimately pushes segments,
+// with extra room for clock skew between the transcoder and the origin.
+const MaxFutureTimestampMs int64 = 2 * 60 * 60 * 1000 // 2 hours
+
 // ErrTimestampInPast is returned when a segment's timestamp is before the
 // current time and the stream already contains at least one segment.
 // The first segment on an empty stream is exempt from this check.
 var ErrTimestampInPast = errors.New("segment timestamp is in the past")
+
+// ErrTimestampTooFarInFuture is returned when a segment's timestamp is more
+// than MaxFutureTimestampMs beyond the current time. Unlike ErrTimestampInPast
+// there is no empty-stream exception.
+var ErrTimestampTooFarInFuture = errors.New("segment timestamp too far in the future")
 
 // ErrTimestampOrderViolation is returned when inserting a segment would
 // break the ordering invariant: segments sorted by index must also be
@@ -449,9 +464,10 @@ func (s *Stream) ReleaseSlot(buf *pool.BufferSlot) {
 // Returns ErrStaleGeneration if generation is older than the stream's current,
 // ErrDuplicateIndex if a segment with the same index already exists,
 // ErrBufferFull if the segment list is at capacity, ErrTimestampInPast if
-// the timestamp is before the current time and the stream is non-empty, or
-// ErrTimestampOrderViolation if the timestamp would break the index/timestamp
-// ordering invariant.
+// the timestamp is before the current time and the stream is non-empty,
+// ErrTimestampTooFarInFuture if the timestamp is more than MaxFutureTimestampMs
+// ahead of now, or ErrTimestampOrderViolation if the timestamp would break the
+// index/timestamp ordering invariant.
 func (s *Stream) CommitSlot(index uint32, buf *pool.BufferSlot, timestamp int64, durationMs uint32, generation int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -463,9 +479,17 @@ func (s *Stream) CommitSlot(index uint32, buf *pool.BufferSlot, timestamp int64,
 		return ErrStaleGeneration
 	}
 
+	now := s.clock.Now().UnixMilli()
+
 	// Reject past timestamps unless the stream is empty (first segment exception).
-	if timestamp < s.clock.Now().UnixMilli() && len(s.segments) > 0 {
+	if timestamp < now && len(s.segments) > 0 {
 		return ErrTimestampInPast
+	}
+
+	// Reject timestamps implausibly far ahead of now (see MaxFutureTimestampMs).
+	// Applies even to the first segment, unlike the past-timestamp check above.
+	if timestamp > now+MaxFutureTimestampMs {
+		return ErrTimestampTooFarInFuture
 	}
 
 	if s.currentGeneration < generation {
