@@ -86,15 +86,15 @@ accepted-config-that-can't-run bug. All tasks **complete**.
 Token minting is security-sensitive (key handling, TTL/expiry arithmetic,
 capability-class binding), so it should live apart from request-routing
 glue. Both minter test files already existed
-(`playlist_minter_test.go`, `viewer_token_test.go`) but their
+(`playlist_token_minter_test.go`, `viewer_token_test.go`) but their
 implementations were buried in the 843-line `api.go`. Pure code move, no
 behavior change — exercised by the pre-existing tests. All tasks
 **complete**.
 
-- [x] `pkg/routes/playlist_minter.go`: the renderer-side
+- [x] `pkg/routes/playlist_token_minter.go`: the renderer-side
       `playlistTokenMinter` (segment-class tokens baked per-URI) plus
       `PlaylistTokenTTL` and `initTokenBucketMs`, moved verbatim out of
-      `api.go`. Covered by the existing `playlist_minter_test.go`.
+      `api.go`. Covered by the existing `playlist_token_minter_test.go`.
 - [x] `pkg/routes/viewer_token.go`: the operator-facing
       `POST /viewer_token` mint endpoint, extracted from the inline router
       closure into `viewerTokenHandler(logger, env, store)` alongside its

@@ -17,7 +17,7 @@ import (
 // Token minting is security-sensitive, so it lives apart from the
 // request-routing glue in its own file (covered by viewer_token_test.go).
 // The renderer-side minter that bakes per-URI segment tokens lives in
-// playlist_minter.go.
+// playlist_token_minter.go.
 
 // MaxViewerTokenRequestBytes is the hard upper bound on a viewer-token mint
 // request body. The body is a tiny JSON object; 1 KiB is generous.

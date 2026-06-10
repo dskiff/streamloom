@@ -11,7 +11,7 @@ import (
 // short-lived segment-class viewer tokens into the init/segment URIs emitted
 // by the media-playlist renderer. Token minting is security-sensitive, so it
 // lives apart from the request-routing glue in its own file (and is covered
-// by playlist_minter_test.go). The operator-facing mint endpoint lives in
+// by playlist_token_minter_test.go). The operator-facing mint endpoint lives in
 // viewer_token.go.
 
 // PlaylistTokenTTL is the lifetime applied to tokens the renderer bakes
