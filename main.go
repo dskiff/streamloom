@@ -3,11 +3,12 @@ package main
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -116,11 +117,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	streamAddr := fmt.Sprintf("%s:%d", addr, env.STREAM_PORT)
+	streamAddr := listenAddr(addr, env.STREAM_PORT)
 	streamRouter := routes.Stream(logger, env, store, requestLogger, tracker)
 	runServerThread(ctx, &serverWg, streamAddr, streamRouter)
 
-	apiAddr := fmt.Sprintf("%s:%d", addr, env.API_PORT)
+	apiAddr := listenAddr(addr, env.API_PORT)
 	apiRouter := routes.API(logger, env, store, requestLogger, tracker)
 	runServerThread(ctx, &serverWg, apiAddr, apiRouter)
 
@@ -134,6 +135,16 @@ func main() {
 	}()
 
 	serverWg.Wait()
+}
+
+// listenAddr joins a host and port into an address suitable for
+// http.Server.Addr / net.Listen. net.JoinHostPort (not fmt.Sprintf) is
+// required so IPv6 hosts are bracketed: ("::1", 8080) -> "[::1]:8080"
+// rather than the invalid "::1:8080" that net.Listen rejects with "too
+// many colons in address". An empty host yields ":<port>", binding all
+// interfaces.
+func listenAddr(host string, port int) string {
+	return net.JoinHostPort(host, strconv.Itoa(port))
 }
 
 func runServerThread(ctx context.Context, wg *sync.WaitGroup, addr string, handler http.Handler) {
