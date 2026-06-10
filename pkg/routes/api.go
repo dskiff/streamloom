@@ -54,25 +54,11 @@ type errMalformedHeader struct{ detail string }
 
 func (e *errMalformedHeader) Error() string { return e.detail }
 
-// errMetadataConflict indicates a metadata header's value differs from
-// the existing stream metadata.
-type errMetadataConflict struct{ detail string }
-
-func (e *errMetadataConflict) Error() string { return e.detail }
-
-// parseMetadataHeaders parses and validates stream metadata from request
-// headers. If existing is nil (first init), all metadata headers are required.
-// If existing is non-nil (subsequent init), headers are optional but any
-// present header must be valid and match the existing value.
-//
-// Returns *errMalformedHeader for missing or unparseable headers and
-// *errMetadataConflict for value mismatches against existing metadata.
-func parseMetadataHeaders(r *http.Request, existing *stream.Metadata) (stream.Metadata, error) {
-	required := existing == nil
+// parseMetadataHeaders parses and validates the required stream metadata
+// headers from an init request. Every metadata header is required; a missing
+// or unparseable header yields *errMalformedHeader.
+func parseMetadataHeaders(r *http.Request) (stream.Metadata, error) {
 	var meta stream.Metadata
-	if existing != nil {
-		meta = *existing
-	}
 
 	// Bandwidth
 	if v := r.Header.Get("X-SL-BANDWIDTH"); v != "" {
@@ -80,11 +66,8 @@ func parseMetadataHeaders(r *http.Request, existing *stream.Metadata) (stream.Me
 		if err != nil || n <= 0 {
 			return meta, &errMalformedHeader{fmt.Sprintf("bandwidth: invalid value %q", v)}
 		}
-		if existing != nil && n != existing.Bandwidth {
-			return meta, &errMetadataConflict{fmt.Sprintf("bandwidth: header=%d existing=%d", n, existing.Bandwidth)}
-		}
 		meta.Bandwidth = n
-	} else if required {
+	} else {
 		return meta, &errMalformedHeader{"missing X-SL-BANDWIDTH header"}
 	}
 
@@ -93,11 +76,8 @@ func parseMetadataHeaders(r *http.Request, existing *stream.Metadata) (stream.Me
 		if err := stream.ValidateCodecs(v); err != nil {
 			return meta, &errMalformedHeader{fmt.Sprintf("codecs: %s", err)}
 		}
-		if existing != nil && v != existing.Codecs {
-			return meta, &errMetadataConflict{fmt.Sprintf("codecs: header=%q existing=%q", v, existing.Codecs)}
-		}
 		meta.Codecs = v
-	} else if required {
+	} else {
 		return meta, &errMalformedHeader{"missing X-SL-CODECS header"}
 	}
 
@@ -107,12 +87,9 @@ func parseMetadataHeaders(r *http.Request, existing *stream.Metadata) (stream.Me
 		if !ok {
 			return meta, &errMalformedHeader{fmt.Sprintf("resolution: invalid value %q", v)}
 		}
-		if existing != nil && (w != existing.Width || h != existing.Height) {
-			return meta, &errMetadataConflict{fmt.Sprintf("resolution: header=%dx%d existing=%dx%d", w, h, existing.Width, existing.Height)}
-		}
 		meta.Width = w
 		meta.Height = h
-	} else if required {
+	} else {
 		return meta, &errMalformedHeader{"missing X-SL-RESOLUTION header"}
 	}
 
@@ -122,11 +99,8 @@ func parseMetadataHeaders(r *http.Request, existing *stream.Metadata) (stream.Me
 		if err != nil || math.IsNaN(f) || math.IsInf(f, 0) || f <= 0 {
 			return meta, &errMalformedHeader{fmt.Sprintf("framerate: invalid value %q", v)}
 		}
-		if existing != nil && f != existing.FrameRate {
-			return meta, &errMetadataConflict{fmt.Sprintf("framerate: header=%g existing=%g", f, existing.FrameRate)}
-		}
 		meta.FrameRate = f
-	} else if required {
+	} else {
 		return meta, &errMalformedHeader{"missing X-SL-FRAMERATE header"}
 	}
 
@@ -136,11 +110,8 @@ func parseMetadataHeaders(r *http.Request, existing *stream.Metadata) (stream.Me
 		if err != nil || n <= 0 {
 			return meta, &errMalformedHeader{fmt.Sprintf("target-duration: invalid value %q", v)}
 		}
-		if existing != nil && n != existing.TargetDurationSecs {
-			return meta, &errMetadataConflict{fmt.Sprintf("target-duration: header=%d existing=%d", n, existing.TargetDurationSecs)}
-		}
 		meta.TargetDurationSecs = n
-	} else if required {
+	} else {
 		return meta, &errMalformedHeader{"missing X-SL-TARGET-DURATION header"}
 	}
 
@@ -150,11 +121,8 @@ func parseMetadataHeaders(r *http.Request, existing *stream.Metadata) (stream.Me
 		if err != nil || n <= 0 {
 			return meta, &errMalformedHeader{fmt.Sprintf("segment-bytes: invalid value %q", v)}
 		}
-		if existing != nil && n != existing.SegmentByteCount {
-			return meta, &errMetadataConflict{fmt.Sprintf("segment-bytes: header=%d existing=%d", n, existing.SegmentByteCount)}
-		}
 		meta.SegmentByteCount = n
-	} else if required {
+	} else {
 		return meta, &errMalformedHeader{"missing X-SL-SEGMENT-BYTES header"}
 	}
 
@@ -260,7 +228,7 @@ func API(logger *slog.Logger, env config.Env, store *stream.Store, requestLogger
 			}
 
 			// Parse required metadata and capacity headers.
-			meta, err := parseMetadataHeaders(r, nil)
+			meta, err := parseMetadataHeaders(r)
 			if err != nil {
 				logger.Warn("invalid metadata header", "error", err)
 				w.WriteHeader(http.StatusBadRequest)
