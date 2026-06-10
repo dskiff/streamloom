@@ -143,7 +143,7 @@ example.com {
 
 ### `POST /api/v1/stream/{streamID}/init`
 
-Initialize (or re-initialize) a stream. The request body must contain the raw `init.mp4` data. Re-initializing an existing stream replaces its metadata, init segment, and clears all segments.
+Initialize a stream. The request body must contain the raw `init.mp4` data. Initializing a stream ID that already exists returns `409 Conflict` — there is no in-place re-initialization. To change a stream's metadata, `DELETE` it first (see below) and then `POST /init` afresh.
 
 Required headers:
 
@@ -165,7 +165,7 @@ Optional headers:
 | `X-SL-MAX-LOOKAHEAD-MS` | Integer (ms, >=0) | `6000` | How far ahead of wall clock the media playlist tail may sit. Defaults to `3 × X-SL-TARGET-DURATION × 1000`. If set, must be `0` (pin tail at wall clock; legacy behavior) or `>= X-SL-TARGET-DURATION × 1000` and at most `3600000` (1 hour). Emitted to clients as `EXT-X-SERVER-CONTROL:HOLD-BACK`. Each request also gets an `EXT-X-START:TIME-OFFSET=-<gap>,PRECISE=YES` where `<gap>` is the seconds between the playlist tail's PDT and the request's wall clock (floored at `3 × X-SL-TARGET-DURATION` for spec compliance). That places the starting segment's `EXT-X-PROGRAM-DATE-TIME` at the viewer's wall clock, so two viewers on separate devices (e.g. talking on the phone) see the same content at the same instant. The horizon also bounds segment access: segments are not served before they reach it, so clients cannot fetch ahead of the live edge. |
 | `X-SL-PLAYLIST-WINDOW-SIZE` | Integer (count, >0) | `8` | Maximum number of segments listed in the media playlist. Defaults to `12`. Must be `<= X-SL-BACKWARD-BUFFER-SIZE` so the published window stays inside the retained-backward eviction guarantee — a longer window would advertise positions older than eviction is obligated to keep. The window's wall-clock span (`X-SL-PLAYLIST-WINDOW-SIZE × X-SL-TARGET-DURATION`) must also be at most **5 minutes**, so every advertised segment rolls out of the window well before the ~10-minute viewer token baked into its URI expires (a longer span would serve `200 OK` playlists whose oldest segment URLs `401` on fetch). streamloom does not serve very large playlists by design. |
 
-The request body should contain the raw init segment data. This endpoint must be called at least once per stream before pushing segments.
+The request body should contain the raw init segment data. This endpoint must be called once per stream before pushing segments.
 
 ### `POST /api/v1/stream/{streamID}/segment`
 
@@ -173,13 +173,29 @@ Upload a video segment. Requires the following headers:
 
 | Header | Format | Description |
 |--------|--------|-------------|
-| `X-SL-INDEX` | Integer (>0) | Segment sequence number from the transcoder |
+| `X-SL-INDEX` | Integer (>=0, uint32) | Segment sequence number from the transcoder |
 | `X-SL-TIMESTAMP` | Integer (unix milliseconds) | Start time of the segment |
 | `X-SL-DURATION` | Integer (milliseconds, >0, <= 60000) | Segment duration in milliseconds. Values above `60000` (60s) are rejected as likely unit-confusion bugs (e.g. microseconds or nanoseconds mislabeled as milliseconds); a real live segment runs a few seconds. |
 
 The request body should contain the raw segment data.
 
 `X-SL-TIMESTAMP` must fall within an accepted window relative to the server clock: a timestamp in the past (on a non-empty stream) or more than two hours in the future is rejected with `422 Unprocessable Entity`. The upper bound rejects implausible timestamps, which in practice come from a transcoder emitting the wrong time unit (e.g. microseconds for milliseconds).
+
+### `DELETE /api/v1/stream/{streamID}`
+
+Delete a stream, discarding its metadata, init segment, all buffered segments, and active-watcher tracking. Requires the push bearer token. Returns `204 No Content` on success, or `404 Not Found` if the stream does not currently exist.
+
+Because `POST /init` rejects an existing stream with `409 Conflict`, deleting is the only way to re-initialize a stream: a transcoder that needs to change a stream's metadata must `DELETE` it and then `POST /init` afresh.
+
+### `GET /api/v1/stream/{streamID}/active_watchers`
+
+Return the number of distinct active watchers for the stream as a plain-text integer (e.g. `3`). Requires the push bearer token. Watchers are counted by resolved client IP (see [Client IP resolution](#client-ip-resolution)); any fetch of a playlist, init, or segment route within the look-back window marks that IP active. The response carries `Cache-Control: no-store`.
+
+Optional query parameter:
+
+| Parameter | Format | Default | Description |
+|-----------|--------|---------|-------------|
+| `window_ms` | Integer (ms, >0) | `60000` | Look-back window. An IP counts as an active watcher if it was last seen within this many milliseconds. A present-but-invalid value (non-integer or `<= 0`) is rejected with `400 Bad Request`. |
 
 ### `POST /api/v1/stream/{streamID}/viewer_token`
 
@@ -190,12 +206,13 @@ Request body (JSON):
 | Field | Type | Description |
 |-------|------|-------------|
 | `expires_at_ms` | int64 | Token expiration as unix milliseconds. The server floors this value to the nearest minute boundary before encoding. The aligned value must be at least 5 minutes past the server's current time; requests below that floor are rejected with `400 Bad Request`. |
+| `allow_long_token` | bool | Optional (default `false`). The aligned TTL (expiry minus now) is normally capped at **7 days**; a request that exceeds the cap is rejected with `400 Bad Request` unless this field is `true`. The cap is a failsafe against operator typos and misconfigured automation that would otherwise mint share links valid for months. |
 
 Response `201 Created`:
 
 ```json
 {
-  "token": "<30-char base64url>",
+  "token": "<28-char base64url>",
   "expires_at_ms": 1700000000000
 }
 ```
@@ -206,7 +223,7 @@ The returned token must be passed as `?vt=<token>` on every stream URL (`stream.
 
 **Two-token model with route scoping.** To keep the cached media playlist per-stream (not per-viewer) and to bound the replay window of URLs scraped from a playlist body, streamloom uses two token classes. Each class's signing key is **derived** from the configured `SL_STREAM_<id>_VIEWER_TOKEN_KEY` via HMAC-SHA256 with the stream ID and class name mixed in — so a token minted for one (stream, class) pair cannot verify under any other:
 
-- The **viewer token** (playlist class, minted via `POST /viewer_token`) is what you hand to a viewer. Its lifetime is caller-specified (minimum 5 minutes). It is accepted on **all** stream routes — playlists, init, and segments.
+- The **viewer token** (playlist class, minted via `POST /viewer_token`) is what you hand to a viewer. Its lifetime is caller-specified (minimum 5 minutes; capped at 7 days unless `allow_long_token` is set). It is accepted on **all** stream routes — playlists, init, and segments.
 - A **short-lived playlist token** (segment class) is minted by the server per URI and baked directly into every `init.mp4` / `segment_*.m4s` URI inside `media.m3u8`. Each segment URI's token expires ~10 minutes past that segment's own presentation timestamp; the init URI's token is hour-bucketed (expires ~10 minutes past the end of each wall-clock hour). Because the token for a given URI is a pure function of its identity, the URI is byte-identical across playlist re-renders — required by HLS clients (RFC 8216 §6.2.2) so dedup-by-URI does not trigger redundant downloads. Segment-class tokens are accepted **only** on init/segment routes — never on playlists. HLS players simply follow the baked URIs; no client-side logic is required.
 
 The asymmetric scoping is deliberate: without it, a client holding a baked segment-class token could refetch `media.m3u8` to harvest a freshly-minted token and repeat the cycle indefinitely, making the 10-minute TTL meaningless. Playlist routes try only the playlist-derived key, so a segment-class token fails MAC there and is rejected. A cryptographically valid token cannot be "upgraded" across classes by any byte flip because the class is bound into the signing key itself, not into the token payload.

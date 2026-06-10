@@ -391,3 +391,28 @@ advance drops (the read path serves any committed index).
       `TestCommitSlot_PendingFreeNotSweptWhileReaderActive`,
       `TestAcquireSlot_SweepsPendingFreeAfterReadersDrain`,
       `TestConcurrentReadersAndGenerationDrop` (passes `-race`).
+
+## README/code sync: dead metadata-conflict path + doc drift
+
+A doc/code audit surfaced README claims that no longer matched the
+implementation, plus dead code left from an abandoned in-place re-init
+design. No behavior change — docs and dead code only. All tasks **complete**.
+
+- [x] Removed dead code in `pkg/routes/api.go`: the `errMetadataConflict`
+      type and the `existing != nil` merge/conflict branches in
+      `parseMetadataHeaders`. The function was only ever called with `nil`
+      — `/init` rejects an existing stream with `409` via
+      `stream.ErrStreamExists` (proven by
+      `TestPostInit_ExistingStreamReturns409`), so those branches were
+      unreachable. Signature simplified to `parseMetadataHeaders(r)`.
+- [x] README: corrected the `/init` re-init description (returns `409`, no
+      in-place re-init; `DELETE` then re-`POST`), the viewer-token length
+      (28 chars, not 30 — `viewer.EncodedTokenLen`), and the `X-SL-INDEX`
+      range (`>=0`, uint32 — the code accepts `0`).
+- [x] README: documented the previously-undocumented `DELETE
+      /api/v1/stream/{id}` and `GET .../active_watchers` endpoints, plus the
+      `allow_long_token` field and 7-day soft TTL cap on `/viewer_token`.
+- [x] Pre-commit: `go build / fmt / vet / test` green. `gosec` reports the
+      same 2 pre-existing G705 XSS false positives (binary `init.mp4` write
+      in `stream.go`; numeric `%d` watcher count in `api.go`) before and
+      after — this change adds none.
