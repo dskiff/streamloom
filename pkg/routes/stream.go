@@ -1,6 +1,7 @@
 package routes
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -54,9 +55,18 @@ func Stream(logger *slog.Logger, env config.Env, store *stream.Store, requestLog
 	router.Use(middleware.SetHeader("X-Content-Type-Options", "nosniff"))
 	router.Use(middleware.SetHeader("X-Frame-Options", "DENY"))
 	router.Use(middleware.SetHeader("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'"))
-	router.Use(middleware.Timeout(config.REQUEST_TIMEOUT))
 
-	router.Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
+	// requestTimeout caps a request and writes a 504 from a defer once
+	// its deadline expires. It is applied per-route below rather than as
+	// a global middleware because /stream/{streamID}/media.m3u8 long-polls
+	// for the live edge and owns its own request deadline (see
+	// mediaPlaylistHandler): the handler already answers a timed-out wait
+	// with 503 + Retry-After, consistent with the other not-ready paths.
+	// Routing media.m3u8 through this middleware too would have its 504
+	// defer issue a second, conflicting WriteHeader on top of that 503.
+	requestTimeout := middleware.Timeout(config.REQUEST_TIMEOUT)
+
+	router.With(requestTimeout).Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
 
@@ -78,8 +88,11 @@ func Stream(logger *slog.Logger, env config.Env, store *stream.Store, requestLog
 			r.Use(mw.ViewerTokenAuth(store.Clock(), env.STREAM_VIEWER_TOKEN_KEYS, logger, viewer.TypePlaylist))
 			r.Use(mw.RecordWatcher(tracker, streamExists))
 
+			// media.m3u8 long-polls and owns its own request deadline, so
+			// it deliberately omits requestTimeout (see the requestTimeout
+			// note above). stream.m3u8 returns promptly and keeps it.
 			r.Get("/media.m3u8", mediaPlaylistHandler(logger, store))
-			r.Get("/stream.m3u8", masterPlaylistHandler(logger, store))
+			r.With(requestTimeout).Get("/stream.m3u8", masterPlaylistHandler(logger, store))
 		})
 
 		// Init and segment routes accept both TypeSegment (short-lived,
@@ -87,6 +100,7 @@ func Stream(logger *slog.Logger, env config.Env, store *stream.Store, requestLog
 		// TypePlaylist (direct operator grant). TypeSegment is listed
 		// first so the hot path verifies with a single HMAC.
 		r.Group(func(r chi.Router) {
+			r.Use(requestTimeout)
 			r.Use(mw.ViewerTokenAuth(store.Clock(), env.STREAM_VIEWER_TOKEN_KEYS, logger, viewer.TypeSegment, viewer.TypePlaylist))
 			r.Use(mw.RecordWatcher(tracker, streamExists))
 
@@ -186,13 +200,37 @@ func mediaPlaylistHandler(logger *slog.Logger, store *stream.Store) http.Handler
 		}
 
 		// Block until a valid playlist is available, the stream is
-		// deleted, or the request is cancelled.
+		// deleted, or we stop waiting. We bound the wait here (rather than
+		// leaning on the router's middleware.Timeout) so this handler is
+		// the sole writer of the response — see the requestTimeout note in
+		// Stream.
+		ctx, cancel := context.WithTimeout(r.Context(), config.REQUEST_TIMEOUT)
+		defer cancel()
+
 		select {
 		case <-s.HasPlaylist():
 		case <-s.Done():
 			writeStreamUnavailable(w)
 			return
-		case <-r.Context().Done():
+		case <-ctx.Done():
+			switch err := ctx.Err(); {
+			case errors.Is(err, context.Canceled):
+				// The client went away mid-wait; there is nobody left to
+				// answer, so write nothing.
+				return
+			case errors.Is(err, context.DeadlineExceeded):
+				// Pre-live wait timed out: the stream is configured but
+				// not yet live. Fall through to the 503 + Retry-After
+				// below, like the other not-ready paths, so the player
+				// keeps polling.
+			default:
+				// The context contract guarantees Err() is one of the two
+				// cases above once Done() is closed. Don't trust that
+				// blindly: surface anything else instead of dropping it,
+				// then still fail closed with the retryable 503 below.
+				logger.Error("unexpected context error awaiting playlist",
+					"streamID", streamID, "error", err)
+			}
 			writeStreamUnavailable(w)
 			return
 		}
