@@ -81,6 +81,34 @@ accepted-config-that-can't-run bug. All tasks **complete**.
       green; `gosec` clean for the change (the two pre-existing G705 taint
       findings on `stream.go`/`api.go` are unchanged by this work).
 
+## Isolate token minting into dedicated files
+
+Token minting is security-sensitive (key handling, TTL/expiry arithmetic,
+capability-class binding), so it should live apart from request-routing
+glue. Both minter test files already existed
+(`playlist_token_minter_test.go`, `viewer_token_test.go`) but their
+implementations were buried in the 843-line `api.go`. Pure code move, no
+behavior change — exercised by the pre-existing tests. All tasks
+**complete**.
+
+- [x] `pkg/routes/playlist_token_minter.go`: the renderer-side
+      `playlistTokenMinter` (segment-class tokens baked per-URI) plus
+      `PlaylistTokenTTL` and `initTokenBucketMs`, moved verbatim out of
+      `api.go`. Covered by the existing `playlist_token_minter_test.go`.
+- [x] `pkg/routes/viewer_token.go`: the operator-facing
+      `POST /viewer_token` mint endpoint, extracted from the inline router
+      closure into `viewerTokenHandler(logger, env, store)` alongside its
+      `MaxViewerTokenRequestBytes` / `MinViewerTokenTTLMs` /
+      `MaxViewerTokenDefaultTTLMs` / `viewerTokenMsPerMinute` constants.
+      `api.go` now wires `r.Post("/viewer_token", viewerTokenHandler(...))`.
+      Covered by the existing `viewer_token_test.go`.
+- [x] `api.go` drops the now-unused `encoding/json` and `viewer` imports
+      and shrinks 843 → 599 lines. Pre-commit: `go fmt / fix / vet`,
+      `go test ./...` (incl. `-race` on `pkg/routes`) green; `gosec`
+      reports only the two pre-existing G705 taint findings
+      (`stream.go`, `api.go` active-watchers writer), unchanged by this
+      move.
+
 ## Active-watcher map: memory-DoS hardening
 
 Close the unbounded / spoofable active-watcher map (memory DoS). All tasks
