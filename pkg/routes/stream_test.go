@@ -2,6 +2,7 @@ package routes
 
 import (
 	"context"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -13,6 +14,7 @@ import (
 	"github.com/dskiff/streamloom/pkg/clock"
 	"github.com/dskiff/streamloom/pkg/config"
 	"github.com/dskiff/streamloom/pkg/stream"
+	"github.com/go-chi/chi/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -567,8 +569,8 @@ func TestMediaPlaylist_PreLiveEdgeReturns503(t *testing.T) {
 	clk := clock.NewMock(time.UnixMilli(0))
 	router, store, _ := testStreamRouter(t, clk)
 	initStream(t, store, "1")
-	// No commits — handler will block on HasPlaylist, then the
-	// request context cancellation surfaces as 503.
+	// No commits — the handler blocks on the wait until the request's
+	// deadline elapses, which it answers with 503 + Retry-After.
 	for _, path := range []string{"/stream/1/media.m3u8", "/stream/1/media.m3u8?to=6.000"} {
 		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 		req := httptest.NewRequest(http.MethodGet, path, nil).WithContext(ctx)
@@ -674,12 +676,12 @@ func TestStreamServer_Healthz(t *testing.T) {
 
 // --- Context cancellation tests ---
 
-func TestMediaPlaylist_Returns503OnContextCancellation(t *testing.T) {
+func TestMediaPlaylist_ClientCancellationWritesNothing(t *testing.T) {
 	clk := clock.NewMock(time.UnixMilli(0))
 	router, store, _ := testStreamRouter(t, clk)
 	initStream(t, store, "1")
 
-	// Do not commit any segments so the handler blocks on HasPlaylist.
+	// Do not commit any segments so the handler blocks on the wait.
 	// Create a request with a context we can cancel.
 	ctx, cancel := context.WithCancel(context.Background())
 	req := httptest.NewRequest(http.MethodGet, "/stream/1/media.m3u8", nil).WithContext(ctx)
@@ -691,12 +693,88 @@ func TestMediaPlaylist_Returns503OnContextCancellation(t *testing.T) {
 		router.ServeHTTP(rec, req)
 	}()
 
-	// Cancel the context to simulate a timeout.
+	// Cancel the context to simulate the client disconnecting mid-wait.
 	cancel()
 	<-done
 
-	assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
-	assert.Equal(t, "2", rec.Header().Get("Retry-After"))
+	// The client is gone, so the handler writes nothing: the recorder keeps
+	// its default code and an empty body (a timed-out wait, by contrast,
+	// returns 503 — see TestMediaPlaylist_PreLiveEdgeReturns503).
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Empty(t, rec.Body.String())
+	assert.Empty(t, rec.Header().Get("Retry-After"))
+}
+
+// writeHeaderProbe is a minimal http.ResponseWriter that records every
+// WriteHeader call (and the implicit one a bare Write would trigger), so a
+// test can assert a handler writes the status line exactly once — or not
+// at all.
+type writeHeaderProbe struct {
+	hdr     http.Header
+	codes   []int
+	bodyLen int
+}
+
+func (p *writeHeaderProbe) Header() http.Header {
+	if p.hdr == nil {
+		p.hdr = http.Header{}
+	}
+	return p.hdr
+}
+
+func (p *writeHeaderProbe) WriteHeader(code int) { p.codes = append(p.codes, code) }
+
+func (p *writeHeaderProbe) Write(b []byte) (int, error) {
+	if len(p.codes) == 0 {
+		p.codes = append(p.codes, http.StatusOK)
+	}
+	p.bodyLen += len(b)
+	return len(b), nil
+}
+
+// TestMediaPlaylist_WaitOutcome_SoleWriter pins mediaPlaylistHandler as the
+// only writer of the response when the pre-live wait ends, and that it
+// answers the two context outcomes differently:
+//
+//   - deadline exceeded   → exactly one WriteHeader(503) + Retry-After, so
+//     a polling player keeps retrying;
+//   - client cancellation → nothing written, because the client is gone.
+//
+// It drives a bare router holding only the handler — deliberately without
+// the request-logging middleware, whose chi WrapResponseWriter would
+// otherwise collapse a repeat WriteHeader and hide a double write — so the
+// probe observes the handler's writes verbatim.
+func TestMediaPlaylist_WaitOutcome_SoleWriter(t *testing.T) {
+	clk := clock.NewMock(time.UnixMilli(0))
+	store := stream.NewStore(clk)
+	initStream(t, store, "1") // configured, no segments → handler blocks on the wait
+
+	router := chi.NewRouter()
+	router.Get("/stream/{streamID}/media.m3u8", mediaPlaylistHandler(slog.Default(), store))
+
+	t.Run("deadline exceeded answers 503 exactly once", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+		defer cancel()
+		req := httptest.NewRequest(http.MethodGet, "/stream/1/media.m3u8", nil).WithContext(ctx)
+		probe := &writeHeaderProbe{}
+		router.ServeHTTP(probe, req)
+
+		assert.Equal(t, []int{http.StatusServiceUnavailable}, probe.codes)
+		assert.Equal(t, "2", probe.Header().Get("Retry-After"))
+		assert.Zero(t, probe.bodyLen)
+	})
+
+	t.Run("client cancellation writes nothing", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel() // client already gone before the handler reaches the wait
+		req := httptest.NewRequest(http.MethodGet, "/stream/1/media.m3u8", nil).WithContext(ctx)
+		probe := &writeHeaderProbe{}
+		router.ServeHTTP(probe, req)
+
+		assert.Empty(t, probe.codes, "no response should be written when the client is gone")
+		assert.Zero(t, probe.bodyLen)
+		assert.Empty(t, probe.Header().Get("Retry-After"))
+	})
 }
 
 // --- Routing tests ---

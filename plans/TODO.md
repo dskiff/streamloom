@@ -4,6 +4,39 @@ Task list for in-flight streamloom work. Completed tasks are kept briefly
 for context, then pruned once a successor task exists or the work is well
 past.
 
+## media.m3u8 long-poll: single, unambiguous timeout response
+
+`mediaPlaylistHandler` blocks pre-live until a playlist renders, the
+stream is deleted, or the request ends. The router applied chi's
+`middleware.Timeout` globally, so when the deadline expired BOTH the
+handler (503 + Retry-After on `r.Context().Done()`) and the middleware's
+`defer` (504) called `WriteHeader` — two competing intents. The second
+write happens to be swallowed today by chi's `WrapResponseWriter` (added
+by `requestLogMiddleware`, which sits ahead of `Timeout` in the chain), so
+no superfluous-WriteHeader line actually surfaces and the client gets the
+503 — but the redundant 504 is dead code that depends on that middleware
+ordering, and the handler didn't distinguish a deadline from a client
+disconnect. All tasks **complete**.
+
+- [x] `Stream`: apply `middleware.Timeout` per-route instead of globally,
+      carving out `/stream/{streamID}/media.m3u8`. The other routes
+      (`/healthz`, `stream.m3u8`, `init.mp4`, `segment_*.m4s`) keep it via
+      `r.With`/`r.Use`; only the long-poll opts out.
+- [x] `mediaPlaylistHandler`: bound the wait with a handler-owned
+      `context.WithTimeout(r.Context(), config.REQUEST_TIMEOUT)`. On
+      `DeadlineExceeded` write the same 503 + Retry-After as the other
+      not-ready paths; on `context.Canceled` (client gone) write nothing.
+      Now the sole writer of the response — no 504 contention.
+- [x] Tests: `TestMediaPlaylist_WaitOutcome_SoleWriter` (deadline →
+      exactly one `WriteHeader(503)`; cancellation → no write, via a
+      `writeHeaderProbe` on a bare router that omits the log middleware so
+      a double write can't hide); `TestMediaPlaylist_PreLiveEdgeReturns503`
+      unchanged (client still sees 503); renamed
+      `TestMediaPlaylist_ClientCancellationWritesNothing` asserts the
+      client-gone path writes nothing. `go fmt/vet/test` green, `-race`
+      clean; `gosec` unchanged (the two pre-existing G705 taint findings on
+      `stream.go`/`api.go` are untouched).
+
 ## IPv6 SL_BIND_ADDR can't boot the server
 
 The config layer validates and accepts IPv6 bind addresses
