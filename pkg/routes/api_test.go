@@ -371,6 +371,49 @@ func TestPostInit_PlaylistWindowSizeDefaultExceedsBackwardBufferRejected(t *test
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
 }
 
+func TestPostInit_PlaylistWindowSpanTooLongRejected(t *testing.T) {
+	// Window 60 at a 10s target spans 600s — past the 5-minute cap — yet fits
+	// inside the backward buffer (70), so the span bound rejects it rather
+	// than the backward-buffer bound.
+	router, _, _, _ := testAPIRouterWithToken(t, clock.Real{})
+
+	hdrs := initHeaders()
+	hdrs["X-SL-TARGET-DURATION"] = "10"
+	hdrs["X-SL-SEGMENT-CAP"] = "80"
+	hdrs["X-SL-BACKWARD-BUFFER-SIZE"] = "70"
+	hdrs["X-SL-PLAYLIST-WINDOW-SIZE"] = "60"
+	rec := postInit(router, "1", "test-token", hdrs, []byte("init-data"))
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+func TestPostInit_PlaylistWindowSpanAtLimitAccepted(t *testing.T) {
+	// Window 30 at a 10s target spans exactly 300s — right at the cap — and
+	// must be accepted: the bound rejects only spans strictly above the cap.
+	router, store, _, _ := testAPIRouterWithToken(t, clock.Real{})
+	t.Cleanup(func() { store.Delete("1") })
+
+	hdrs := initHeaders()
+	hdrs["X-SL-TARGET-DURATION"] = "10"
+	hdrs["X-SL-SEGMENT-CAP"] = "80"
+	hdrs["X-SL-BACKWARD-BUFFER-SIZE"] = "70"
+	hdrs["X-SL-PLAYLIST-WINDOW-SIZE"] = "30"
+	rec := postInit(router, "1", "test-token", hdrs, []byte("init-data"))
+	require.Equal(t, http.StatusCreated, rec.Code)
+
+	s := store.Get("1")
+	require.NotNil(t, s)
+	assert.Equal(t, 30, s.PlaylistWindowSize())
+}
+
+// TestPlaylistWindowSpanBelowTokenTTL guards the ordering these two constants
+// must keep: MaxPlaylistWindowSpan below PlaylistTokenTTL. They live in
+// separate packages and can't reference each other, so without this pin a
+// change to either could silently erode the margin between them.
+func TestPlaylistWindowSpanBelowTokenTTL(t *testing.T) {
+	assert.Less(t, stream.MaxPlaylistWindowSpan, PlaylistTokenTTL,
+		"playlist window-span cap must stay below the baked segment-token TTL")
+}
+
 func TestPostInit_ExceedsMaxBufferBytes(t *testing.T) {
 	// With STREAM_MAX_BUFFER_BYTES=1024 and (segmentCap + workingSpace) * segmentBytes
 	// far exceeding that, the request should be rejected.

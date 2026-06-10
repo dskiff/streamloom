@@ -279,6 +279,41 @@ PDT close to wall time.
       `TestInitStoresPlaylistWindowSize`. README updated with the
       header and the `X-SL-BACKWARD-BUFFER-SIZE` interaction.
 
+## Cap playlist window span to keep baked tokens valid
+
+Large playlist windows advertised segments whose baked `?vt=` segment-class
+tokens had already expired. A segment's token expires at
+`seg.Timestamp + PlaylistTokenTTL` (~10m, minute-truncated), but a segment
+stays advertised for roughly `windowSize × targetDuration − lookahead` after
+its timestamp. Once that span approached the TTL (e.g. window 60 at a 10s
+target → 600s, or 274 at 2s → 548s — both previously passed init validation,
+whose only window bound was `windowSize <= backwardBufferSize`), the older
+part of every freshly served playlist `401`'d on fetch for viewer-token
+streams while the playlist itself still served `200`. The README's "segments
+roll out of the window (tens of seconds) long before their tokens expire"
+held only for small windows. All tasks **complete**.
+
+- [x] `stream.MaxPlaylistWindowSpan` (5m, documented to stay strictly below
+      `routes.PlaylistTokenTTL` with headroom for the token's minute
+      truncation and clock skew) plus `maxPlaylistWindowSpanSecs`. New
+      `ErrPlaylistWindowSpanTooLong`. `Store.Init` rejects when
+      `playlistWindowSize × meta.TargetDurationSecs` exceeds the cap
+      (compared via division to avoid int64 overflow on hostile inputs).
+- [x] `/init` handler surfaces the same bound for a clearer 400 with header
+      context (target-duration + cap), mirroring the existing
+      backward-buffer surface check.
+- [x] Tests: `TestInitRejectsPlaylistWindowSpanTooLong` (stream) covers the
+      two issue scenarios, one-second-over, and the exact-cap accept;
+      `TestPostInit_PlaylistWindowSpan{TooLongRejected,AtLimitAccepted}`
+      (routes) cover the HTTP surface; `TestPlaylistWindowSpanBelowTokenTTL`
+      guards the cross-package `MaxPlaylistWindowSpan < PlaylistTokenTTL`
+      coupling so a future change to either constant can't silently
+      reintroduce the bug.
+- [x] README stale-playlist edge case + `X-SL-PLAYLIST-WINDOW-SIZE` row
+      document the 5-minute span cap; `plans/viewer-tokens.md` design
+      record notes it. Pre-commit: `go fmt / vet / test` green; `gosec` run
+      where available.
+
 ## Stale-generation drop: no panic with active readers
 
 Security-review fix: `dropStaleGenerationLocked` panicked when a dropped

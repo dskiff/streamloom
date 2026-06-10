@@ -261,7 +261,13 @@ the aligned value in the response so callers see exactly what was encoded.
    don't churn across renders (HLS URI-stability requirement). If a
    stream stops producing segments for longer than ~10 minutes, scraped
    segment URLs for segments already past their TTL will 401 — same
-   bound as the prior design, just applied per-segment.
+   bound as the prior design, just applied per-segment. To keep this
+   confined to the stream-stopped case, the playlist window's wall-clock
+   span (`windowSize × targetDuration`) is capped at
+   `stream.MaxPlaylistWindowSpan` (5m, < `PlaylistTokenTTL`) at `/init`:
+   without it, a large enough window would advertise still-live segments
+   whose per-segment tokens had already expired, 401-ing the older part
+   of every freshly served playlist.
 8. **Token rotation via playlist refetch** — without route scoping, a
    client holding any valid token could refetch `media.m3u8` to harvest a
    freshly-minted token and repeat indefinitely, making the 10-minute TTL
