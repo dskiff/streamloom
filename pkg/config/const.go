@@ -40,6 +40,13 @@ const DefaultMaxLookaheadMultiplier = 3
 // beyond any reasonable live-edge look-ahead window.
 const MaxLookaheadCeilingMs int64 = 60 * 60 * 1000
 
+// MaxSegmentDurationMs is the largest X-SL-DURATION (segment duration,
+// in milliseconds) accepted on a push. Real live segments run a few
+// seconds, so a value past a minute almost always means the pushing
+// pipeline mislabeled its units (e.g. microseconds or nanoseconds as
+// milliseconds); reject it rather than admit a grossly inflated duration.
+const MaxSegmentDurationMs = 60 * 1000
+
 // DefaultStreamPort is the default port for the public HLS stream server.
 const DefaultStreamPort = 8080
 

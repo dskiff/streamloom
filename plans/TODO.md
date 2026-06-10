@@ -4,6 +4,28 @@ Task list for in-flight streamloom work. Completed tasks are kept briefly
 for context, then pruned once a successor task exists or the work is well
 past.
 
+## X-SL-DURATION sanity bound
+
+`X-SL-DURATION` was parsed as a uint32 (up to ~49.7 days) and only
+rejected for zero. An absurd duration inflates the published tail's
+`EndMs`, so the master-baked sticky `EXT-X-START` offset
+(`FreshOffsetSecs`) can exceed `maxStickyOffsetSecs` — the media handler
+then rejects its own `?to=` value and silently drops the tag; an
+oversized `EXTINF` also dwarfs `EXT-X-TARGETDURATION` (RFC 8216). All
+tasks **complete**.
+
+- [x] Add `config.MaxSegmentDurationMs` (`60_000` ms / 60s). The value is
+      chosen so the worst-case tail-to-now gap (`MaxLookaheadCeilingMs +
+      MaxSegmentDurationMs = 3_660_000 ms`) lands exactly at
+      `maxStickyOffsetSecs`, guaranteeing the sticky offset stays in range
+      in every configuration while still catching unit confusion.
+- [x] Reject `X-SL-DURATION > MaxSegmentDurationMs` with `400` in the
+      segment handler (mirrors the `X-SL-MAX-LOOKAHEAD-MS` ceiling check).
+- [x] Tests `TestPostSegment_DurationExceedsMax` (over-cap → 400) and
+      `TestPostSegment_DurationAtMaxAccepted` (at-cap → 201). README
+      `X-SL-DURATION` row documents the bound. Pre-commit: `go fmt / fix /
+      vet / test` green; `gosec` clean for the change.
+
 ## media.m3u8 long-poll: single, unambiguous timeout response
 
 `mediaPlaylistHandler` blocks pre-live until a playlist renders, the
