@@ -9,8 +9,11 @@ import (
 )
 
 // requestLogMiddleware returns a slogchi middleware configured for request
-// logging. When requestLogger is non-nil, logs are written at Info level to
-// it; otherwise request logging is disabled.
+// logging. When requestLogger is non-nil, every request is logged to it
+// (Info for success, Warn for 4xx, Error for 5xx). When it is nil, only the
+// success path is muted: those logs go to the main logger l at
+// LOG_LEVEL_DISABLED (below its threshold, so dropped), while 4xx/5xx still
+// log to l at Warn/Error so client and server errors remain visible.
 func requestLogMiddleware(l *slog.Logger, requestLogger *slog.Logger) func(next http.Handler) http.Handler {
 	requestLogLevel := config.LOG_LEVEL_DISABLED
 	rl := l

@@ -39,7 +39,7 @@ func RecordWatcher(tracker *watcher.Tracker, streamExists func(streamID string) 
 }
 
 // extractIP parses the host portion from an address that may be "IP",
-// "IP:port", or "[IPv6]:port". After chi's RealIP middleware, RemoteAddr
+// "IP:port", or "[IPv6]:port". After TrustedRealIP resolution, RemoteAddr
 // may be a bare IP (from X-Forwarded-For) or IP:port (direct connection).
 func extractIP(addr string) string {
 	host, _, err := net.SplitHostPort(addr)

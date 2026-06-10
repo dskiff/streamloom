@@ -302,7 +302,7 @@ func TestMediaPlaylist_Returns503WhenStreamDeletedWhileWaiting(t *testing.T) {
 	s := store.Get("1")
 	require.NotNil(t, s)
 
-	// Do not commit any segments — the handler will block on HasSegments.
+	// Do not commit any segments — the handler will block on HasPlaylist.
 	// Delete the stream in a goroutine after a short delay.
 	done := make(chan struct{})
 	go func() {
