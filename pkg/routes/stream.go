@@ -213,13 +213,25 @@ func mediaPlaylistHandler(logger *slog.Logger, store *stream.Store) http.Handler
 			writeStreamUnavailable(w)
 			return
 		case <-ctx.Done():
-			// DeadlineExceeded: the stream is configured but not yet live.
-			// Answer like the other not-ready paths so the player keeps
-			// polling. A context.Canceled instead means the client went
-			// away mid-wait, so there is nobody to answer — write nothing.
-			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-				writeStreamUnavailable(w)
+			switch err := ctx.Err(); {
+			case errors.Is(err, context.Canceled):
+				// The client went away mid-wait; there is nobody left to
+				// answer, so write nothing.
+				return
+			case errors.Is(err, context.DeadlineExceeded):
+				// Pre-live wait timed out: the stream is configured but
+				// not yet live. Fall through to the 503 + Retry-After
+				// below, like the other not-ready paths, so the player
+				// keeps polling.
+			default:
+				// The context contract guarantees Err() is one of the two
+				// cases above once Done() is closed. Don't trust that
+				// blindly: surface anything else instead of dropping it,
+				// then still fail closed with the retryable 503 below.
+				logger.Error("unexpected context error awaiting playlist",
+					"streamID", streamID, "error", err)
 			}
+			writeStreamUnavailable(w)
 			return
 		}
 
