@@ -76,8 +76,8 @@ type mockTimer struct {
 func (mt *mockTimer) C() <-chan time.Time { return mt.c }
 
 // Stop prevents the timer from firing. Returns true if the timer was active
-// (i.e., had not yet fired or been stopped). As with time.Timer, the caller
-// must drain C after a false return before calling Reset.
+// (i.e., had not yet fired or been stopped). A stale value left in C by an
+// earlier fire is cleared by Reset, so the caller need not drain C first.
 func (mt *mockTimer) Stop() bool {
 	mt.mock.mu.Lock()
 	defer mt.mock.mu.Unlock()
@@ -87,7 +87,7 @@ func (mt *mockTimer) Stop() bool {
 }
 
 // Reset restarts the timer to fire after duration d from the mock clock's
-// current time. The caller must have already stopped or drained the timer.
+// current time, clearing any stale value left in C by an earlier fire.
 func (mt *mockTimer) Reset(d time.Duration) bool {
 	mt.mock.mu.Lock()
 	defer mt.mock.mu.Unlock()

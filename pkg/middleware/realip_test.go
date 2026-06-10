@@ -30,7 +30,7 @@ func TestTrustedRealIP_TrustedUsesForwarded(t *testing.T) {
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
 
-	// chi's RealIP middleware rewrites RemoteAddr from X-Forwarded-For.
+	// TrustedRealIP rewrites RemoteAddr from the trusted X-Forwarded-For entry.
 	assert.Equal(t, "203.0.113.50", gotRemoteAddr)
 }
 

@@ -7,8 +7,9 @@ import "time"
 // Timer abstracts time.Timer so that code using timers can be tested with
 // a mock clock. The semantics mirror time.Timer: C returns the channel,
 // Stop prevents firing (returning true if the timer was active), and Reset
-// restarts the timer. As with time.Timer, callers must drain C after a
-// false return from Stop before calling Reset.
+// restarts the timer. As of Go 1.23, Stop and Reset are synchronized with
+// the channel — no stale value is delivered after either call — so callers
+// need not drain C before calling Reset.
 type Timer interface {
 	C() <-chan time.Time
 	Stop() bool

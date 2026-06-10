@@ -177,7 +177,7 @@ func runServerThread(ctx context.Context, wg *sync.WaitGroup, addr string, handl
 		defer cancel()
 
 		if err := srv.Shutdown(shutdownCtx); err != nil {
-			logger.Error("server threw when shutting down:", "error", err)
+			logger.Error("server threw when shutting down", "error", err)
 		}
 
 		logger.Info("server shutdown complete", "address", addr)
