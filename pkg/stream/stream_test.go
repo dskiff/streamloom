@@ -1414,6 +1414,30 @@ func TestInitRejectsPlaylistWindowSizeAboveBackwardBuffer(t *testing.T) {
 	t.Cleanup(func() { store.Delete("1") })
 }
 
+func TestInitRejectsPlaylistWindowSpanTooLong(t *testing.T) {
+	store := NewStore(clock.Real{})
+
+	// Window 60 at a 10s target spans 600s, past the 5-minute cap. The
+	// backward buffer (99) admits the window, so the span bound rejects it
+	// rather than the backward-buffer bound.
+	err := store.Init("1", Metadata{TargetDurationSecs: 10}, []byte{0x00}, 100, testSegmentBytes, 99, 0, 60, testMaxLookaheadMs)
+	assert.ErrorIs(t, err, ErrPlaylistWindowSpanTooLong, "window 60 x 10s = 600s")
+
+	// Window 274 at a 2s target spans 548s.
+	err = store.Init("1", Metadata{TargetDurationSecs: 2}, []byte{0x00}, 300, testSegmentBytes, 280, 0, 274, testMaxLookaheadMs)
+	assert.ErrorIs(t, err, ErrPlaylistWindowSpanTooLong, "window 274 x 2s = 548s")
+
+	// One second past the cap: window 151 at 2s = 302s > 300s.
+	err = store.Init("1", Metadata{TargetDurationSecs: 2}, []byte{0x00}, 200, testSegmentBytes, 160, 0, 151, testMaxLookaheadMs)
+	assert.ErrorIs(t, err, ErrPlaylistWindowSpanTooLong, "window 151 x 2s = 302s")
+
+	// Exactly at the cap (window 150 x 2s = 300s) is allowed: the bound
+	// rejects only spans strictly above the cap.
+	err = store.Init("1", Metadata{TargetDurationSecs: 2}, []byte{0x00}, 200, testSegmentBytes, 160, 0, 150, testMaxLookaheadMs)
+	assert.NoError(t, err, "window 150 x 2s = 300s is exactly at the cap")
+	t.Cleanup(func() { store.Delete("1") })
+}
+
 func TestInitStoresPlaylistWindowSize(t *testing.T) {
 	store := NewStore(clock.Real{})
 	require.NoError(t, store.Init("1", Metadata{TargetDurationSecs: 2}, []byte{0x00},

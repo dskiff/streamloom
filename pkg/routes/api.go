@@ -585,6 +585,20 @@ func API(logger *slog.Logger, env config.Env, store *stream.Store, requestLogger
 				return
 			}
 
+			// Surface the window-span bound (enforced authoritatively in
+			// stream.Init) here for a clearer 400 with header context. Divide
+			// rather than multiply so the product can't overflow;
+			// meta.TargetDurationSecs is > 0 (validated above).
+			if int64(playlistWindowSize) > int64(stream.MaxPlaylistWindowSpan/time.Second)/int64(meta.TargetDurationSecs) {
+				logger.Warn("playlist-window-size span exceeds maximum",
+					"playlist_window_size", playlistWindowSize,
+					"target_duration_secs", meta.TargetDurationSecs,
+					"max_window_span", stream.MaxPlaylistWindowSpan.String(),
+				)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+
 			// Playlist look-ahead cap: how far ahead of wall clock the
 			// media-playlist tail may sit. Defaults to
 			// DefaultMaxLookaheadMultiplier × target-duration so PDT-sync'd

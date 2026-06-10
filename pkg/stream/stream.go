@@ -9,10 +9,24 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/dskiff/streamloom/pkg/clock"
 	"github.com/dskiff/streamloom/pkg/pool"
 )
+
+// MaxPlaylistWindowSpan caps a stream's playlist window by the wall-clock
+// span of media it advertises (playlistWindowSize × targetDuration), in
+// addition to the segment-count bound. A segment stays advertised for roughly
+// this span before it rolls off the window tail; keeping the span short keeps
+// that advertised lifetime within the validity of the short-lived token baked
+// into each segment URI. Five minutes sits well under that token's lifetime
+// and keeps playlists small.
+const MaxPlaylistWindowSpan = 5 * time.Minute
+
+// maxPlaylistWindowSpanSecs is MaxPlaylistWindowSpan in whole seconds, the
+// unit target durations are expressed in.
+const maxPlaylistWindowSpanSecs = int64(MaxPlaylistWindowSpan / time.Second)
 
 // MaxInitBytes is the maximum allowed size for an init.mp4 upload (1 MB).
 const MaxInitBytes = 1 << 20
@@ -599,6 +613,11 @@ var ErrInvalidTargetDuration = errors.New("metadata.TargetDurationSecs must be >
 // the backward-buffer eviction policy guarantees to keep.
 var ErrInvalidPlaylistWindowSize = errors.New("playlistWindowSize must be > 0 and <= backwardBufferSize")
 
+// ErrPlaylistWindowSpanTooLong is returned by Store.Init when the playlist
+// window's wall-clock span (playlistWindowSize × targetDuration) exceeds
+// MaxPlaylistWindowSpan. See that constant for the rationale.
+var ErrPlaylistWindowSpanTooLong = errors.New("playlistWindowSize * targetDurationSecs exceeds MaxPlaylistWindowSpan")
+
 // ErrInvalidBackwardBufferSize is returned when backwardBufferSize is less than 1
 // or not less than the segment capacity.
 var ErrInvalidBackwardBufferSize = errors.New("backwardBufferSize must be >= 1 and < segmentCapacity")
@@ -673,7 +692,9 @@ func WithMintToken(m PlaylistTokenMinter) InitOption {
 // it must be >= 1 and < segmentCapacity.
 // playlistWindowSize is the maximum number of segments in the media playlist;
 // must be > 0 and <= backwardBufferSize so the published window stays inside
-// the retained-backward eviction guarantee.
+// the retained-backward eviction guarantee, and its wall-clock span
+// (playlistWindowSize × meta.TargetDurationSecs) must not exceed
+// MaxPlaylistWindowSpan.
 // maxLookaheadMs is how far ahead of wall-clock the playlist tail may sit;
 // must be >= 0. A value of 0 pins the tail at wall clock (legacy behavior).
 // Optional InitOptions configure per-stream features (e.g. viewer-token minting).
@@ -694,6 +715,12 @@ func (s *Store) Init(id string, meta Metadata, initData []byte, segmentCapacity,
 	// vanish on the next commit.
 	if playlistWindowSize <= 0 || playlistWindowSize > backwardBufferSize {
 		return ErrInvalidPlaylistWindowSize
+	}
+	// Bound the window's wall-clock span (see MaxPlaylistWindowSpan). Divide
+	// rather than multiply so a large windowSize × targetDuration can't
+	// overflow int64; TargetDurationSecs is > 0 (checked above).
+	if int64(playlistWindowSize) > maxPlaylistWindowSpanSecs/int64(meta.TargetDurationSecs) {
+		return ErrPlaylistWindowSpanTooLong
 	}
 	if workingSpace < 0 || segmentCapacity > math.MaxInt-workingSpace {
 		return ErrInvalidWorkingSpace
