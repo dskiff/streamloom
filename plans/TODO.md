@@ -4,6 +4,28 @@ Task list for in-flight streamloom work. Completed tasks are kept briefly
 for context, then pruned once a successor task exists or the work is well
 past.
 
+## IPv6 SL_BIND_ADDR can't boot the server
+
+The config layer validates and accepts IPv6 bind addresses
+(`parseBindAddr` blesses `::1`, `TestParseBindAddrValidIPv6`), but
+`main.go` built listen addresses with `fmt.Sprintf("%s:%d", addr, port)`.
+For `SL_BIND_ADDR=::1` that produced `"::1:8080"`, which `net.Listen`
+rejects with "too many colons in address" → `os.Exit(1)`: an
+accepted-config-that-can't-run bug. All tasks **complete**.
+
+- [x] Add `listenAddr(host, port)` in `main.go` using
+      `net.JoinHostPort(host, strconv.Itoa(port))`, which brackets IPv6
+      hosts (`::1` → `[::1]:8080`) and leaves IPv4 / empty-host
+      (all-interfaces `:<port>`) output unchanged. Both stream- and
+      api-address call sites now use it; `fmt` import dropped.
+- [x] Tests in `main_test.go`: `TestListenAddr` (table: ipv4, ipv6
+      loopback/unspecified/full, empty host) pins the bracketing
+      deterministically; `TestListenAddr_AcceptedByNetListen` boots a real
+      ephemeral listener per blessed host (IPv6 subtest skips where the
+      sandbox lacks IPv6 loopback). Pre-commit: `go fmt / fix / vet / test`
+      green; `gosec` clean for the change (the two pre-existing G705 taint
+      findings on `stream.go`/`api.go` are unchanged by this work).
+
 ## Active-watcher map: memory-DoS hardening
 
 Close the unbounded / spoofable active-watcher map (memory DoS). All tasks
