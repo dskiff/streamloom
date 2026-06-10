@@ -741,6 +741,12 @@ func API(logger *slog.Logger, env config.Env, store *stream.Store, requestLogger
 				w.WriteHeader(http.StatusBadRequest)
 				return
 			}
+			if durationMs > config.MaxSegmentDurationMs {
+				logger.Warn("duration header above ceiling",
+					"value", durationMs, "ceiling_ms", config.MaxSegmentDurationMs)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
 
 			// Parse optional generation header (default 0).
 			var generation int64

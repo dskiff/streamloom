@@ -494,6 +494,30 @@ func TestPostSegment_ZeroDuration(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
 }
 
+func TestPostSegment_DurationExceedsMax(t *testing.T) {
+	clk := clock.NewMock(time.UnixMilli(0))
+	router, store, _, _ := testAPIRouterWithToken(t, clk)
+	hdrs := initHeaders()
+	postInit(router, "1", "test-token", hdrs, []byte("init-data"))
+	t.Cleanup(func() { store.Delete("1") })
+
+	dur := strconv.Itoa(config.MaxSegmentDurationMs + 1)
+	rec := postSegment(router, "1", "test-token", "0", "5000", dur, []byte("data"))
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+func TestPostSegment_DurationAtMaxAccepted(t *testing.T) {
+	clk := clock.NewMock(time.UnixMilli(0))
+	router, store, _, _ := testAPIRouterWithToken(t, clk)
+	hdrs := initHeaders()
+	postInit(router, "1", "test-token", hdrs, []byte("init-data"))
+	t.Cleanup(func() { store.Delete("1") })
+
+	dur := strconv.Itoa(config.MaxSegmentDurationMs)
+	rec := postSegment(router, "1", "test-token", "0", "5000", dur, []byte("data"))
+	assert.Equal(t, http.StatusCreated, rec.Code)
+}
+
 func TestPostSegment_EmptyBody(t *testing.T) {
 	clk := clock.NewMock(time.UnixMilli(0))
 	router, store, _, _ := testAPIRouterWithToken(t, clk)

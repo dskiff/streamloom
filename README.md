@@ -175,7 +175,7 @@ Upload a video segment. Requires the following headers:
 |--------|--------|-------------|
 | `X-SL-INDEX` | Integer (>0) | Segment sequence number from the transcoder |
 | `X-SL-TIMESTAMP` | Integer (unix milliseconds) | Start time of the segment |
-| `X-SL-DURATION` | Integer (milliseconds, >0) | Segment duration in milliseconds |
+| `X-SL-DURATION` | Integer (milliseconds, >0, <= 60000) | Segment duration in milliseconds. Values above `60000` (60s) are rejected as likely unit-confusion bugs (e.g. microseconds or nanoseconds mislabeled as milliseconds); a real live segment runs a few seconds. |
 
 The request body should contain the raw segment data.
 
