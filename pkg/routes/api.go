@@ -63,6 +63,43 @@ const PlaylistTokenTTL = 10 * time.Minute
 // the viewer package's private constant across the serde boundary.
 const viewerTokenMsPerMinute = 60_000
 
+// maxTokenSafePlaylistWindow returns the largest playlist window size for
+// which every segment the media playlist advertises still carries a
+// non-expired baked segment-class token, given the stream's target duration
+// and look-ahead cap (both in milliseconds). targetDurationMs must be > 0.
+// The bound is meaningful only when viewer-token auth is enabled; public
+// streams bake no tokens and are not subject to it.
+//
+// Each segment's baked token expires PlaylistTokenTTL past the segment's own
+// presentation timestamp, floored to the minute by viewer.Mint — so its
+// effective lifetime is as little as PlaylistTokenTTL −
+// (viewerTokenMsPerMinute − 1). The renderer advertises the last windowSize
+// eligible segments; the oldest of those can be as much as
+// windowSize × targetDuration − maxLookahead older than wall-clock now (the
+// newest eligible segment, the tail, sits at up to now + maxLookahead, and a
+// window of windowSize segments spans at most windowSize target durations).
+// Requiring that worst-case age to stay strictly within the effective token
+// lifetime yields the tight integer bound
+//
+//	windowSize ≤ (PlaylistTokenTTL − viewerTokenMsPerMinute + maxLookahead) / targetDuration
+//
+// Without this cap a window that merely satisfies windowSize ≤
+// backwardBufferSize (the only other bound) can advertise segments whose
+// baked token has already expired, so the older part of every freshly served
+// playlist 401s on fetch.
+//
+// The result is clamped to a minimum of 1 so the smallest legal window is
+// always permitted: a single-segment window advertises only the tail, which
+// is at most one target duration old and so always inside the token lifetime
+// for any realistic target duration.
+func maxTokenSafePlaylistWindow(targetDurationMs, maxLookaheadMs int64) int64 {
+	budgetMs := PlaylistTokenTTL.Milliseconds() - viewerTokenMsPerMinute + maxLookaheadMs
+	if maxWindow := budgetMs / targetDurationMs; maxWindow >= 1 {
+		return maxWindow
+	}
+	return 1
+}
+
 // playlistTokenMinter implements stream.PlaylistTokenMinter. It produces
 // segment-class viewer tokens that the media-playlist renderer bakes into
 // emitted URIs.
@@ -618,6 +655,34 @@ func API(logger *slog.Logger, env config.Env, store *stream.Store, requestLogger
 				maxLookaheadMs = parsed
 			}
 
+			// When viewer-token auth is enabled for this stream, the renderer
+			// bakes a short-lived segment-class token into each segment URI
+			// that expires PlaylistTokenTTL past the segment's own presentation
+			// timestamp (floored to the minute by viewer.Mint). A segment stays
+			// advertised in the playlist for up to
+			// windowSize × target-duration − look-ahead after its timestamp, so
+			// an oversized window would advertise segments whose baked token has
+			// already expired — every such fetch 401s (see the README
+			// "Stale-playlist edge case"). Cap the window so the oldest
+			// advertised segment's token is always still valid. Public streams
+			// bake no tokens and are exempt; their window is bounded only by
+			// backwardBufferSize above.
+			viewerKeys, viewerAuth := env.GetViewerKeys(streamID)
+			if viewerAuth {
+				maxWindow := maxTokenSafePlaylistWindow(targetDurationMs, maxLookaheadMs)
+				if int64(playlistWindowSize) > maxWindow {
+					logger.Warn("playlist-window-size exceeds token-safe maximum",
+						"playlist_window_size", playlistWindowSize,
+						"max_token_safe_window", maxWindow,
+						"target_duration_ms", targetDurationMs,
+						"max_lookahead_ms", maxLookaheadMs,
+						"playlist_token_ttl_ms", PlaylistTokenTTL.Milliseconds(),
+					)
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+			}
+
 			// When a viewer-token key is configured for this stream, wire a
 			// PlaylistTokenMinter the renderer will invoke per URI —
 			// InitToken once per render (hour-bucketed) and SegmentToken
@@ -630,7 +695,7 @@ func API(logger *slog.Logger, env config.Env, store *stream.Store, requestLogger
 			// (preserves public-playback parity with pre-viewer-token
 			// behavior).
 			var initOpts []stream.InitOption
-			if viewerKeys, ok := env.GetViewerKeys(streamID); ok {
+			if viewerAuth {
 				minter := makePlaylistTokenMinter(viewerKeys.Segment, logger, streamID)
 				initOpts = append(initOpts, stream.WithMintToken(minter))
 			}

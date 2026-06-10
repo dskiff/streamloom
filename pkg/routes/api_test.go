@@ -371,6 +371,105 @@ func TestPostInit_PlaylistWindowSizeDefaultExceedsBackwardBufferRejected(t *test
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
 }
 
+// largeWindowHeaders returns init headers sized for a big playlist window at a
+// 10s target duration: backward-buffer-size 60 (so the window clears the
+// windowSize <= backwardBufferSize bound) and a matching segment cap. At a 10s
+// target with the default look-ahead, the token-safe window cap is 57, so
+// callers can straddle it by setting X-SL-PLAYLIST-WINDOW-SIZE around 57.
+func largeWindowHeaders() map[string]string {
+	h := initHeaders()
+	h["X-SL-TARGET-DURATION"] = "10"
+	h["X-SL-SEGMENT-CAP"] = "64"
+	h["X-SL-BACKWARD-BUFFER-SIZE"] = "60"
+	return h
+}
+
+func TestPostInit_PlaylistWindowSizeTokenSafeCapRejected(t *testing.T) {
+	// Viewer-token auth is enabled, so the renderer bakes a ~10-minute token
+	// into each segment URI. At a 10s target with the default look-ahead the
+	// token-safe window cap is 57; a window of 60 (the task's example) clears
+	// the backward-buffer bound (60 <= 60) but advertises segments whose baked
+	// token would already be expired, so init must reject it.
+	router, _, _, _ := testAPIRouterWithViewerKey(t, clock.Real{})
+
+	hdrs := largeWindowHeaders()
+	hdrs["X-SL-PLAYLIST-WINDOW-SIZE"] = "60"
+	rec := postInit(router, "1", "test-token", hdrs, []byte("init-data"))
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+func TestPostInit_PlaylistWindowSizeTokenSafeCapBoundaryAccepted(t *testing.T) {
+	// A window exactly at the token-safe cap (57 at 10s / default look-ahead)
+	// is still backed by a non-expired token for its oldest entry, so it must
+	// be accepted even with viewer-token auth enabled.
+	router, store, _, _ := testAPIRouterWithViewerKey(t, clock.Real{})
+	t.Cleanup(func() { store.Delete("1") })
+
+	hdrs := largeWindowHeaders()
+	hdrs["X-SL-PLAYLIST-WINDOW-SIZE"] = "57"
+	rec := postInit(router, "1", "test-token", hdrs, []byte("init-data"))
+	require.Equal(t, http.StatusCreated, rec.Code)
+
+	s := store.Get("1")
+	require.NotNil(t, s)
+	assert.Equal(t, 57, s.PlaylistWindowSize())
+}
+
+func TestPostInit_PlaylistWindowSizePublicStreamNotTokenCapped(t *testing.T) {
+	// The token-safe cap is gated on viewer-token auth. A public stream (no
+	// viewer key) bakes no tokens, so a window of 60 at 10s — which a
+	// viewer-token stream would reject — is accepted, bounded only by
+	// backwardBufferSize (60 <= 60).
+	router, store, _, _ := testAPIRouterWithToken(t, clock.Real{})
+	t.Cleanup(func() { store.Delete("1") })
+
+	hdrs := largeWindowHeaders()
+	hdrs["X-SL-PLAYLIST-WINDOW-SIZE"] = "60"
+	rec := postInit(router, "1", "test-token", hdrs, []byte("init-data"))
+	require.Equal(t, http.StatusCreated, rec.Code)
+
+	s := store.Get("1")
+	require.NotNil(t, s)
+	assert.Equal(t, 60, s.PlaylistWindowSize())
+}
+
+func TestPostInit_PlaylistWindowSizeDefaultTokenSafeForViewerStream(t *testing.T) {
+	// The default window (12) at the default 2s target sits well under the
+	// token-safe cap (273), so enabling viewer-token auth must not reject a
+	// stream that does not touch the window header at all.
+	router, store, _, _ := testAPIRouterWithViewerKey(t, clock.Real{})
+	t.Cleanup(func() { store.Delete("1") })
+
+	rec := postInit(router, "1", "test-token", initHeaders(), []byte("init-data"))
+	require.Equal(t, http.StatusCreated, rec.Code)
+
+	s := store.Get("1")
+	require.NotNil(t, s)
+	assert.Equal(t, config.DefaultMediaWindowSize, s.PlaylistWindowSize())
+}
+
+func TestMaxTokenSafePlaylistWindow(t *testing.T) {
+	// PlaylistTokenTTL (10 min) minus the minute-alignment slop, plus the
+	// look-ahead, divided by the target duration. Boundaries here pin the
+	// task's worked examples: 273 at 2s and 57 at 10s.
+	cases := []struct {
+		name        string
+		targetMs    int64
+		lookaheadMs int64
+		want        int64
+	}{
+		{"2s default lookahead", 2000, 6000, 273},
+		{"10s default lookahead", 10000, 30000, 57},
+		{"legacy zero lookahead", 1000, 0, 540},
+		{"target duration above budget clamps to 1", 600000, 0, 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, maxTokenSafePlaylistWindow(tc.targetMs, tc.lookaheadMs))
+		})
+	}
+}
+
 func TestPostInit_ExceedsMaxBufferBytes(t *testing.T) {
 	// With STREAM_MAX_BUFFER_BYTES=1024 and (segmentCap + workingSpace) * segmentBytes
 	// far exceeding that, the request should be rejected.

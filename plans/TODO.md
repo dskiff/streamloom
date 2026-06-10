@@ -202,6 +202,35 @@ PDT close to wall time.
       `TestInitStoresPlaylistWindowSize`. README updated with the
       header and the `X-SL-BACKWARD-BUFFER-SIZE` interaction.
 
+## Cap playlist window against baked-token TTL
+
+A segment URI's baked segment-class token expires `PlaylistTokenTTL`
+(~10 min) past the segment's own presentation timestamp, minute-aligned
+down by `viewer.Mint`. A segment stays advertised for up to
+`windowSize × target-duration − look-ahead` after its timestamp, so once
+that exceeds the token TTL the oldest entries of every freshly-served
+playlist `401` on fetch for viewer-token streams. The only existing window
+bound was `windowSize <= backwardBufferSize`, so large windows (e.g. 60 at
+10s, 274 at 2s) passed init yet served expired tokens. The README claimed
+this was a non-issue "for live streams"; that held only for small windows.
+
+- [x] `maxTokenSafePlaylistWindow(targetDurationMs, maxLookaheadMs)` in
+      `pkg/routes/api.go` returns the tight bound
+      `(PlaylistTokenTTL − viewerTokenMsPerMinute + look-ahead) /
+      target-duration`, clamped to a minimum of 1. The `−1min` term covers
+      `Mint`'s minute-flooring of the expiry.
+- [x] `/init` enforces it **only when viewer-token auth is enabled** for the
+      stream (`env.GetViewerKeys`), returning `400` with header context.
+      Public streams bake no tokens and keep the `backwardBufferSize`-only
+      bound. The single `GetViewerKeys` lookup is reused for the minter
+      wiring.
+- [x] Tests: `TestPostInit_PlaylistWindowSize{TokenSafeCapRejected,
+      TokenSafeCapBoundaryAccepted,PublicStreamNotTokenCapped,
+      DefaultTokenSafeForViewerStream}` and the table-driven
+      `TestMaxTokenSafePlaylistWindow` pinning the 273@2s / 57@10s
+      boundaries and the clamp. README `X-SL-PLAYLIST-WINDOW-SIZE` row and
+      the "Stale-playlist edge case" note updated to describe the cap.
+
 ## Stale-generation drop: no panic with active readers
 
 Security-review fix: `dropStaleGenerationLocked` panicked when a dropped
