@@ -79,9 +79,20 @@ remote: - Required status check "streamloom" is expected.
 
 The push was a rule violation and succeeded only because the Claude GitHub App
 holds a bypass. `renovate[bot]` has no such bypass, so the identical push is
-rejected outright. (The `pull_request` rule did **not** appear in that
-violation list — the status-check-on-create rule is the one doing the
-blocking.)
+rejected outright.
+
+A second push, *updating* that branch rather than creating it, reported both
+rules:
+
+```
+remote: - Changes must be made through a pull request.
+remote: - Required status check "streamloom" is expected.
+```
+
+So the two rules block different stages: `required_status_checks` rejects the
+initial creation, and `pull_request` additionally rejects every later push to
+the branch. Even if creation were permitted, Renovate could never push a rebase
+or a follow-up version bump onto its own branch.
 
 Note the ruleset's `bypass_actors` comes back absent from the REST API even
 though a bypass demonstrably occurred, so that field cannot be trusted to
@@ -145,8 +156,9 @@ Pick one; the first is the real fix.
    `~DEFAULT_BRANCH` (or `refs/heads/main`) and the exclusion list becomes
    unnecessary.
 2. Tick **"Do not require status checks on creation"**
-   (`do_not_enforce_on_create: true`). Narrower, and leaves the other `~ALL`
-   rules in place to cause trouble later.
+   (`do_not_enforce_on_create: true`). **Not sufficient alone** — it unblocks
+   the initial creation, but the `pull_request` rule still rejects every
+   subsequent push to the branch, so Renovate could not rebase or re-bump it.
 3. Add `renovate[bot]` as a bypass actor.
 4. Add `refs/heads/renovate/**/*` to the exclusion list — but see the
    case-sensitivity note below before relying on exclusions.
