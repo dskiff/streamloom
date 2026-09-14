@@ -431,29 +431,30 @@ look up `ko-build/setup-ko`. Two unrelated causes — see
       `v0.10` tag (`61b4d1d3…`, verified lightweight via `git ls-remote`).
       Validation: the dashboard's "Could not determine new digest" warning
       clears and `ko-build/setup-ko` leaves the pending list on the next run.
-- [ ] Grant the Renovate GitHub App **Workflows: Read and write** on
-      `dskiff/streamloom` (and confirm Contents: Read and write). All five
-      GitHub Actions updates match Renovate's silent
-      "Workflows update rejection - aborting branch." path, which is what a
-      missing `workflows` scope produces. Validation: `renovate/actions-*`
-      branches appear and PRs open.
-- [ ] Pull the Mend run log
-      (<https://developer.mend.io/github/dskiff/streamloom>) and grep for
-      `Workflows update rejection`, `No files to commit`, `No file changes
-      detected`, `remote rejected`, `403`. Needed to explain the three
-      `gomod` updates, which the silent-abort paths do not cover.
-      Validation: each of the 10 pending updates maps to a known log line.
-- [ ] Decide what to do about `automerge: true` vs the "basic protection"
-      ruleset. It targets `~ALL` refs, so `renovate/*` gets
-      `pull_request` (1 approval, no bypass actors) — Renovate cannot
-      approve its own PR, so every automerge stalls. Either drop
-      `automerge`, add `renovate[bot]` as a bypass actor, or accept manual
-      approval. `non_fast_forward` will also reject Renovate's
-      `--force-with-lease` rebases once PRs start flowing.
-      Validation: a minor/patch update merges without human action, or
-      `automerge` is removed from `renovate.json`.
-- [ ] Fix the ruleset's case-sensitive exclude: `refs/heads/Claude/**/*`
+- [ ] Re-scope the "basic protection" ruleset (id 14480935) from `~ALL` to
+      the default branch. It enforces the `streamloom` status check on ref
+      *creation* (`do_not_enforce_on_create: false`), which no new branch can
+      ever satisfy, so every `renovate/*` push is rejected — confirmed by the
+      `Bypassed rule violations … Required status check "streamloom" is
+      expected.` notice GitHub emitted when this branch was pushed under the
+      Claude app's bypass. Renovate holds no bypass. Narrower alternatives:
+      set `do_not_enforce_on_create: true`, or add `renovate[bot]` as a
+      bypass actor. Validation: `renovate/*` branches and PRs appear on the
+      next run and the dashboard's "Other Branches" list drains.
+- [ ] Decide what to do about `automerge: true`, which cannot work while the
+      ruleset's `pull_request` rule requires an approving review on
+      `renovate/*` — Renovate cannot approve its own PR. `non_fast_forward`
+      will also reject its `--force-with-lease` rebases. Re-scoping the
+      ruleset to `main` resolves both; otherwise drop `automerge` or grant a
+      bypass. Validation: a minor/patch update merges without human action,
+      or `automerge` is removed from `renovate.json`.
+- [ ] Fix the ruleset's case-sensitive excludes: `refs/heads/Claude/**/*`
       does not match the lowercase `claude/...` branches this repo actually
       gets, so the exemption is a no-op. Validation:
       `GET /repos/dskiff/streamloom/rules/branches/claude%2Ffoo` returns no
       rules.
+- [ ] If the five GitHub Actions updates alone stay stuck after the ruleset
+      fix, grant the Renovate GitHub App **Workflows: Read and write** — it
+      is required to push any branch touching `.github/workflows/`, and
+      Renovate aborts those branches silently without it. Validation:
+      `renovate/actions-*` branches appear.
