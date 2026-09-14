@@ -416,3 +416,44 @@ design. No behavior change — docs and dead code only. All tasks **complete**.
       same 2 pre-existing G705 XSS false positives (binary `init.mp4` write
       in `stream.go`; numeric `%d` watcher count in `api.go`) before and
       after — this change adds none.
+
+## Renovate: stuck digest lookup and zero PRs
+
+Renovate has never opened a PR here (dashboard issue #21, onboarded
+2026-04-15; no `renovate/*` ref has ever existed) and separately fails to
+look up `ko-build/setup-ko`. Two unrelated causes — see
+`plans/renovate-remediation.md` for the full evidence chain.
+
+- [x] Fix the `ko-build/setup-ko` pin in `.github/workflows/publish.yml`.
+      Upstream tags are two-component (`v0.1` … `v0.9`, `v0.10`), so the
+      `# v0.9.0` comment named a tag that does not exist and Renovate could
+      not resolve a digest for the current value. Repinned to the real
+      `v0.10` tag (`61b4d1d3…`, verified lightweight via `git ls-remote`).
+      Validation: the dashboard's "Could not determine new digest" warning
+      clears and `ko-build/setup-ko` leaves the pending list on the next run.
+- [ ] Grant the Renovate GitHub App **Workflows: Read and write** on
+      `dskiff/streamloom` (and confirm Contents: Read and write). All five
+      GitHub Actions updates match Renovate's silent
+      "Workflows update rejection - aborting branch." path, which is what a
+      missing `workflows` scope produces. Validation: `renovate/actions-*`
+      branches appear and PRs open.
+- [ ] Pull the Mend run log
+      (<https://developer.mend.io/github/dskiff/streamloom>) and grep for
+      `Workflows update rejection`, `No files to commit`, `No file changes
+      detected`, `remote rejected`, `403`. Needed to explain the three
+      `gomod` updates, which the silent-abort paths do not cover.
+      Validation: each of the 10 pending updates maps to a known log line.
+- [ ] Decide what to do about `automerge: true` vs the "basic protection"
+      ruleset. It targets `~ALL` refs, so `renovate/*` gets
+      `pull_request` (1 approval, no bypass actors) — Renovate cannot
+      approve its own PR, so every automerge stalls. Either drop
+      `automerge`, add `renovate[bot]` as a bypass actor, or accept manual
+      approval. `non_fast_forward` will also reject Renovate's
+      `--force-with-lease` rebases once PRs start flowing.
+      Validation: a minor/patch update merges without human action, or
+      `automerge` is removed from `renovate.json`.
+- [ ] Fix the ruleset's case-sensitive exclude: `refs/heads/Claude/**/*`
+      does not match the lowercase `claude/...` branches this repo actually
+      gets, so the exemption is a no-op. Validation:
+      `GET /repos/dskiff/streamloom/rules/branches/claude%2Ffoo` returns no
+      rules.
