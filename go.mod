@@ -3,7 +3,7 @@ module github.com/dskiff/streamloom
 go 1.24.7
 
 require (
-	github.com/go-chi/chi/v5 v5.2.5
+	github.com/go-chi/chi/v5 v5.3.2
 	github.com/joho/godotenv v1.5.1
 	github.com/samber/slog-chi v1.19.1
 	github.com/stretchr/testify v1.11.1
