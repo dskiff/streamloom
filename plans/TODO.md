@@ -4,6 +4,43 @@ Task list for in-flight streamloom work. Completed tasks are kept briefly
 for context, then pruned once a successor task exists or the work is well
 past.
 
+## Go 1.27.1 toolchain upgrade
+
+Bump the `go` directive from `1.24.7` to `1.27.1`. The declared language
+version gates which modernizers `go fix` applies, so the upgrade is not a
+one-line change: CI's "ensure no changes after formatting and fixing" step
+runs `go fix ./...` and fails on any resulting diff, so the rewrites it now
+emits have to land in the same commit. All tasks **complete**.
+
+- [x] `go.mod`: `go 1.24.7` → `go 1.27.1` (via `go mod edit -go=1.27.1`, so
+      no `toolchain` directive is introduced and `go.sum` is untouched).
+      With the default `GOTOOLCHAIN=auto`, every consumer — the devbox
+      shell, CI, and `ko build` — downloads and switches to exactly
+      `go1.27.1`, so no separate toolchain pin is needed.
+- [x] Language-version-gated `go fix` rewrites, all behavior-preserving:
+      `sync.WaitGroup.Go` replaces the `Add(1)`/`defer Done()` pair in
+      `main.go`'s shutdown goroutine (the counter is still incremented
+      synchronously before the goroutine starts, so `serverWg.Wait()`
+      ordering is unchanged); `errors.AsType[*http.MaxBytesError]` replaces
+      the `errors.As` + declared-target pattern in `api.go` and
+      `viewer_token.go`; `slices.Backward` replaces the manual reverse
+      index walk in `middleware.rightmostUntrustedIP` (same right-to-left
+      order, so the X-Forwarded-For spoof resistance that walk exists for is
+      preserved); `strings.SplitSeq` and range-over-int in test helpers.
+- [x] Pre-commit: `go fmt / fix / vet` green and idempotent (a second `go
+      fix` pass produces no diff, so CI's no-diff gate is satisfied);
+      `go build -ldflags "-X main.Version=test"`, `go test ./...` and
+      `go test -race ./...` all green under `go1.27.1`. `gosec` reports only
+      the two pre-existing G705 taint false positives (`stream.go` binary
+      `init.mp4` write, `api.go` numeric `%d` watcher count) — unchanged by
+      this work.
+- [ ] (Follow-up, not blocking) `devbox.json` still requests `go@latest`,
+      which `devbox.lock` resolves to `1.26.1`. That shell works — the
+      `go.mod` directive makes it fetch `go1.27.1` on demand — but the
+      pinned nix Go trails the module requirement until Renovate refreshes
+      the lock. Regenerating it needs `devbox` and the package index, which
+      this environment has no access to.
+
 ## X-SL-DURATION sanity bound
 
 `X-SL-DURATION` was parsed as a uint32 (up to ~49.7 days) and only

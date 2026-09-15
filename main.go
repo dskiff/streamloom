@@ -168,9 +168,7 @@ func runServerThread(ctx context.Context, wg *sync.WaitGroup, addr string, handl
 		}
 	}()
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		<-ctx.Done()
 
 		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), config.SHUTDOWN_TIMEOUT-1*time.Second)
@@ -181,5 +179,5 @@ func runServerThread(ctx context.Context, wg *sync.WaitGroup, addr string, handl
 		}
 
 		logger.Info("server shutdown complete", "address", addr)
-	}()
+	})
 }

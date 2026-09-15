@@ -23,7 +23,7 @@ import (
 // body — anything starting with `#` is a tag, blanks are separators.
 func extractMediaURI(t *testing.T, masterBody string) string {
 	t.Helper()
-	for _, line := range strings.Split(masterBody, "\n") {
+	for line := range strings.SplitSeq(masterBody, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
