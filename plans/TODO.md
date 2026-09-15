@@ -529,9 +529,13 @@ run would have been red on known false positives. All tasks **complete**.
 - [x] Run gosec through devbox (`jetify-com/devbox-install-action` with
       `enable-cache: 'true'`, then `devbox run -- gosec ./...`) rather
       than building it from source in CI. `devbox.lock` already pins
-      gosec `2.28.0` and go `1.26.1`, so CI runs the same binaries as a
+      gosec `2.28.0` and go `1.27.0`, so CI runs the same binaries as a
       local `devbox shell`, there is no second version to keep in sync,
       and the action's nix-store cache is keyed on `devbox.lock` —
-      packages are refetched only when a pin actually changes.
-      Validation: gosec `2.28.0` reports `Issues: 0` under both go
-      `1.24.7` and `GOTOOLCHAIN=go1.26.1` (the version devbox pins).
+      packages are refetched only when a pin actually changes. The go
+      pin matches the `go 1.27.0` directive after the Go 1.27 upgrade,
+      so gosec analyzes under the module's own toolchain rather than an
+      on-demand download.
+      Validation: gosec `2.28.0` reports `Issues: 0` under
+      `GOTOOLCHAIN=go1.27.0`, with `go fmt / fix / vet / build / test`
+      green on the rebased tree.
