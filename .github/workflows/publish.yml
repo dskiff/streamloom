@@ -16,7 +16,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
+      # setup-go exports GOTOOLCHAIN=local into the job env, which disables
+      # the on-demand toolchain switch Go would otherwise use to satisfy the
+      # go.mod directive. With no version input it also falls back to the
+      # runner's pre-installed Go, so ko ends up building under whatever the
+      # image happens to ship. Reading the version from go.mod pins the
+      # toolchain to the one the module actually declares, so the two cannot
+      # drift apart again.
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
 
       - uses: ko-build/setup-ko@61b4d1d396f5b2e7d6bb6fefdce3dc38d1a13445 # v0.10
 
