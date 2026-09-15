@@ -2,7 +2,7 @@
   "$schema": "https://raw.githubusercontent.com/jetify-com/devbox/0.17.0/.schema/devbox.schema.json",
   "packages": [
     "go@latest",
-    "gosec@latest"
+    "gosec@2.28.0"
   ],
   "shell": {
     "init_hook": [
