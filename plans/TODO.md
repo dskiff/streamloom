@@ -34,12 +34,22 @@ emits have to land in the same commit. All tasks **complete**.
       the two pre-existing G705 taint false positives (`stream.go` binary
       `init.mp4` write, `api.go` numeric `%d` watcher count) — unchanged by
       this work.
-- [ ] (Follow-up, not blocking) `devbox.json` still requests `go@latest`,
-      which `devbox.lock` resolves to `1.26.1`. That shell works — the
-      `go.mod` directive makes it fetch `go1.27.1` on demand — but the
-      pinned nix Go trails the module requirement until Renovate refreshes
-      the lock. Regenerating it needs `devbox` and the package index, which
-      this environment has no access to.
+- [x] `devbox.json`: `go@latest` → `go@1.27.1`, so the dev shell ships the
+      same Go the module requires instead of relying on a toolchain
+      download, and matches the fixed-version style already used for
+      `gosec@2.28.0`. `@latest` was not self-correcting here: nixpkgs
+      carries 1.27.1 only as the `go_1_27` attribute while top-level `go`
+      is still aliased to `go_1_26`, so `go@latest` would have stayed on
+      1.26.x until nixpkgs flips that alias.
+- [ ] (Follow-up) Regenerate the `devbox.lock` entry for `go@1.27.1`. The
+      stale `go@latest` entry (resolved 1.26.1) was removed rather than
+      hand-edited — a lock entry carries per-system nix store paths that
+      can only come from the resolver, and inventing them would break the
+      shell. `devbox install` writes the real entry on the first run by
+      anyone with package-index access; this environment's egress policy
+      blocks `search.devbox.sh`. Until then `devbox.json` and
+      `devbox.lock` are intentionally out of sync. Nothing in CI consumes
+      devbox, so this does not gate the pipeline.
 
 ## X-SL-DURATION sanity bound
 
