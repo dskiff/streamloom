@@ -10,6 +10,8 @@ github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZb
 github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
 github.com/samber/slog-chi v1.19.0 h1:fl4qH5Hhk7feHtyp4CxJUt7U1TqjPrZ1uueDW9D+Cps=
 github.com/samber/slog-chi v1.19.0/go.mod h1:a1iIuofF2gS1ii8aXIQhC6TEguLOhOvSM958fY5hToU=
+github.com/samber/slog-chi v1.19.1 h1:gwBq1QOxeHtjYoHwPi0LJ2i6nQmy/hda1jIeT+OwdYc=
+github.com/samber/slog-chi v1.19.1/go.mod h1:a1iIuofF2gS1ii8aXIQhC6TEguLOhOvSM958fY5hToU=
 github.com/stretchr/testify v1.11.1 h1:7s2iGBzp5EwR7/aIZr8ao5+dra3wiQyKjjFuvgVKu7U=
 github.com/stretchr/testify v1.11.1/go.mod h1:wZwfW3scLgRK+23gO65QZefKpKQRnfz6sD981Nm4B6U=
 go.opentelemetry.io/otel v1.29.0 h1:PdomN/Al4q/lN6iBJEN3AwPvUiHPMlt93c8bqTG5Llw=
