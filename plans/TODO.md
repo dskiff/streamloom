@@ -502,3 +502,32 @@ the pin follow-up is open.
       without a `customManagers` entry, so pinning trades an upstream
       surprise for a manual bump — left as an explicit call for the repo
       owner rather than folded into the publish fix.
+
+## gosec in CI
+
+`gosec` was in the documented pre-commit list (AGENTS.md) and pinned in
+`devbox.json`, but nothing enforced it — a security regression only got
+caught if the author remembered to run it locally. Two long-standing G705
+(XSS via taint analysis) findings also sat unannotated, so the first CI
+run would have been red on known false positives. All tasks **complete**.
+
+- [x] Annotate the two pre-existing G705 false positives with `#nosec
+      G705 -- <justification>`, matching the style already used in
+      `mediaPlaylistHandler`. `pkg/routes/stream.go` (`initHandler`):
+      `init.mp4` bytes arrive over the token-authenticated ingest API,
+      never from viewer request data, and both routers set
+      `X-Content-Type-Options: nosniff` plus `default-src 'none';
+      frame-ancestors 'none'`. `pkg/routes/api.go` (`/active_watchers`):
+      `%d` over an `int`, so the body is digits only; the tainted
+      `window_ms` is parsed as an `int64` and clamped in `ActiveCount`,
+      and only selects the counting window. Validation: `gosec ./...`
+      reports `Issues: 0` (`Nosec: 6`, up from 4).
+- [x] Add a `gosec` job to `.github/workflows/ci.yml`. It runs in
+      parallel with the `streamloom` job so the install cost does not
+      serialize behind build/test, and it surfaces as its own check.
+      Validation: `gosec ./...` fails the job on any finding.
+- [x] Resolve the gosec version from `devbox.json` rather than pinning it
+      a second time in the workflow, so CI and `devbox shell` cannot
+      drift and Renovate has a single pin to bump. Validation: `jq -er`
+      extracts `2.28.0`, and exits 4 (failing the step) if the pin ever
+      disappears rather than silently installing something else.

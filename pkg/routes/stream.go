@@ -380,6 +380,13 @@ func initHandler(logger *slog.Logger, store *stream.Store) http.HandlerFunc {
 		w.Header().Set("Content-Type", config.MP4_MIME_TYPE)
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Content-Length", strconv.Itoa(len(initData)))
+		// #nosec G705 -- initialization-segment bytes pushed over the
+		// authenticated ingest API (POST /api/v1/stream/{streamID}/init),
+		// never viewer-supplied request data. Serving them back verbatim
+		// is what an origin server does, and this router sets
+		// X-Content-Type-Options: nosniff plus a
+		// "default-src 'none'; frame-ancestors 'none'" CSP, so the body
+		// is delivered as MP4 and never interpreted as a document.
 		if _, err := w.Write(initData); err != nil {
 			logger.Error("failed to write response", "error", err)
 		}
