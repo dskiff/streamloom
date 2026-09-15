@@ -455,6 +455,9 @@ the pin follow-up is open.
       (`with: { version: v0.19.1 }`). Every action is SHA-pinned, but the
       tool that actually builds and publishes the image floats on
       `latest-release`, which is what let an upstream release break a
-      `main` publish with no diff. Deferred because PRs #45 and #49 both
-      rewrite that same `uses:` line; apply once they land. Renovate will
-      not track a `with: version:` input without a `customManagers` entry.
+      `main` publish with no diff. #49 has since landed (setup-ko is now
+      `61b4d1d` / `v0.10` on `main`), so only #45 still rewrites that
+      `uses:` line. Renovate will not track a `with: version:` input
+      without a `customManagers` entry, so pinning trades an upstream
+      surprise for a manual bump — left as an explicit call for the repo
+      owner rather than folded into the publish fix.
