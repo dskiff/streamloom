@@ -34,3 +34,21 @@ jobs:
       - run: go build -ldflags "-X main.Version=test" -v .
 
       - run: go test -v ./...
+
+  gosec:
+    name: gosec
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # devbox.lock pins gosec (and the Go it analyzes under), so CI runs
+      # the same binaries as a local `devbox shell`. The action caches the
+      # nix store keyed on devbox.lock, so packages are only fetched again
+      # when a pin actually changes.
+      - name: Install devbox
+        uses: jetify-com/devbox-install-action@8c6a66ed6273138b1915457069de78cb52fe3bd7 # v0.15.0
+        with:
+          enable-cache: 'true'
+
+      - run: devbox run -- gosec ./...

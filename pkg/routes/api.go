@@ -416,6 +416,12 @@ func API(logger *slog.Logger, env config.Env, store *stream.Store, requestLogger
 
 			w.Header().Set("Content-Type", "text/plain")
 			w.Header().Set("Cache-Control", "no-store")
+			// #nosec G705 -- "%d" over an int counter, so the body is
+			// digits only and cannot carry markup. The tainted input
+			// (window_ms) is parsed as an int64 and clamped by
+			// ActiveCount; it selects the counting window and never
+			// reaches the response body. Served as text/plain with
+			// nosniff and a "default-src 'none'" CSP.
 			if _, err := fmt.Fprintf(w, "%d", count); err != nil {
 				logger.Error("failed to write response", "error", err)
 			}
