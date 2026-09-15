@@ -4,6 +4,57 @@ Task list for in-flight streamloom work. Completed tasks are kept briefly
 for context, then pruned once a successor task exists or the work is well
 past.
 
+## ko publish: unpinned Go under `GOTOOLCHAIN=local`
+
+`publish` started failing on `main` immediately after the Go 1.27 upgrade
+(#57) with `failed to publish images: qualifying local import : err: exit
+status 1: stderr: go: go.mod requires go >= 1.27.0 (running go 1.24.13;
+GOTOOLCHAIN=local)`, while `ci` stayed green on the same commit.
+
+Two `setup-go` defaults combine to cause it. The step in `publish.yml`
+passed no version input, so the action logged `go-version input was not
+specified. The action will try to use pre-installed version.` and left the
+runner's own Go on `PATH` (`GOROOT=/opt/hostedtoolcache/go/1.24.13/x64`).
+It also exports `GOTOOLCHAIN=local` into the job env — visible in every
+later step's `env:` block — which disables the on-demand toolchain switch.
+ko shells out to `go` to qualify the import path, and that `go` refuses to
+build a module declaring `go 1.27.0`.
+
+`ci` was unaffected because it has no `setup-go` step at all: `GOTOOLCHAIN`
+keeps its default `auto`, so the runner's 1.24.13 transparently downloads
+and re-execs `go1.27.0`. Nothing was wrong with `.ko.yaml`, `go.mod` or the
+ko version — publish run #60 was green on this same workflow when `go.mod`
+still said `go 1.24.7`, which the preinstalled 1.24.13 satisfied outright.
+Fix **complete**; the CI-coverage follow-up is open.
+
+- [x] Add `with: { go-version-file: go.mod }` to the `setup-go` step in
+      `publish.yml`. The module's own directive becomes the single source
+      of truth, so the installed toolchain and the declared requirement
+      cannot drift apart again — a later `go mod edit -go=` moves both at
+      once. `1.27.0` is carried in setup-go's own `actions/go-versions`
+      manifest, so it installs from the tool cache rather than falling
+      back to a `go.dev/dl` download, and it matches the `go@1.27.0`
+      devbox pin exactly.
+- [x] Reproduced and verified locally against ko `v0.19.1`, the version
+      `setup-ko`'s `latest-release` default installs. With go1.24.13 on
+      `PATH` and `GOTOOLCHAIN=local`, `ko build --base-import-paths
+      --tags=latest` fails with the byte-for-byte CI error; with go1.27.0
+      on `PATH` and `GOTOOLCHAIN=local` still set, ko gets past import
+      qualification to the base-image fetch (`cgr.dev`, blocked by this
+      environment's egress policy, not by the build). Both ko target
+      platforms cross-compile under that toolchain, `linux/amd64` and
+      `linux/arm64`, each with `-X main.Version=` stamped.
+- [x] Pre-commit: `go fmt / fix / vet` green and idempotent, `go test
+      ./...` green, `gosec ./...` reports `Issues: 0`. No Go source
+      changed, so gosec findings are unchanged by construction.
+- [ ] Open for the repo owner: nothing in `ci` exercises `ko build`, so a
+      publish-only break reaches `main` with every check green. A
+      `ko build --push=false` step on pull requests would close that gap.
+      Deliberately left out of this fix — it adds an image build to every
+      PR, which is a cost call for the owner. Note that pinning the
+      toolchain in `ci.yml` would *not* have caught this: `ci` has no
+      `setup-go` step, so it never had `GOTOOLCHAIN=local` to begin with.
+
 ## Go 1.27 toolchain upgrade
 
 Bump the `go` directive from `1.24.7` to `1.27.0`. The declared language
