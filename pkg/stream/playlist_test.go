@@ -755,7 +755,7 @@ func extractTagLine(t *testing.T, playlist, tagPrefix string) string {
 	t.Helper()
 	var found string
 	count := 0
-	for _, line := range strings.Split(playlist, "\n") {
+	for line := range strings.SplitSeq(playlist, "\n") {
 		if strings.HasPrefix(line, tagPrefix) {
 			found = line
 			count++

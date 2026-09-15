@@ -59,7 +59,7 @@ func TestActiveWatchers_TrueClientIPSpoofDoesNotInflate(t *testing.T) {
 	streamRouter, apiRouter, store := testRoutersWithTrustedProxy(t, clk)
 	initStream(t, store, "1")
 
-	for i := 0; i < 50; i++ {
+	for i := range 50 {
 		req := httptest.NewRequest(http.MethodGet, "/stream/1/stream.m3u8", nil)
 		req.RemoteAddr = "10.0.0.9:1234"                                 // the trusted proxy
 		req.Header.Set("X-Forwarded-For", "198.51.100.7")                // real client
@@ -95,7 +95,7 @@ func TestActiveWatchers_ForgedForwardedPrefixDoesNotInflate(t *testing.T) {
 	streamRouter, apiRouter, store := testRoutersWithTrustedProxy(t, clk)
 	initStream(t, store, "1")
 
-	for i := 0; i < 25; i++ {
+	for i := range 25 {
 		req := httptest.NewRequest(http.MethodGet, "/stream/1/stream.m3u8", nil)
 		req.RemoteAddr = "10.0.0.9:1234"
 		// Forged leftmost entries vary per request; the proxy-appended peer

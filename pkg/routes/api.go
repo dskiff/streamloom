@@ -211,8 +211,7 @@ func API(logger *slog.Logger, env config.Env, store *stream.Store, requestLogger
 			r.Body = http.MaxBytesReader(w, r.Body, stream.MaxInitBytes)
 			initData, err := io.ReadAll(r.Body)
 			if err != nil {
-				var maxBytesErr *http.MaxBytesError
-				if errors.As(err, &maxBytesErr) {
+				if _, ok := errors.AsType[*http.MaxBytesError](err); ok {
 					logger.Warn("init body too large", "limit", stream.MaxInitBytes)
 					w.WriteHeader(http.StatusRequestEntityTooLarge)
 				} else {

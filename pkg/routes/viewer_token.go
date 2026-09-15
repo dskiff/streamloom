@@ -74,8 +74,7 @@ func viewerTokenHandler(logger *slog.Logger, env config.Env, store *stream.Store
 			// Distinguish body-size overflow (413) from parse errors
 			// (400) so misbehaving clients get an accurate signal and
 			// the status matches the other authenticated endpoints.
-			var maxBytesErr *http.MaxBytesError
-			if errors.As(err, &maxBytesErr) {
+			if _, ok := errors.AsType[*http.MaxBytesError](err); ok {
 				logger.Warn("viewer token request body too large",
 					"streamID", streamID, "limit", MaxViewerTokenRequestBytes)
 				w.WriteHeader(http.StatusRequestEntityTooLarge)

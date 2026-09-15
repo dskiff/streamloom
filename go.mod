@@ -1,6 +1,6 @@
 module github.com/dskiff/streamloom
 
-go 1.24.7
+go 1.27.0
 
 require (
 	github.com/go-chi/chi/v5 v5.3.2

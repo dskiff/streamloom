@@ -4,6 +4,47 @@ Task list for in-flight streamloom work. Completed tasks are kept briefly
 for context, then pruned once a successor task exists or the work is well
 past.
 
+## Go 1.27 toolchain upgrade
+
+Bump the `go` directive from `1.24.7` to `1.27.0`. The declared language
+version gates which modernizers `go fix` applies, so the upgrade is not a
+one-line change: CI's "ensure no changes after formatting and fixing" step
+runs `go fix ./...` and fails on any resulting diff, so the rewrites it now
+emits have to land in the same commit. All tasks **complete**.
+
+- [x] `devbox.json`: `go@latest` → `go@1.27.0`, matching the fixed-version
+      style already used for `gosec@2.28.0`. `1.27.0` is the ceiling here:
+      the package index resolves `go_1_27` at nixpkgs commit `c27cdad`
+      (the same commit pinned for `gosec`), where that attribute is
+      `1.27.0`. `@latest` was not self-correcting — it resolved to
+      `1.26.1`, because top-level `go` in nixpkgs is still aliased to
+      `go_1_26`, so it would have stayed on 1.26.x until nixpkgs flips
+      that alias.
+- [x] `go.mod`: `go 1.24.7` → `go 1.27.0`, matching the devbox toolchain
+      exactly (via `go mod edit -go=1.27.0`, so no `toolchain` directive is
+      introduced and `go.sum` is untouched). Because the two agree, the dev
+      shell satisfies the directive outright and `GOTOOLCHAIN=auto` has
+      nothing to download; CI and `ko build` fetch `go1.27.0` on demand.
+- [x] Language-version-gated `go fix` rewrites, all behavior-preserving:
+      `sync.WaitGroup.Go` replaces the `Add(1)`/`defer Done()` pair in
+      `main.go`'s shutdown goroutine (the counter is still incremented
+      synchronously before the goroutine starts, so `serverWg.Wait()`
+      ordering is unchanged); `errors.AsType[*http.MaxBytesError]` replaces
+      the `errors.As` + declared-target pattern in `api.go` and
+      `viewer_token.go`; `slices.Backward` replaces the manual reverse
+      index walk in `middleware.rightmostUntrustedIP` (same right-to-left
+      order, so the X-Forwarded-For spoof resistance that walk exists for is
+      preserved); `strings.SplitSeq` and range-over-int in test helpers.
+      Gating is on the language version (`go1.27`), not the patch, so the
+      1.27.1 → 1.27.0 correction left this set unchanged.
+- [x] Pre-commit under `go1.27.0`: `go fmt / fix / vet` green and idempotent
+      (a second `go fix` pass produces no diff, so CI's no-diff gate is
+      satisfied); `go build -ldflags "-X main.Version=test"`,
+      `go test ./...` and `go test -race ./...` all green. `gosec` reports
+      only the two pre-existing G705 taint false positives (`stream.go`
+      binary `init.mp4` write, `api.go` numeric `%d` watcher count) —
+      unchanged by this work.
+
 ## X-SL-DURATION sanity bound
 
 `X-SL-DURATION` was parsed as a uint32 (up to ~49.7 days) and only

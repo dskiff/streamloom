@@ -1297,9 +1297,7 @@ func TestConcurrentReadersAndEviction(t *testing.T) {
 
 	writerErrs := make(chan error, 5)
 	var writerWg sync.WaitGroup
-	writerWg.Add(1)
-	go func() {
-		defer writerWg.Done()
+	writerWg.Go(func() {
 		for i := 10; i < 15; i++ {
 			buf, ok := s.AcquireSlot()
 			if !ok {
@@ -1317,7 +1315,7 @@ func TestConcurrentReadersAndEviction(t *testing.T) {
 				writerErrs <- fmt.Errorf("CommitSlot failed for segment %d: %w", i, err)
 			}
 		}
-	}()
+	})
 
 	// Wait for writer to finish (eviction has run while readers hold refs).
 	writerWg.Wait()
@@ -1651,7 +1649,7 @@ func TestCommitSlot_GenerationAdvance_DropsStaleSegments(t *testing.T) {
 	s := store.Get("g")
 
 	// Push 5 segments at gen=0.
-	for i := uint32(0); i < 5; i++ {
+	for i := range uint32(5) {
 		err := commitSlotGen(t, s, i, []byte("data"), int64(5000+i*2000), 2000, 0)
 		require.NoError(t, err)
 	}
@@ -1685,7 +1683,7 @@ func TestCommitSlot_SameGeneration_NoDrop(t *testing.T) {
 	mustInit(t, store, "g", meta, []byte("init"), 10, testSegmentBytes, 5)
 	s := store.Get("g")
 
-	for i := uint32(0); i < 5; i++ {
+	for i := range uint32(5) {
 		err := commitSlotGen(t, s, i, []byte("data"), int64(5000+i*2000), 2000, 0)
 		require.NoError(t, err)
 	}
@@ -1706,7 +1704,7 @@ func TestCommitSlot_GenerationDropFreesCapacity(t *testing.T) {
 	s := store.Get("g")
 
 	// Fill to capacity with gen=0.
-	for i := uint32(0); i < 5; i++ {
+	for i := range uint32(5) {
 		err := commitSlotGen(t, s, i, []byte("data"), int64(5000+i*2000), 2000, 0)
 		require.NoError(t, err)
 	}
@@ -1731,7 +1729,7 @@ func TestCommitSlot_GenerationAdvanceThenContinue(t *testing.T) {
 	s := store.Get("g")
 
 	// Push gen=0 segments.
-	for i := uint32(0); i < 3; i++ {
+	for i := range uint32(3) {
 		err := commitSlotGen(t, s, i, []byte("data"), int64(5000+i*2000), 2000, 0)
 		require.NoError(t, err)
 	}
@@ -1762,7 +1760,7 @@ func TestCommitSlot_SameGenDropsStaleOnSubsequentInsert(t *testing.T) {
 	s := store.Get("g")
 
 	// Push 10 gen=0 segments (indices 0-9).
-	for i := uint32(0); i < 10; i++ {
+	for i := range uint32(10) {
 		err := commitSlotGen(t, s, i, []byte("data"), int64(5000+i*2000), 2000, 0)
 		require.NoError(t, err)
 	}
@@ -1848,7 +1846,7 @@ func TestCommitSlot_GenerationAdvance_DefersBufferWithActiveReader(t *testing.T)
 	s := store.Get("g")
 
 	// Push 5 segments at gen=0.
-	for i := uint32(0); i < 5; i++ {
+	for i := range uint32(5) {
 		err := commitSlotGen(t, s, i, []byte("data"), int64(5000+i*2000), 2000, 0)
 		require.NoError(t, err)
 	}
@@ -1989,7 +1987,7 @@ func TestAcquireSlot_SweepsPendingFreeAfterReadersDrain(t *testing.T) {
 	t.Cleanup(func() { store.Delete("g") })
 	s := store.Get("g")
 
-	for i := uint32(0); i < 3; i++ {
+	for i := range uint32(3) {
 		require.NoError(t, commitSlotGen(t, s, i, []byte("data"), int64(5000+i*2000), 2000, 0))
 	}
 

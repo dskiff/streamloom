@@ -3,6 +3,7 @@ package middleware
 import (
 	"net"
 	"net/http"
+	"slices"
 	"strings"
 )
 
@@ -83,8 +84,8 @@ func rightmostUntrustedIP(xff string, trustedNets []*net.IPNet) string {
 		return ""
 	}
 	parts := strings.Split(xff, ",")
-	for i := len(parts) - 1; i >= 0; i-- {
-		entry := strings.TrimSpace(parts[i])
+	for _, part := range slices.Backward(parts) {
+		entry := strings.TrimSpace(part)
 		ip := net.ParseIP(entry)
 		if ip == nil {
 			return ""

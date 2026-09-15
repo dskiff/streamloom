@@ -73,7 +73,7 @@ func TestRecord_CapsDistinctIPsPerStream(t *testing.T) {
 
 	// Fill the stream to the per-stream cap with distinct IPs. The triple
 	// (i>>16, i>>8, i) is unique for every i < 2^24, so all IPs are distinct.
-	for i := 0; i < MaxIPsPerStream; i++ {
+	for i := range MaxIPsPerStream {
 		tr.Record("s1", fmt.Sprintf("10.%d.%d.%d", i>>16&0xff, i>>8&0xff, i&0xff))
 	}
 	require.Equal(t, MaxIPsPerStream, tr.ActiveCount("s1", MaxWindowMs))
@@ -98,7 +98,7 @@ func TestRecord_CapIsPerStream(t *testing.T) {
 	tr := NewTracker(clk)
 
 	// Saturating one stream must not affect another stream's tracking.
-	for i := 0; i < MaxIPsPerStream; i++ {
+	for i := range MaxIPsPerStream {
 		tr.Record("s1", fmt.Sprintf("10.%d.%d.%d", i>>16&0xff, i>>8&0xff, i&0xff))
 	}
 	tr.Record("s2", "203.0.113.1")
