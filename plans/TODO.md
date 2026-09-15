@@ -526,8 +526,12 @@ run would have been red on known false positives. All tasks **complete**.
       parallel with the `streamloom` job so the install cost does not
       serialize behind build/test, and it surfaces as its own check.
       Validation: `gosec ./...` fails the job on any finding.
-- [x] Resolve the gosec version from `devbox.json` rather than pinning it
-      a second time in the workflow, so CI and `devbox shell` cannot
-      drift and Renovate has a single pin to bump. Validation: `jq -er`
-      extracts `2.28.0`, and exits 4 (failing the step) if the pin ever
-      disappears rather than silently installing something else.
+- [x] Run gosec through devbox (`jetify-com/devbox-install-action` with
+      `enable-cache: 'true'`, then `devbox run -- gosec ./...`) rather
+      than building it from source in CI. `devbox.lock` already pins
+      gosec `2.28.0` and go `1.26.1`, so CI runs the same binaries as a
+      local `devbox shell`, there is no second version to keep in sync,
+      and the action's nix-store cache is keyed on `devbox.lock` —
+      packages are refetched only when a pin actually changes.
+      Validation: gosec `2.28.0` reports `Issues: 0` under both go
+      `1.24.7` and `GOTOOLCHAIN=go1.26.1` (the version devbox pins).
