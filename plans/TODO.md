@@ -416,3 +416,45 @@ design. No behavior change — docs and dead code only. All tasks **complete**.
       same 2 pre-existing G705 XSS false positives (binary `init.mp4` write
       in `stream.go`; numeric `%d` watcher count in `api.go`) before and
       after — this change adds none.
+
+## ko publish: invalid `--verbose` in `.ko.yaml` `defaultFlags`
+
+`publish` started failing on `main` with
+`error building "ko://github.com/dskiff/streamloom": build: go build:
+exit status 2: flag provided but not defined: -verbose`, with no change
+to `publish.yml` or `.ko.yaml` in the commits that broke.
+
+`defaultFlags` in `.ko.yaml` are passed verbatim to `go build`, which has
+no `-verbose` flag (only `-v`). `--verbose` is ko's *own* CLI flag
+("Enable debug logs"), so it had been in the wrong place since `.ko.yaml`
+was added in #1 — but it was inert: before ko v0.19.0,
+`configForImportPath()` appended `-trimpath` to `config.Flags` *before*
+`buildOne` tested `len(flags) == 0`, so the `defaultFlags` fallback never
+fired and the flag was silently dropped. ko v0.19.0 (ko-build/ko#1568,
+`e952dc5f`) moved the fallback ahead of that mutation, so `defaultFlags`
+is now honored and the invalid flag reaches `go build`.
+
+The trigger was a toolchain float, not a code change: `setup-ko`'s
+`version` input defaults to `latest-release`, and the failing run's log
+shows it resolving `ko-build/ko` latest to `v0.19.1`. Fix **complete**;
+the pin follow-up is open.
+
+- [x] Drop the `defaultFlags` block from `.ko.yaml`. This restores the
+      exact behavior every green publish had (the flag never reached `go
+      build`), rather than changing build output. `defaultLdflags` is
+      unaffected — it is read from `config.Ldflags`/`g.defaultLdflags` in
+      `buildOne` and `configForImportPath` never touches `Ldflags`.
+- [x] Verified against ko `v0.19.1` (the version CI installed): the
+      unmodified config reproduces the exact CI error, and with
+      `defaultFlags` removed both `linux/amd64` and `linux/arm64` build.
+      Extracted the amd64 binary from the image tarball and confirmed
+      `-X main.Version=<VERSION>` is still stamped. `go fmt / fix / vet /
+      build / test` green; no Go source changed, so `gosec` findings are
+      unchanged by construction.
+- [ ] Pin the ko binary in `publish.yml`
+      (`with: { version: v0.19.1 }`). Every action is SHA-pinned, but the
+      tool that actually builds and publishes the image floats on
+      `latest-release`, which is what let an upstream release break a
+      `main` publish with no diff. Deferred because PRs #45 and #49 both
+      rewrite that same `uses:` line; apply once they land. Renovate will
+      not track a `with: version:` input without a `customManagers` entry.
