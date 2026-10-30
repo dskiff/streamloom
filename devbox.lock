@@ -43,41 +43,41 @@
         }
       }
     },
-    "gosec@2.29.0": {
-      "last_modified": "2026-10-08T19:21:32Z",
-      "resolved": "github:NixOS/nixpkgs/8edc0c72e3a38faf5434e40d1f19431125fe4b30#gosec",
+    "gosec@2.30.0": {
+      "last_modified": "2026-10-24T11:44:37Z",
+      "resolved": "github:NixOS/nixpkgs/d3b13ad75cc492690728f9307e443dec9ef9a20e#gosec",
       "source": "devbox-search",
-      "version": "2.29.0",
+      "version": "2.30.0",
       "systems": {
         "aarch64-darwin": {
           "outputs": [
             {
               "name": "out",
-              "path": "/nix/store/k1k1lczccb9jgd638yzfq3ybg4hn8p57-gosec-2.29.0",
+              "path": "/nix/store/ncdqfrvifffwlsyrgkclrgr8rxrzqvs7-gosec-2.30.0",
               "default": true
             }
           ],
-          "store_path": "/nix/store/k1k1lczccb9jgd638yzfq3ybg4hn8p57-gosec-2.29.0"
+          "store_path": "/nix/store/ncdqfrvifffwlsyrgkclrgr8rxrzqvs7-gosec-2.30.0"
         },
         "aarch64-linux": {
           "outputs": [
             {
               "name": "out",
-              "path": "/nix/store/2rp3qfkc5psl4j9d6glycqba6afda2sf-gosec-2.29.0",
+              "path": "/nix/store/3dicdsgicj2h7s3h988y8glz8ylr6hrw-gosec-2.30.0",
               "default": true
             }
           ],
-          "store_path": "/nix/store/2rp3qfkc5psl4j9d6glycqba6afda2sf-gosec-2.29.0"
+          "store_path": "/nix/store/3dicdsgicj2h7s3h988y8glz8ylr6hrw-gosec-2.30.0"
         },
         "x86_64-linux": {
           "outputs": [
             {
               "name": "out",
-              "path": "/nix/store/pqqrmcd926icv2x5yxp2jbc719bdjg65-gosec-2.29.0",
+              "path": "/nix/store/5qbnzpi97vvsga5kmkxbvsy5rqjym20r-gosec-2.30.0",
               "default": true
             }
           ],
-          "store_path": "/nix/store/pqqrmcd926icv2x5yxp2jbc719bdjg65-gosec-2.29.0"
+          "store_path": "/nix/store/5qbnzpi97vvsga5kmkxbvsy5rqjym20r-gosec-2.30.0"
         }
       }
     }
